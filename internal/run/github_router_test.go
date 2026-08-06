@@ -17,6 +17,54 @@ import (
 	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
+type replyLookupClient struct {
+	owner, repository, marker string
+	request                   forge.ReplyRequest
+	getNumber                 int
+}
+
+func (*replyLookupClient) CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
+	return forge.PullRequest{}, nil
+}
+func (*replyLookupClient) FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error) {
+	return forge.PullRequest{}, false, nil
+}
+func (c *replyLookupClient) GetPullRequest(_ context.Context, owner, repository string, number int) (forge.PullRequestState, error) {
+	c.owner, c.repository, c.getNumber = owner, repository, number
+	return forge.PullRequestState{Number: number, State: "open"}, nil
+}
+
+func TestForgeRouterRoutesPullRequestInspection(t *testing.T) {
+	target := forge.Target{Provider: forge.ProviderGitHub, BaseURL: "https://api.github.com", Owner: "Acme", Repository: "Widget", CredentialsSecret: "widget-github"}
+	client := new(replyLookupClient)
+	router := forgeRouter{forgeRoute(target): client}
+	got, err := router.GetPullRequest(context.Background(), target, 42)
+	if err != nil || got.Number != 42 || client.owner != target.Owner || client.repository != target.Repository || client.getNumber != 42 {
+		t.Fatalf("GetPullRequest = %#v, %v; routed client = %#v", got, err, client)
+	}
+}
+func (c *replyLookupClient) PullRequestReplyExists(_ context.Context, owner, repository string, request forge.ReplyRequest, marker string) (bool, error) {
+	c.owner, c.repository, c.request, c.marker = owner, repository, request, marker
+	return true, nil
+}
+func (*replyLookupClient) ReplyToPullRequest(context.Context, string, string, forge.ReplyRequest) error {
+	return nil
+}
+
+func TestForgeRouterRoutesReplyExistenceCheck(t *testing.T) {
+	target := forge.Target{Provider: forge.ProviderGitHub, BaseURL: "https://api.github.com", Owner: "Acme", Repository: "Widget", CredentialsSecret: "widget-github"}
+	client := new(replyLookupClient)
+	router := forgeRouter{forgeRoute(target): client}
+	request := forge.ReplyRequest{PullRequestNumber: 42, CommentKind: "review"}
+	found, err := router.PullRequestReplyExists(context.Background(), target, request, "<!-- simpleswe:123 -->")
+	if err != nil || !found {
+		t.Fatalf("PullRequestReplyExists = %t, %v", found, err)
+	}
+	if client.owner != target.Owner || client.repository != target.Repository || client.request != request || client.marker != "<!-- simpleswe:123 -->" {
+		t.Fatalf("routed reply lookup = %#v", client)
+	}
+}
+
 func TestForgeRouterRoutesGitHubFindAndCreateByCaseInsensitiveOwnerAndRepository(t *testing.T) {
 	type testRepository struct {
 		owner, repository, token string
@@ -45,7 +93,7 @@ func TestForgeRouterRoutesGitHubFindAndCreateByCaseInsensitiveOwnerAndRepository
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodGet {
-			fmt.Fprintf(w, `[{"number":%d,"body":"Created by simpleswe task task-1","head":{"ref":"feature/task-1"},"html_url":"https://github.example/pr/%d"}]`, test.id, test.id)
+			fmt.Fprintf(w, `[{"number":%d,"state":"open","body":"Created by simpleswe task task-1","head":{"ref":"feature/task-1","repo":{"name":%q,"owner":{"login":%q}}},"base":{"ref":"main"},"html_url":"https://github.example/pr/%d"}]`, test.id, test.repository, test.owner, test.id)
 			return
 		}
 		io.WriteString(w, fmt.Sprintf(`{"number":%d,"html_url":"https://github.example/pr/%d"}`, test.id, test.id))
@@ -74,7 +122,7 @@ func TestForgeRouterRoutesGitHubFindAndCreateByCaseInsensitiveOwnerAndRepository
 			Provider: forge.ProviderGitHub, BaseURL: server.URL, Owner: owner, Repository: repository,
 			CredentialsSecret: test.owner + "-github",
 		}
-		found, ok, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "task-1")
+		found, ok, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "main", "task-1")
 		if err != nil || !ok || found.ID != test.id || found.HTMLURL != "https://github.example/pr/"+fmt.Sprint(test.id) {
 			t.Fatalf("FindPullRequest(%s/%s) = %#v, %t, %v", owner, repository, found, ok, err)
 		}
@@ -99,7 +147,7 @@ func TestForgeRouterRoutesGitHubFindAndCreateByCaseInsensitiveOwnerAndRepository
 		t.Fatalf("CreatePullRequest unknown route error = %v; want permanent", err)
 	}
 	unknown.Provider = "gitlab"
-	if _, _, err := router.FindPullRequest(context.Background(), unknown, "branch", "task"); err == nil || !forge.IsPermanent(err) {
+	if _, _, err := router.FindPullRequest(context.Background(), unknown, "branch", "main", "task"); err == nil || !forge.IsPermanent(err) {
 		t.Fatalf("FindPullRequest unknown provider error = %v; want permanent", err)
 	}
 }
@@ -185,7 +233,7 @@ func TestForgeRouterRejectsChangedImmutableBaseURLAndCredentialRouteWithoutDispa
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, _, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "task-1")
+			_, _, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "main", "task-1")
 			if err == nil || !forge.IsPermanent(err) || !strings.Contains(err.Error(), "immutable forge route") {
 				t.Fatalf("FindPullRequest error = %v; want permanent immutable route error", err)
 			}

@@ -25,6 +25,7 @@ secrets:
 config:
   controller:
     listen_address: ":8080"
+    webhook_listen_address: ":8081"
     namespace: simpleswe
     deadline: 30m
     max_fix_attempts: 3

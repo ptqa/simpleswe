@@ -50,6 +50,7 @@ type Options struct {
 	Clock                     Clock
 	RecoveryInterval          time.Duration
 	NotifyPendingPullRequests func(context.Context) error
+	ProcessForgeEvents        func(context.Context) error
 }
 
 // Runtime connects Kubernetes watches and Pod output to the durable controller.
@@ -174,6 +175,11 @@ func (r *Runtime) recoverDurableWork(ctx context.Context) error {
 
 func (r *Runtime) recoverOnce(ctx context.Context) error {
 	var errs []error
+	if r.options.ProcessForgeEvents != nil {
+		if err := r.options.ProcessForgeEvents(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("process forge events: %w", err))
+		}
+	}
 	if err := r.controller.Reconcile(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("reconcile tasks: %w", err))
 	}

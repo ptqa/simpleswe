@@ -1,5 +1,6 @@
 controller:
   listen_address: ":8080"
+  webhook_listen_address: ":8081"
   namespace: simpleswe
   deadline: 30m
   max_fix_attempts: 3
@@ -15,6 +16,8 @@ slack:
     file: /run/secrets/slack/app-token
 bitbucket:
   base_url: https://api.bitbucket.org
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   widget:
     clone_url: https://bitbucket.org/acme/widget.git

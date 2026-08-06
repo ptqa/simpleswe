@@ -83,7 +83,7 @@ func TestCreatePullRequest(t *testing.T) {
 	}
 }
 
-func TestFindPullRequestMatchesSourceBranchAndTaskMarker(t *testing.T) {
+func TestFindPullRequestMatchesTargetRepositorySourceBaseAndTaskMarker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s, want GET", r.Method)
@@ -99,22 +99,43 @@ func TestFindPullRequestMatchesSourceBranchAndTaskMarker(t *testing.T) {
 		if query.Get("head") != "acme:feature/task" {
 			t.Errorf("head query = %q, want acme:feature/task", query.Get("head"))
 		}
+		if query.Get("base") != "main" {
+			t.Errorf("base query = %q, want main", query.Get("base"))
+		}
 
 		io.WriteString(w, `[`+
-			`{"number":41,"body":"Created by simpleswe task swe-123","head":{"ref":"other"},"html_url":"https://github.example/pull/41"},`+
-			`{"number":42,"body":"Created by another worker","head":{"ref":"feature/task"},"html_url":"https://github.example/pull/42"},`+
-			`{"number":43,"body":"Created by simpleswe task swe-123","head":{"ref":"feature/task"},"html_url":"https://github.example/pull/43"}`+
+			`{"number":40,"state":"open","body":"Created by simpleswe task swe-123","head":{"ref":"other","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/40"},`+
+			`{"number":41,"state":"open","body":"Created by simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"release"},"html_url":"https://github.example/pull/41"},`+
+			`{"number":42,"state":"open","body":"Created by simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"fork","owner":{"login":"other"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/42"},`+
+			`{"number":43,"state":"open","body":"Created by another worker","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/43"},`+
+			`{"number":44,"state":"open","body":"Created by simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/44"}`+
 			`]`)
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL, testToken)
-	got, found, err := client.FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "swe-123")
+	got, found, err := client.FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "main", "swe-123")
 	if err != nil {
 		t.Fatalf("FindPullRequest: %v", err)
 	}
-	if !found || got.ID != 43 || got.HTMLURL != "https://github.example/pull/43" {
-		t.Fatalf("FindPullRequest = %#v, %t; want pull request 43", got, found)
+	if !found || got.ID != 44 || got.HTMLURL != "https://github.example/pull/44" {
+		t.Fatalf("FindPullRequest = %#v, %t; want pull request 44", got, found)
+	}
+}
+
+func TestFindPullRequestIgnoresClosedAndMergedMatches(t *testing.T) {
+	for _, candidate := range []string{
+		`{"number":44,"state":"closed","body":"Created by simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/44"}`,
+		`{"number":44,"state":"open","merged":true,"body":"Created by simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/44"}`,
+	} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			io.WriteString(w, "["+candidate+"]")
+		}))
+		got, found, err := newTestClient(t, server.URL, "").FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "main", "swe-123")
+		server.Close()
+		if err != nil || found || got != (forge.PullRequest{}) {
+			t.Fatalf("FindPullRequest non-open candidate = %#v, %t, %v; want no match", got, found, err)
+		}
 	}
 }
 
@@ -124,9 +145,36 @@ func TestFindPullRequestReturnsNoMatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, found, err := newTestClient(t, server.URL, "").FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "swe-123")
+	got, found, err := newTestClient(t, server.URL, "").FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "main", "swe-123")
 	if err != nil || found || got != (forge.PullRequest{}) {
 		t.Fatalf("FindPullRequest = %#v, %t, %v; want no match", got, found, err)
+	}
+}
+
+func TestGetPullRequestParsesStateAndRefsFromTargetScopedEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/repos/acme/service/pulls/42" || r.URL.RawQuery != "" {
+			t.Fatalf("request = %s %s; want GET /repos/acme/service/pulls/42", r.Method, r.URL.RequestURI())
+		}
+		io.WriteString(w, `{"number":42,"state":"open","merged":false,"head":{"ref":"feature/task","sha":"0123456789abcdef0123456789abcdef01234567","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"}}`)
+	}))
+	defer server.Close()
+
+	got, err := newTestClient(t, server.URL, "").GetPullRequest(context.Background(), testOwner, testRepository, 42)
+	want := forge.PullRequestState{Number: 42, State: "open", SourceOwner: "acme", SourceRepository: "service", SourceBranch: "feature/task", DestinationBranch: "main", HeadSHA: "0123456789abcdef0123456789abcdef01234567"}
+	if err != nil || got != want {
+		t.Fatalf("GetPullRequest = %#v, %v; want %#v", got, err, want)
+	}
+}
+
+func TestGetPullRequestRejectsMissingHeadSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"number":42,"state":"open","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"}}`)
+	}))
+	defer server.Close()
+
+	if _, err := newTestClient(t, server.URL, "").GetPullRequest(context.Background(), testOwner, testRepository, 42); err == nil || !forge.IsPermanent(err) {
+		t.Fatalf("GetPullRequest missing head SHA error = %v; want permanent", err)
 	}
 }
 
@@ -300,8 +348,8 @@ func TestCreatePullRequestValidatesResponse(t *testing.T) {
 			defer server.Close()
 
 			_, err := newTestClient(t, server.URL, "").CreatePullRequest(context.Background(), testOwner, testRepository, forge.CreatePullRequestRequest{})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("CreatePullRequest error = %v; want %q", err, test.want)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
+				t.Fatalf("CreatePullRequest error = %v; want permanent %q", err, test.want)
 			}
 		})
 	}
@@ -313,9 +361,9 @@ func TestFindPullRequestValidatesMatchedResponse(t *testing.T) {
 		body string
 		want string
 	}{
-		{name: "missing number", body: `[{"body":"simpleswe task swe-123","head":{"ref":"feature/task"},"html_url":"https://github.example/pull/1"}]`, want: "missing pull request id"},
-		{name: "missing URL", body: `[{"number":1,"body":"simpleswe task swe-123","head":{"ref":"feature/task"}}]`, want: "missing pull request URL"},
-		{name: "invalid URL", body: `[{"number":1,"body":"simpleswe task swe-123","head":{"ref":"feature/task"},"html_url":"/pull/1"}]`, want: "invalid pull request URL"},
+		{name: "missing number", body: `[{"state":"open","body":"simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"https://github.example/pull/1"}]`, want: "missing pull request id"},
+		{name: "missing URL", body: `[{"number":1,"state":"open","body":"simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"}}]`, want: "missing pull request URL"},
+		{name: "invalid URL", body: `[{"number":1,"state":"open","body":"simpleswe task swe-123","head":{"ref":"feature/task","repo":{"name":"service","owner":{"login":"acme"}}},"base":{"ref":"main"},"html_url":"/pull/1"}]`, want: "invalid pull request URL"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -323,9 +371,9 @@ func TestFindPullRequestValidatesMatchedResponse(t *testing.T) {
 			}))
 			defer server.Close()
 
-			_, _, err := newTestClient(t, server.URL, "").FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "swe-123")
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
+			_, _, err := newTestClient(t, server.URL, "").FindPullRequest(context.Background(), testOwner, testRepository, "feature/task", "main", "swe-123")
+			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
+				t.Fatalf("FindPullRequest error = %v; want permanent %q", err, test.want)
 			}
 		})
 	}

@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
 const (
@@ -95,7 +97,7 @@ func TestCreatePullRequest(t *testing.T) {
 	}
 }
 
-func TestFindPullRequestMatchesSourceBranchAndTaskMarker(t *testing.T) {
+func TestFindPullRequestMatchesTargetRepositorySourceBaseAndTaskMarker(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("method = %s, want GET", r.Method)
@@ -104,19 +106,62 @@ func TestFindPullRequestMatchesSourceBranchAndTaskMarker(t *testing.T) {
 			t.Errorf("state query = %q, want OPEN", r.URL.Query().Get("state"))
 		}
 		io.WriteString(w, `{"values":[`+
-			`{"id":41,"description":"Created by simpleswe task other","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/41"}}},`+
-			`{"id":42,"description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/42"}}}`+
+			`{"id":40,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"other"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/40"}}},`+
+			`{"id":41,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"release"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/41"}}},`+
+			`{"id":42,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"other/fork"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/42"}}},`+
+			`{"id":43,"state":"OPEN","description":"Created by simpleswe task other","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/43"}}},`+
+			`{"id":44,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/44"}}}`+
 			`]}`)
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL, testUsername, testAppPassword)
-	got, found, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "swe-123")
+	got, found, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
 	if err != nil {
 		t.Fatalf("FindPullRequest: %v", err)
 	}
-	if !found || got.ID != 42 || !strings.HasSuffix(got.HTMLURL, "/42") {
-		t.Fatalf("FindPullRequest = %#v, %t; want pull request 42", got, found)
+	if !found || got.ID != 44 || !strings.HasSuffix(got.HTMLURL, "/44") {
+		t.Fatalf("FindPullRequest = %#v, %t; want pull request 44", got, found)
+	}
+}
+
+func TestFindPullRequestIgnoresClosedAndMergedMatches(t *testing.T) {
+	for _, state := range []string{"DECLINED", "MERGED"} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			io.WriteString(w, `{"values":[{"id":44,"state":"`+state+`","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/44"}}}]}`)
+		}))
+		got, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
+		server.Close()
+		if err != nil || found || got != (forge.PullRequest{}) {
+			t.Fatalf("FindPullRequest %s candidate = %#v, %t, %v; want no match", state, got, found, err)
+		}
+	}
+}
+
+func TestGetPullRequestParsesStateAndRefsFromTargetScopedEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/2.0/repositories/workspace/repository/pullrequests/42" || r.URL.RawQuery != "" {
+			t.Fatalf("request = %s %s; want GET target pull request 42", r.Method, r.URL.RequestURI())
+		}
+		io.WriteString(w, `{"id":42,"state":"OPEN","source":{"branch":{"name":"feature/task"},"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`)
+	}))
+	defer server.Close()
+
+	got, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
+	want := forge.PullRequestState{Number: 42, State: "open", SourceOwner: "workspace", SourceRepository: "repository", SourceBranch: "feature/task", DestinationBranch: "main", HeadSHA: "0123456789abcdef0123456789abcdef01234567"}
+	if err != nil || got != want {
+		t.Fatalf("GetPullRequest = %#v, %v; want %#v", got, err, want)
+	}
+}
+
+func TestGetPullRequestRejectsMissingHeadSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, `{"id":42,"state":"OPEN","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`)
+	}))
+	defer server.Close()
+
+	if _, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42); err == nil || !forge.IsPermanent(err) {
+		t.Fatalf("GetPullRequest missing head SHA error = %v; want permanent", err)
 	}
 }
 
@@ -295,8 +340,8 @@ func TestCreatePullRequestValidatesResponse(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, test.body) }))
 			defer server.Close()
 			_, err := newTestClient(t, server.URL, "", "").CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("CreatePullRequest error = %v; want %q", err, test.want)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
+				t.Fatalf("CreatePullRequest error = %v; want permanent %q", err, test.want)
 			}
 		})
 	}
@@ -311,29 +356,29 @@ func TestFindPullRequestHandlesLookupErrorsAndNoMatch(t *testing.T) {
 	}{
 		{name: "status", body: "denied", code: http.StatusForbidden, want: "denied"},
 		{name: "malformed JSON", body: "not-json", code: http.StatusOK, want: "decode Bitbucket lookup response"},
-		{name: "incomplete match", body: `{"values":[{"id":0,"description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK, want: "incomplete pull request"},
-		{name: "invalid URL", body: `{"values":[{"id":1,"description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"/pull-requests/1"}}}]}`, code: http.StatusOK, want: "invalid pull request URL"},
+		{name: "incomplete match", body: `{"values":[{"id":0,"state":"OPEN","description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK, want: "incomplete pull request"},
+		{name: "invalid URL", body: `{"values":[{"id":1,"state":"OPEN","description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"/pull-requests/1"}}}]}`, code: http.StatusOK, want: "invalid pull request URL"},
 		{name: "no match", body: `{"values":[{"id":1,"description":"other","source":{"branch":{"name":"other"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("pagelen") != "50" || r.URL.Query().Get("q") != `source.branch.name="feature/task"` {
-					t.Errorf("lookup query = %q; want pagelen=50 and source branch filter", r.URL.RawQuery)
+				if r.URL.Query().Get("pagelen") != "50" || r.URL.Query().Get("q") != `source.branch.name="feature/task" AND destination.branch.name="main"` {
+					t.Errorf("lookup query = %q; want pagelen=50 and exact branch filters", r.URL.RawQuery)
 				}
 				w.WriteHeader(test.code)
 				io.WriteString(w, test.body)
 			}))
 			defer server.Close()
-			_, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "swe-123")
+			_, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
 			if test.want == "" {
 				if err != nil || found {
 					t.Fatalf("FindPullRequest = found %t, error %v; want no match", found, err)
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
+				t.Fatalf("FindPullRequest error = %v; want permanent %q", err, test.want)
 			}
 		})
 	}
@@ -357,7 +402,7 @@ func TestFindPullRequestHandlesTransportAndReadErrors(t *testing.T) {
 					return nil, errors.New("lookup unavailable")
 				})}
 			}
-			_, _, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "swe-123")
+			_, _, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
 			}

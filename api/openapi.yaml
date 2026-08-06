@@ -5,17 +5,18 @@ info:
   description: |
     API for submitting and observing software-engineering tasks.
 
-    The service is exposed as a ClusterIP and is reached through port-forward
-    only. No authentication scheme is defined yet; network access is the
-    current access boundary and must not be treated as a substitute for
-    authentication when this service is exposed beyond the cluster.
+    The controller API is private by default on its ClusterIP and is reached
+    through port-forward. Signed webhook paths are served by the separate
+    webhook listener and `-webhooks` ClusterIP Service. No authentication
+    scheme is defined for the controller API; do not expose it publicly.
 servers:
   - url: /
-    description: Service-relative URL; use through a ClusterIP or port-forward.
+    description: Service-relative URL; controller operations use the private API Service, while webhook operations use the separate webhooks Service.
 security: []
 tags:
   - name: health
   - name: tasks
+  - name: webhooks
 paths:
   /v1/health:
     get:
@@ -31,6 +32,72 @@ paths:
                 $ref: '#/components/schemas/HealthResponse'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/webhooks/github:
+    post:
+      tags: [webhooks]
+      operationId: receive_github_webhook
+      summary: Receive a signed GitHub webhook
+      security:
+        - GitHubWebhookSignature: []
+      description: Validate the signature over the exact raw request body before parsing, then durably accept the delivery for asynchronous processing. Valid deliveries are accepted even when the event is irrelevant to the service.
+      parameters:
+        - $ref: '#/components/parameters/GitHubDelivery'
+        - $ref: '#/components/parameters/GitHubEvent'
+        - $ref: '#/components/parameters/GitHubSignature'
+      requestBody:
+        required: true
+        description: Provider-defined GitHub webhook JSON object.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '202':
+          $ref: '#/components/responses/WebhookAccepted'
+        '400':
+          $ref: '#/components/responses/WebhookBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /v1/webhooks/bitbucket:
+    post:
+      tags: [webhooks]
+      operationId: receive_bitbucket_webhook
+      summary: Receive a signed Bitbucket webhook
+      security:
+        - BitbucketWebhookSignature: []
+      description: Validate the signature over the exact raw request body before parsing, then durably accept the delivery for asynchronous processing. Valid deliveries are accepted even when the event is irrelevant to the service.
+      parameters:
+        - $ref: '#/components/parameters/BitbucketRequestUUID'
+        - $ref: '#/components/parameters/BitbucketEventKey'
+        - $ref: '#/components/parameters/BitbucketSignature'
+      requestBody:
+        required: true
+        description: Provider-defined Bitbucket webhook JSON object.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookPayload'
+      responses:
+        '202':
+          $ref: '#/components/responses/WebhookAccepted'
+        '400':
+          $ref: '#/components/responses/WebhookBadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /v1/tasks:
     get:
@@ -233,6 +300,17 @@ paths:
           $ref: '#/components/responses/NotFound'
 
 components:
+  securitySchemes:
+    GitHubWebhookSignature:
+      type: apiKey
+      in: header
+      name: X-Hub-Signature-256
+      description: HMAC-SHA256 over the exact raw request body using the configured GitHub webhook secret, encoded as `sha256=<hex digest>`.
+    BitbucketWebhookSignature:
+      type: apiKey
+      in: header
+      name: X-Hub-Signature
+      description: HMAC-SHA256 over the exact raw request body using the configured Bitbucket webhook secret, encoded as `sha256=<hex digest>`.
   parameters:
     TaskID:
       name: taskID
@@ -271,10 +349,83 @@ components:
       schema:
         type: string
         minLength: 1
-
+    GitHubDelivery:
+      name: X-GitHub-Delivery
+      in: header
+      required: true
+      description: GitHub delivery identifier.
+      schema:
+        type: string
+        minLength: 1
+    GitHubEvent:
+      name: X-GitHub-Event
+      in: header
+      required: true
+      description: GitHub event name.
+      schema:
+        type: string
+        minLength: 1
+    GitHubSignature:
+      name: X-Hub-Signature-256
+      in: header
+      required: true
+      description: HMAC-SHA256 signature of the exact raw request body.
+      schema:
+        type: string
+        pattern: '^sha256=[0-9A-Fa-f]{64}$'
+    BitbucketRequestUUID:
+      name: X-Request-UUID
+      in: header
+      required: true
+      description: Bitbucket request identifier.
+      schema:
+        type: string
+        minLength: 1
+    BitbucketEventKey:
+      name: X-Event-Key
+      in: header
+      required: true
+      description: Bitbucket event key.
+      schema:
+        type: string
+        minLength: 1
+    BitbucketSignature:
+      name: X-Hub-Signature
+      in: header
+      required: true
+      description: HMAC-SHA256 signature of the exact raw request body.
+      schema:
+        type: string
+        pattern: '^sha256=[0-9A-Fa-f]{64}$'
   responses:
     BadRequest:
       description: Request is malformed or contains invalid parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    WebhookAccepted:
+      description: Valid delivery accepted for asynchronous processing, including deliveries for irrelevant event kinds.
+    WebhookBadRequest:
+      description: Webhook headers or JSON payload are malformed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Webhook signature is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    PayloadTooLarge:
+      description: Webhook payload exceeds the maximum accepted size.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalServerError:
+      description: An internal error prevented the webhook delivery from being stored.
       content:
         application/json:
           schema:
@@ -286,7 +437,7 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     NotFound:
-      description: The requested task or result does not exist.
+      description: The requested task, result, or configured webhook provider does not exist.
       content:
         application/json:
           schema:
@@ -337,6 +488,11 @@ components:
           minLength: 1
           pattern: .*\S.*
           description: Optional Slack-specific event identifier used to deduplicate retries of a Slack-originated task and support tracing; mutually exclusive with idempotency_key.
+
+    WebhookPayload:
+      type: object
+      description: Provider-defined webhook payload. Fields vary by event type and are not modeled here.
+      additionalProperties: true
 
     ErrorResponse:
       type: object

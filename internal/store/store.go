@@ -56,6 +56,9 @@ type Attempt struct {
 	Number           int
 	Immutable        bool
 	State            task.State
+	Prompt           string
+	BaseBranch       string
+	TaskBranch       string
 	LogsExhausted    bool
 	ValidationState  string
 	ManifestJSON     []byte
@@ -179,6 +182,9 @@ CREATE TABLE IF NOT EXISTS task_attempts (
     number INTEGER NOT NULL CHECK (number > 0),
     immutable INTEGER NOT NULL DEFAULT 1 CHECK (immutable = 1),
     state TEXT NOT NULL,
+	prompt TEXT NOT NULL DEFAULT '',
+	base_branch TEXT NOT NULL DEFAULT '',
+	task_branch TEXT NOT NULL DEFAULT '',
 	logs_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (logs_exhausted IN (0, 1)),
 	validation_state TEXT NOT NULL DEFAULT '',
 	manifest_json BLOB NOT NULL DEFAULT '',
@@ -242,6 +248,39 @@ CREATE TABLE IF NOT EXISTS slack_inbox_rejections (
 	created_at TEXT NOT NULL,
 	updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS forge_events (
+	id TEXT PRIMARY KEY,
+	provider TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	owner TEXT NOT NULL,
+	repository TEXT NOT NULL,
+	pull_request_number INTEGER NOT NULL DEFAULT 0 CHECK (pull_request_number >= 0),
+	commit_sha TEXT NOT NULL,
+	branch TEXT NOT NULL,
+	comment_id INTEGER NOT NULL DEFAULT 0 CHECK (comment_id >= 0),
+	comment_kind TEXT NOT NULL DEFAULT '',
+	title TEXT NOT NULL DEFAULT '',
+	body TEXT NOT NULL DEFAULT '',
+	author TEXT NOT NULL DEFAULT '',
+	url TEXT NOT NULL DEFAULT '',
+	task_id TEXT REFERENCES tasks(id),
+	attempt_id TEXT UNIQUE REFERENCES task_attempts(id),
+	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'handled', 'failed')),
+	attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+	last_error TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	handled_at TEXT,
+	failed_at TEXT,
+	next_attempt_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS forge_events_incomplete
+	ON forge_events(status, created_at);
+
+CREATE INDEX IF NOT EXISTS forge_events_task_status
+	ON forge_events(task_id, status);
 
 CREATE TABLE IF NOT EXISTS log_chunks (
     id TEXT PRIMARY KEY,
@@ -418,6 +457,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		"ALTER TABLE tasks ADD COLUMN slack_user_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE pull_requests ADD COLUMN notified_at TEXT",
 		"ALTER TABLE task_attempts ADD COLUMN logs_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (logs_exhausted IN (0, 1))",
+		"ALTER TABLE task_attempts ADD COLUMN prompt TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE task_attempts ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE task_attempts ADD COLUMN task_branch TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE task_attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE task_attempts ADD COLUMN manifest_json BLOB NOT NULL DEFAULT ''",
 		"ALTER TABLE task_attempts ADD COLUMN resource_snapshot BLOB NOT NULL DEFAULT ''",
@@ -429,6 +471,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		"ALTER TABLE secret_cleanups ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE secret_cleanups ADD COLUMN secret_uid TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE secret_cleanups ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
+		"ALTER TABLE forge_events ADD COLUMN next_attempt_at TEXT",
 	} {
 		if _, err := db.ExecContext(ctx, migration); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
 			return closeOnError(fmt.Errorf("migrate SQLite schema: %w", err))
@@ -820,7 +863,7 @@ func (s *Store) ListActiveTasks(ctx context.Context) (_ []Task, resultErr error)
 
 func (s *Store) ListAttempts(ctx context.Context, taskID string) (_ []Attempt, resultErr error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, task_id, number, immutable, state, logs_exhausted, validation_state,
+		SELECT id, task_id, number, immutable, state, prompt, base_branch, task_branch, logs_exhausted, validation_state,
 		       manifest_json, resource_snapshot, config_digest, created_at
 		FROM task_attempts WHERE task_id = ? ORDER BY number`, taskID)
 	if err != nil {
@@ -846,7 +889,8 @@ func (s *Store) ListAttempts(ctx context.Context, taskID string) (_ []Attempt, r
 func (s *Store) CurrentAttempt(ctx context.Context, taskID string) (Attempt, error) {
 	attempt, err := scanAttempt(s.db.QueryRowContext(ctx, `
 		SELECT task_attempts.id, task_attempts.task_id, task_attempts.number,
-		       task_attempts.immutable, task_attempts.state, task_attempts.logs_exhausted,
+		       task_attempts.immutable, task_attempts.state, task_attempts.prompt,
+		       task_attempts.base_branch, task_attempts.task_branch, task_attempts.logs_exhausted,
 		       task_attempts.validation_state, task_attempts.manifest_json,
 		       task_attempts.resource_snapshot, task_attempts.config_digest, task_attempts.created_at
 		FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
@@ -863,7 +907,7 @@ func (s *Store) CurrentAttempt(ctx context.Context, taskID string) (Attempt, err
 // GetAttempt returns an attempt only when it belongs to taskID.
 func (s *Store) GetAttempt(ctx context.Context, taskID, attemptID string) (Attempt, error) {
 	attempt, err := scanAttempt(s.db.QueryRowContext(ctx, `
-		SELECT id, task_id, number, immutable, state, logs_exhausted, validation_state,
+		SELECT id, task_id, number, immutable, state, prompt, base_branch, task_branch, logs_exhausted, validation_state,
 		       manifest_json, resource_snapshot, config_digest, created_at
 		FROM task_attempts WHERE task_id = ? AND id = ?`, taskID, attemptID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -878,7 +922,7 @@ func (s *Store) GetAttempt(ctx context.Context, taskID, attemptID string) (Attem
 // GetAttemptNumber returns one immutable attempt by its task-local number.
 func (s *Store) GetAttemptNumber(ctx context.Context, taskID string, number int) (Attempt, error) {
 	attempt, err := scanAttempt(s.db.QueryRowContext(ctx, `
-		SELECT id, task_id, number, immutable, state, logs_exhausted, validation_state,
+		SELECT id, task_id, number, immutable, state, prompt, base_branch, task_branch, logs_exhausted, validation_state,
 		       manifest_json, resource_snapshot, config_digest, created_at
 		FROM task_attempts WHERE task_id = ? AND number = ?`, taskID, number))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -895,6 +939,65 @@ func (s *Store) RetryTask(ctx context.Context, taskID string) (Attempt, error) {
 	return attempt, err
 }
 
+// RetryAttemptPlan reserves no state while allowing a controller to build the
+// next attempt's immutable snapshot before the retry transaction.
+type RetryAttemptPlan struct {
+	Attempt           Attempt
+	PreviousAttemptID string
+}
+
+func (s *Store) PlanRetryAttempt(ctx context.Context, taskID, idempotencyKey string) (RetryAttemptPlan, bool, error) {
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if idempotencyKey != "" {
+		attempt, err := s.GetRetryIntent(ctx, taskID, idempotencyKey)
+		if err == nil {
+			return RetryAttemptPlan{Attempt: attempt}, false, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return RetryAttemptPlan{}, false, err
+		}
+	}
+	var state, currentAttemptID, prompt, baseBranch, taskBranch string
+	var logsExhausted int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT tasks.state, tasks.current_attempt_id, task_attempts.logs_exhausted,
+		       task_attempts.prompt, task_attempts.base_branch, task_attempts.task_branch
+		FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
+		WHERE tasks.id = ?`, taskID).Scan(&state, &currentAttemptID, &logsExhausted, &prompt, &baseBranch, &taskBranch); errors.Is(err, sql.ErrNoRows) {
+		return RetryAttemptPlan{}, false, fmt.Errorf("%w: %s", ErrNotFound, taskID)
+	} else if err != nil {
+		return RetryAttemptPlan{}, false, fmt.Errorf("plan task retry: %w", err)
+	}
+	if err := (task.Machine{}).Retry(task.State(state), task.QUEUED); err != nil {
+		return RetryAttemptPlan{}, false, err
+	}
+	if logsExhausted != 1 {
+		return RetryAttemptPlan{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
+	}
+	var forgeEventID string
+	if err := s.db.QueryRowContext(ctx, `SELECT id FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&forgeEventID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return RetryAttemptPlan{}, false, fmt.Errorf("plan running forge event retry: %w", err)
+	}
+	if forgeEventID == "" {
+		prompt, baseBranch, taskBranch = "", "", ""
+	}
+	var number int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(number), 0) + 1 FROM task_attempts WHERE task_id = ?`, taskID).Scan(&number); err != nil {
+		return RetryAttemptPlan{}, false, fmt.Errorf("plan retry number: %w", err)
+	}
+	attemptID, err := newID("swe-attempt-")
+	if err != nil {
+		return RetryAttemptPlan{}, false, err
+	}
+	return RetryAttemptPlan{
+		PreviousAttemptID: currentAttemptID,
+		Attempt: Attempt{
+			ID: attemptID, TaskID: taskID, Number: number, Immutable: true, State: task.QUEUED,
+			Prompt: prompt, BaseBranch: baseBranch, TaskBranch: taskBranch,
+		},
+	}, true, nil
+}
+
 // GetRetryIntent returns the immutable attempt originally assigned to an
 // idempotency key, regardless of the task's current attempt.
 func (s *Store) GetRetryIntent(ctx context.Context, taskID, idempotencyKey string) (Attempt, error) {
@@ -903,7 +1006,7 @@ func (s *Store) GetRetryIntent(ctx context.Context, taskID, idempotencyKey strin
 		return Attempt{}, fmt.Errorf("%w: empty retry idempotency key", ErrNotFound)
 	}
 	attempt, err := scanAttempt(s.db.QueryRowContext(ctx, `
-		SELECT a.id, a.task_id, a.number, a.immutable, a.state, a.logs_exhausted,
+		SELECT a.id, a.task_id, a.number, a.immutable, a.state, a.prompt, a.base_branch, a.task_branch, a.logs_exhausted,
 		       a.validation_state, a.manifest_json, a.resource_snapshot, a.config_digest, a.created_at
 		FROM retry_intents r JOIN task_attempts a ON a.id = r.attempt_id
 		WHERE r.task_id = ? AND r.idempotency_key = ?`, taskID, idempotencyKey))
@@ -919,6 +1022,15 @@ func (s *Store) GetRetryIntent(ctx context.Context, taskID, idempotencyKey strin
 // RetryTaskOnce atomically resets a failed aggregate onto a new queued
 // attempt. A supplied idempotency key returns the original retry on replay.
 func (s *Store) RetryTaskOnce(ctx context.Context, taskID, idempotencyKey string) (Attempt, bool, error) {
+	return s.retryTaskOnce(ctx, taskID, idempotencyKey, nil)
+}
+
+// StartPlannedRetryTaskOnce atomically selects a pre-snapshotted retry.
+func (s *Store) StartPlannedRetryTaskOnce(ctx context.Context, taskID, idempotencyKey string, plan RetryAttemptPlan) (Attempt, bool, error) {
+	return s.retryTaskOnce(ctx, taskID, idempotencyKey, &plan)
+}
+
+func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string, plan *RetryAttemptPlan) (Attempt, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Attempt{}, false, fmt.Errorf("begin task retry: %w", err)
@@ -928,7 +1040,7 @@ func (s *Store) RetryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if idempotencyKey != "" {
 		attempt, err := scanAttempt(tx.QueryRowContext(ctx, `
-			SELECT a.id, a.task_id, a.number, a.immutable, a.state, a.logs_exhausted,
+			SELECT a.id, a.task_id, a.number, a.immutable, a.state, a.prompt, a.base_branch, a.task_branch, a.logs_exhausted,
 			       a.validation_state, a.manifest_json, a.resource_snapshot, a.config_digest, a.created_at
 			FROM retry_intents r JOIN task_attempts a ON a.id = r.attempt_id
 			WHERE r.task_id = ? AND r.idempotency_key = ?`, taskID, idempotencyKey))
@@ -944,11 +1056,12 @@ func (s *Store) RetryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	}
 
 	var cancellationRequested, logsExhausted int
-	var state, currentAttemptID string
+	var state, currentAttemptID, prompt, baseBranch, taskBranch string
 	if err := tx.QueryRowContext(ctx,
-		`SELECT tasks.state, tasks.cancellation_requested, tasks.current_attempt_id, task_attempts.logs_exhausted
+		`SELECT tasks.state, tasks.cancellation_requested, tasks.current_attempt_id, task_attempts.logs_exhausted,
+		        task_attempts.prompt, task_attempts.base_branch, task_attempts.task_branch
 		 FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id WHERE tasks.id = ?`, taskID,
-	).Scan(&state, &cancellationRequested, &currentAttemptID, &logsExhausted); errors.Is(err, sql.ErrNoRows) {
+	).Scan(&state, &cancellationRequested, &currentAttemptID, &logsExhausted, &prompt, &baseBranch, &taskBranch); errors.Is(err, sql.ErrNoRows) {
 		return Attempt{}, false, fmt.Errorf("%w: %s", ErrNotFound, taskID)
 	} else if err != nil {
 		return Attempt{}, false, fmt.Errorf("read task for retry: %w", err)
@@ -959,27 +1072,91 @@ func (s *Store) RetryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	if logsExhausted != 1 {
 		return Attempt{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
 	}
+	var forgeEventID string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT id FROM forge_events
+		WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&forgeEventID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Attempt{}, false, fmt.Errorf("read running forge event for retry: %w", err)
+	}
+	retryPrompt, retryBaseBranch, retryTaskBranch := "", "", ""
+	if forgeEventID != "" {
+		retryPrompt, retryBaseBranch, retryTaskBranch = prompt, baseBranch, taskBranch
+	}
 
 	var number int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COALESCE(MAX(number), 0) + 1 FROM task_attempts WHERE task_id = ?`, taskID).Scan(&number); err != nil {
 		return Attempt{}, false, fmt.Errorf("read retry number: %w", err)
 	}
-	attemptID, err := newID("swe-attempt-")
-	if err != nil {
-		return Attempt{}, false, err
+	attempt := Attempt{
+		TaskID: taskID, Number: number, Immutable: true, State: task.QUEUED,
+		Prompt: retryPrompt, BaseBranch: retryBaseBranch, TaskBranch: retryTaskBranch,
+	}
+	if plan == nil {
+		if forgeEventID != "" {
+			return Attempt{}, false, fmt.Errorf("%w: running forge follow-up retry requires a complete planned snapshot", ErrConflict)
+		}
+		attempt.ID, err = newID("swe-attempt-")
+		if err != nil {
+			return Attempt{}, false, err
+		}
+	} else {
+		attempt = plan.Attempt
+		if plan.PreviousAttemptID != currentAttemptID || attempt.TaskID != taskID || attempt.Number != number || !attempt.Immutable || attempt.State != task.QUEUED ||
+			attempt.Prompt != retryPrompt || attempt.BaseBranch != retryBaseBranch || attempt.TaskBranch != retryTaskBranch || strings.TrimSpace(attempt.ID) == "" {
+			return Attempt{}, false, fmt.Errorf("%w: retry plan no longer matches current task attempt", ErrConflict)
+		}
+		if len(attempt.ManifestJSON) == 0 || len(attempt.ResourceSnapshot) == 0 || strings.TrimSpace(attempt.ConfigDigest) == "" {
+			return Attempt{}, false, fmt.Errorf("%w: planned retry attempt %q has no complete immutable snapshot", ErrConflict, attempt.ID)
+		}
 	}
 	now := time.Now().UTC()
+	if attempt.ManifestJSON == nil {
+		attempt.ManifestJSON = []byte{}
+	}
+	if attempt.ResourceSnapshot == nil {
+		attempt.ResourceSnapshot = []byte{}
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO task_attempts (id, task_id, number, immutable, state, created_at)
-		VALUES (?, ?, ?, 1, ?, ?)`, attemptID, taskID, number, task.QUEUED, stamp(now)); err != nil {
+		INSERT INTO task_attempts
+			(id, task_id, number, immutable, state, prompt, base_branch, task_branch,
+			 manifest_json, resource_snapshot, config_digest, created_at)
+		VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`, attempt.ID, taskID, number, task.QUEUED,
+		attempt.Prompt, attempt.BaseBranch, attempt.TaskBranch, attempt.ManifestJSON, attempt.ResourceSnapshot, attempt.ConfigDigest, stamp(now)); err != nil {
 		return Attempt{}, false, fmt.Errorf("insert retry attempt: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx,
+	if forgeEventID != "" {
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO pull_requests
+				(attempt_id, state, number, url, title, head_branch, base_branch, error, notified_at)
+			SELECT ?, state, number, url, title, head_branch, base_branch, error, notified_at
+			FROM pull_requests WHERE attempt_id = ? AND state = 'open'`, attempt.ID, currentAttemptID)
+		if err != nil {
+			return Attempt{}, false, fmt.Errorf("copy forge retry pull request: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return Attempt{}, false, fmt.Errorf("%w: running forge event %q has no open pull request", ErrConflict, forgeEventID)
+		}
+		result, err = tx.ExecContext(ctx, `
+			UPDATE forge_events SET attempt_id = ?, updated_at = ?
+			WHERE id = ? AND task_id = ? AND attempt_id = ? AND status = 'running'`,
+			attempt.ID, stamp(now), forgeEventID, taskID, currentAttemptID)
+		if err != nil {
+			return Attempt{}, false, fmt.Errorf("rebind forge event retry: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+			return Attempt{}, false, fmt.Errorf("%w: running forge event %q changed during retry", ErrConflict, forgeEventID)
+		}
+	}
+	result, err := tx.ExecContext(ctx,
 		"UPDATE tasks SET state = ?, current_attempt_id = ?, cancellation_requested = 0, updated_at = ? WHERE id = ? AND state = ?",
-		task.QUEUED, attemptID, stamp(now), taskID, task.FAILED,
-	); err != nil {
+		task.QUEUED, attempt.ID, stamp(now), taskID, task.FAILED,
+	)
+	if err != nil {
 		return Attempt{}, false, fmt.Errorf("update current retry attempt: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		return Attempt{}, false, fmt.Errorf("%w: task %q changed during retry", ErrConflict, taskID)
 	}
 	eventID, err := newID("swe-event-")
 	if err != nil {
@@ -989,21 +1166,20 @@ func (s *Store) RetryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 		INSERT INTO task_events
 			(id, task_id, attempt_id, occurred_at, from_state, to_state, reason, trigger, resource_identity, metadata, error)
 		VALUES (?, ?, ?, ?, ?, ?, 'retry requested', 'api', '{}', '{}', '')`,
-		eventID, taskID, attemptID, stamp(now), task.FAILED, task.QUEUED); err != nil {
+		eventID, taskID, attempt.ID, stamp(now), task.FAILED, task.QUEUED); err != nil {
 		return Attempt{}, false, fmt.Errorf("append retry event: %w", err)
 	}
 	if idempotencyKey != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO retry_intents (task_id, idempotency_key, attempt_id, created_at) VALUES (?, ?, ?, ?)`,
-			taskID, idempotencyKey, attemptID, stamp(now)); err != nil {
+			taskID, idempotencyKey, attempt.ID, stamp(now)); err != nil {
 			return Attempt{}, false, fmt.Errorf("record retry intent: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Attempt{}, false, fmt.Errorf("commit task retry: %w", err)
 	}
-	return Attempt{
-		ID: attemptID, TaskID: taskID, Number: number, Immutable: true, State: task.QUEUED, CreatedAt: now,
-	}, true, nil
+	attempt.CreatedAt = now
+	return attempt, true, nil
 }
 
 // SaveAttemptSnapshot stores immutable worker inputs before any external
@@ -1777,7 +1953,8 @@ func scanAttempt(row scanner) (Attempt, error) {
 	var state, createdAt string
 	var immutable, logsExhausted int
 	if err := row.Scan(
-		&result.ID, &result.TaskID, &result.Number, &immutable, &state, &logsExhausted,
+		&result.ID, &result.TaskID, &result.Number, &immutable, &state,
+		&result.Prompt, &result.BaseBranch, &result.TaskBranch, &logsExhausted,
 		&result.ValidationState, &result.ManifestJSON, &result.ResourceSnapshot, &result.ConfigDigest, &createdAt,
 	); err != nil {
 		return Attempt{}, err

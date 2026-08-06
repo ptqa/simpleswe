@@ -10,18 +10,24 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
-const maxResponseBody = 1 << 20
+const (
+	maxResponseBody            = 1 << 20
+	maxCommentListResponseBody = 32 << 20
+)
 
 type HTTPError struct {
 	StatusCode         int
 	Status             string
 	Message            string
 	RetryAfter         bool
+	RetryAfterDelay    time.Duration
 	RateLimitExhausted bool
 }
 
@@ -32,7 +38,8 @@ func (e *HTTPError) Error() string {
 	return "GitHub returned " + e.Status + ": " + e.Message
 }
 
-func (e *HTTPError) HTTPStatusCode() int { return e.StatusCode }
+func (e *HTTPError) HTTPStatusCode() int       { return e.StatusCode }
+func (e *HTTPError) RetryDelay() time.Duration { return e.RetryAfterDelay }
 
 func (e *HTTPError) Retryable() bool {
 	switch e.StatusCode {
@@ -66,7 +73,7 @@ func NewClient(baseURL, token string) (*Client, error) {
 func (c *Client) CreatePullRequest(ctx context.Context, owner, repository string, input forge.CreatePullRequestRequest) (_ forge.PullRequest, resultErr error) {
 	endpoint, err := c.endpoint(owner, repository)
 	if err != nil {
-		return forge.PullRequest{}, err
+		return forge.PullRequest{}, forge.MarkPermanent(err)
 	}
 	body, err := json.Marshal(struct {
 		Title string `json:"title"`
@@ -103,15 +110,16 @@ func (c *Client) CreatePullRequest(ctx context.Context, owner, repository string
 	}
 	var decoded pullRequestResponse
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return forge.PullRequest{}, fmt.Errorf("decode GitHub response: %w", err)
+		return forge.PullRequest{}, forge.MarkPermanent(fmt.Errorf("decode GitHub response: %w", err))
 	}
-	return validatePullRequest(decoded, "decode GitHub response")
+	pullRequest, err := validatePullRequest(decoded, "decode GitHub response")
+	return pullRequest, forge.MarkPermanent(err)
 }
 
-func (c *Client) FindPullRequest(ctx context.Context, owner, repository, sourceBranch, taskMarker string) (_ forge.PullRequest, _ bool, resultErr error) {
+func (c *Client) FindPullRequest(ctx context.Context, owner, repository, sourceBranch, destinationBranch, taskMarker string) (_ forge.PullRequest, _ bool, resultErr error) {
 	endpoint, err := c.endpoint(owner, repository)
 	if err != nil {
-		return forge.PullRequest{}, false, err
+		return forge.PullRequest{}, false, forge.MarkPermanent(err)
 	}
 	target, err := url.Parse(endpoint)
 	if err != nil {
@@ -120,6 +128,7 @@ func (c *Client) FindPullRequest(ctx context.Context, owner, repository, sourceB
 	query := target.Query()
 	query.Set("state", "open")
 	query.Set("head", owner+":"+sourceBranch)
+	query.Set("base", destinationBranch)
 	target.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
@@ -146,17 +155,68 @@ func (c *Client) FindPullRequest(ctx context.Context, owner, repository, sourceB
 	}
 	var decoded []pullRequestResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return forge.PullRequest{}, false, fmt.Errorf("decode GitHub lookup response: %w", err)
+		return forge.PullRequest{}, false, forge.MarkPermanent(fmt.Errorf("decode GitHub lookup response: %w", err))
 	}
 	marker := "simpleswe task " + taskMarker
 	for _, candidate := range decoded {
-		if candidate.Head.Ref != sourceBranch || !strings.Contains(candidate.Body, marker) {
+		if candidate.Head.Ref != sourceBranch || candidate.Base.Ref != destinationBranch || !strings.Contains(candidate.Body, marker) {
+			continue
+		}
+		state := strings.ToLower(candidate.State)
+		if candidate.Merged {
+			state = "merged"
+		}
+		if state != "open" {
+			continue
+		}
+		if candidate.Head.Repository.Owner.Login == "" || candidate.Head.Repository.Name == "" {
+			return forge.PullRequest{}, false, forge.MarkPermanent(errors.New("decode GitHub lookup response: missing source repository identity"))
+		}
+		if !strings.EqualFold(candidate.Head.Repository.Owner.Login, owner) || !strings.EqualFold(candidate.Head.Repository.Name, repository) {
 			continue
 		}
 		pullRequest, err := validatePullRequest(candidate, "decode GitHub lookup response")
-		return pullRequest, err == nil, err
+		return pullRequest, err == nil, forge.MarkPermanent(err)
 	}
 	return forge.PullRequest{}, false, nil
+}
+
+// GetPullRequest reads current provider truth from the configured repository
+// endpoint. Response URLs are intentionally ignored.
+func (c *Client) GetPullRequest(ctx context.Context, owner, repository string, number int) (_ forge.PullRequestState, resultErr error) {
+	endpoint, err := c.pullRequestEndpoint(owner, repository, number)
+	if err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(fmt.Errorf("create GitHub pull request request: %w", err))
+	}
+	c.setHeaders(request)
+	response, err := c.do(request)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return forge.PullRequestState{}, fmt.Errorf("GitHub pull request context: %w", contextErr)
+		}
+		return forge.PullRequestState{}, fmt.Errorf("GitHub pull request failed: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, response.Body.Close()) }()
+	body, err := readBounded(response.Body)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return forge.PullRequestState{}, fmt.Errorf("GitHub pull request response context: %w", contextErr)
+		}
+		return forge.PullRequestState{}, fmt.Errorf("read GitHub pull request response: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return forge.PullRequestState{}, c.httpError(response, body)
+	}
+	var decoded pullRequestResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(fmt.Errorf("decode GitHub pull request response: %w", err))
+	}
+	state, err := validatePullRequestState(decoded)
+	return state, forge.MarkPermanent(err)
 }
 
 func (c *Client) endpoint(owner, repository string) (string, error) {
@@ -171,6 +231,25 @@ func (c *Client) endpoint(owner, repository string) (string, error) {
 	escapedBasePath := strings.TrimRight(c.baseURL.EscapedPath(), "/")
 	target.Path = basePath + "/repos/" + owner + "/" + repository + "/pulls"
 	target.RawPath = escapedBasePath + "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repository) + "/pulls"
+	return target.String(), nil
+}
+
+func (c *Client) pullRequestEndpoint(owner, repository string, number int) (string, error) {
+	if number <= 0 {
+		return "", errors.New("GitHub pull request number must be positive")
+	}
+	endpoint, err := c.endpoint(owner, repository)
+	if err != nil {
+		return "", err
+	}
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse GitHub pull request endpoint: %w", err)
+	}
+	suffix := "/" + strconv.Itoa(number)
+	escapedPath := target.EscapedPath()
+	target.Path += suffix
+	target.RawPath = escapedPath + suffix
 	return target.String(), nil
 }
 
@@ -207,6 +286,7 @@ func (c *Client) httpError(response *http.Response, body []byte) *HTTPError {
 		Status:             response.Status,
 		Message:            c.redact(strings.TrimSpace(string(body))),
 		RetryAfter:         response.Header.Get("Retry-After") != "",
+		RetryAfterDelay:    forge.ParseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
 		RateLimitExhausted: strings.TrimSpace(response.Header.Get("X-Ratelimit-Remaining")) == "0",
 	}
 }
@@ -225,13 +305,40 @@ func validatePullRequest(decoded pullRequestResponse, prefix string) (forge.Pull
 	return forge.PullRequest{ID: decoded.Number, HTMLURL: decoded.HTMLURL}, nil
 }
 
+func validatePullRequestState(decoded pullRequestResponse) (forge.PullRequestState, error) {
+	state := strings.ToLower(decoded.State)
+	if decoded.Merged {
+		state = "merged"
+	}
+	if decoded.Number <= 0 || (state != "open" && state != "closed" && state != "merged") ||
+		decoded.Head.Ref == "" || decoded.Head.Repository.Owner.Login == "" || decoded.Head.Repository.Name == "" || decoded.Base.Ref == "" {
+		return forge.PullRequestState{}, errors.New("decode GitHub pull request response: incomplete pull request state or refs")
+	}
+	if err := forge.ValidateNormalizedIdentity("GitHub pull request head SHA", decoded.Head.SHA, true); err != nil {
+		return forge.PullRequestState{}, fmt.Errorf("decode GitHub pull request response: %w", err)
+	}
+	return forge.PullRequestState{
+		Number: decoded.Number, State: state,
+		SourceOwner: decoded.Head.Repository.Owner.Login, SourceRepository: decoded.Head.Repository.Name,
+		SourceBranch: decoded.Head.Ref, DestinationBranch: decoded.Base.Ref, HeadSHA: decoded.Head.SHA,
+	}, nil
+}
+
 func readBounded(reader io.Reader) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(reader, maxResponseBody+1))
+	return readBoundedTo(reader, maxResponseBody)
+}
+
+func readCommentListBounded(reader io.Reader) ([]byte, error) {
+	return readBoundedTo(reader, maxCommentListResponseBody)
+}
+
+func readBoundedTo(reader io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read bounded response: %w", err)
 	}
-	if len(body) > maxResponseBody {
-		return nil, fmt.Errorf("response body exceeds %d bytes", maxResponseBody)
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
 	}
 	return body, nil
 }
@@ -248,7 +355,19 @@ type pullRequestResponse struct {
 	Number  int    `json:"number"`
 	Body    string `json:"body"`
 	HTMLURL string `json:"html_url"`
+	State   string `json:"state"`
+	Merged  bool   `json:"merged"`
 	Head    struct {
-		Ref string `json:"ref"`
+		Ref        string `json:"ref"`
+		SHA        string `json:"sha"`
+		Repository struct {
+			Name  string `json:"name"`
+			Owner struct {
+				Login string `json:"login"`
+			} `json:"owner"`
+		} `json:"repo"`
 	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 }

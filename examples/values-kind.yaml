@@ -21,6 +21,7 @@ resources:
 config:
   controller:
     listen_address: ":8080"
+    webhook_listen_address: ":8081"
     namespace: simpleswe
     deadline: 10m
     max_fix_attempts: 1

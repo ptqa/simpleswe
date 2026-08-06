@@ -2,12 +2,16 @@
 package forge
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -93,6 +97,97 @@ type PullRequest struct {
 	HTMLURL string
 }
 
+// PullRequestState is the provider-reported identity and lifecycle state used
+// to verify an owned pull request before starting follow-up work.
+type PullRequestState struct {
+	Number            int
+	State             string
+	SourceOwner       string
+	SourceRepository  string
+	SourceBranch      string
+	DestinationBranch string
+	HeadSHA           string
+}
+
+// Event is the normalized subset of a provider webhook that can affect a
+// simpleswe pull request.
+type Event struct {
+	DeliveryID        string
+	Provider          Provider
+	Kind              string
+	Owner             string
+	Repository        string
+	PullRequestNumber int
+	CommitSHA         string
+	Branch            string
+	CommentID         int
+	CommentKind       string
+	Title             string
+	Body              string
+	Author            string
+	URL               string
+}
+
+// ReplyRequest describes a comment or general pull-request reply.
+type ReplyRequest struct {
+	PullRequestNumber int
+	CommentID         int
+	CommentKind       string
+	Body              string
+}
+
+// ReplyMarker identifies one event's provider reply across process crashes.
+func ReplyMarker(eventID string) string {
+	digest := sha256.Sum256([]byte(eventID))
+	return fmt.Sprintf("<!-- simpleswe:%x -->", digest[:8])
+}
+
+var replyMarkerPattern = regexp.MustCompile(`<!-- simpleswe:[0-9a-f]{16} -->`)
+
+// ContainsReplyMarker reports only comments emitted by ReplyMarker.
+func ContainsReplyMarker(body string) bool {
+	return replyMarkerPattern.MatchString(body)
+}
+
+const MaxNormalizedTextLength = 128 * 1024
+
+// ValidateNormalizedText checks text before it crosses into the worker
+// prompt boundary.
+func ValidateNormalizedText(name, value string, required bool) error {
+	if required && strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	if len(value) > MaxNormalizedTextLength {
+		return fmt.Errorf("%s is too long", name)
+	}
+	if strings.IndexFunc(value, func(char rune) bool {
+		return unicode.IsControl(char) && char != '\n' && char != '\r' && char != '\t'
+	}) >= 0 {
+		return fmt.Errorf("%s contains control characters", name)
+	}
+	return nil
+}
+
+// ValidateNormalizedIdentity checks identifiers and routing coordinates, where
+// control whitespace is not permitted.
+func ValidateNormalizedIdentity(name, value string, required bool) error {
+	if err := ValidateNormalizedText(name, value, required); err != nil {
+		return err
+	}
+	if strings.IndexFunc(value, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%s contains control characters", name)
+	}
+	return nil
+}
+
+// ValidateReplyRequest checks the provider-neutral reply fields.
+func ValidateReplyRequest(request ReplyRequest) error {
+	if request.PullRequestNumber <= 0 {
+		return errors.New("reply pull request number must be positive")
+	}
+	return ValidateNormalizedText("reply body", request.Body, true)
+}
+
 type statusCoder interface {
 	HTTPStatusCode() int
 }
@@ -103,6 +198,10 @@ type retryableError interface {
 
 type permanentError interface {
 	Permanent() bool
+}
+
+type retryDelayer interface {
+	RetryDelay() time.Duration
 }
 
 type markedPermanentError struct{ error }
@@ -116,6 +215,37 @@ func MarkPermanent(err error) error {
 		return nil
 	}
 	return markedPermanentError{err}
+}
+
+// RetryDelay returns a provider-requested retry delay when one was parsed
+// reliably from the response.
+func RetryDelay(err error) time.Duration {
+	var delayed retryDelayer
+	if errors.As(err, &delayed) {
+		return delayed.RetryDelay()
+	}
+	return 0
+}
+
+// ParseRetryAfter accepts the two standard Retry-After representations.
+func ParseRetryAfter(value string, now time.Time) time.Duration {
+	const maximum = 24 * time.Hour
+	trimmed := strings.TrimSpace(value)
+	if trimmed != "" && strings.Trim(trimmed, "0123456789") == "" {
+		seconds, err := strconv.ParseUint(trimmed, 10, 64)
+		if seconds == 0 {
+			return 0
+		}
+		if err != nil || seconds >= uint64(maximum/time.Second) {
+			return maximum
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return min(when.Sub(now), maximum)
 }
 
 // IsPermanent reports only clear client errors. Timeout, conflict, locked,

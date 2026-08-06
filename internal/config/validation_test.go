@@ -79,10 +79,11 @@ func TestQuantitySign(t *testing.T) {
 func validConfig() Config {
 	return Config{
 		Controller: ControllerConfig{
-			ListenAddress:  ":8080",
-			Namespace:      "simpleswe",
-			Deadline:       time.Minute,
-			MaxFixAttempts: 1,
+			ListenAddress:        ":8080",
+			WebhookListenAddress: ":8081",
+			Namespace:            "simpleswe",
+			Deadline:             time.Minute,
+			MaxFixAttempts:       1,
 		},
 		Worker: WorkerConfig{
 			Command:      "opencode",
@@ -94,9 +95,11 @@ func validConfig() Config {
 
 func TestConfigValidateTopLevelFields(t *testing.T) {
 	for name, edit := range map[string]func(*Config){
-		"listen address": func(c *Config) { c.Controller.ListenAddress = "" },
-		"namespace":      func(c *Config) { c.Controller.Namespace = "INVALID" },
-		"deadline":       func(c *Config) { c.Controller.Deadline = 0 },
+		"listen address":         func(c *Config) { c.Controller.ListenAddress = "" },
+		"webhook listen address": func(c *Config) { c.Controller.WebhookListenAddress = " " },
+		"shared listen address":  func(c *Config) { c.Controller.WebhookListenAddress = c.Controller.ListenAddress },
+		"namespace":              func(c *Config) { c.Controller.Namespace = "INVALID" },
+		"deadline":               func(c *Config) { c.Controller.Deadline = 0 },
 		"max fix attempts": func(c *Config) {
 			c.Controller.MaxFixAttempts = -1
 		},

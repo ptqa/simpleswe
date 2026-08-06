@@ -52,6 +52,7 @@ type controllerContract interface {
 
 type fixture struct {
 	ctx          context.Context
+	databasePath string
 	store        *store.Store
 	kube         *fake.Clientset
 	config       config.Config
@@ -62,7 +63,8 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "controller.sqlite"))
+	databasePath := filepath.Join(t.TempDir(), "controller.sqlite")
+	db, err := store.Open(context.Background(), databasePath)
 	if err != nil {
 		t.Fatalf("open Store: %v", err)
 	}
@@ -97,6 +99,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	return &fixture{
 		ctx:          context.Background(),
+		databasePath: databasePath,
 		store:        db,
 		kube:         kube,
 		config:       cfg,
@@ -146,15 +149,28 @@ type pullRequestCall struct {
 }
 
 type fakePullRequestCreator struct {
-	mu          sync.Mutex
-	calls       []pullRequestCall
-	found       *forge.PullRequest
-	findCalls   int
-	findTargets []forge.Target
-	failFind    int
-	findErr     error
-	blocked     chan struct{}
-	release     chan struct{}
+	mu                 sync.Mutex
+	calls              []pullRequestCall
+	replyTargets       []forge.Target
+	replies            []forge.ReplyRequest
+	replyExistTargets  []forge.Target
+	replyExistRequests []forge.ReplyRequest
+	replyMarkers       []string
+	replyExists        bool
+	replyExistsErr     error
+	replyErr           error
+	found              *forge.PullRequest
+	findCalls          int
+	findTargets        []forge.Target
+	failFind           int
+	findErr            error
+	getResult          *forge.PullRequestState
+	getErr             error
+	getCalls           int
+	getTargets         []forge.Target
+	getNumbers         []int
+	blocked            chan struct{}
+	release            chan struct{}
 }
 
 func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
@@ -164,7 +180,7 @@ func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, target for
 	return forge.PullRequest{ID: 42, HTMLURL: pullRequestURL}, nil
 }
 
-func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, target forge.Target, _, _ string) (forge.PullRequest, bool, error) {
+func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, target forge.Target, _, _, _ string) (forge.PullRequest, bool, error) {
 	f.mu.Lock()
 	f.findCalls++
 	f.findTargets = append(f.findTargets, target)
@@ -192,6 +208,43 @@ func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, target for
 		return forge.PullRequest{}, false, nil
 	}
 	return *found, true, nil
+}
+
+func (f *fakePullRequestCreator) GetPullRequest(_ context.Context, target forge.Target, number int) (forge.PullRequestState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getCalls++
+	f.getTargets = append(f.getTargets, target)
+	f.getNumbers = append(f.getNumbers, number)
+	if f.getErr != nil {
+		return forge.PullRequestState{}, f.getErr
+	}
+	if f.getResult != nil {
+		return *f.getResult, nil
+	}
+	result := forge.PullRequestState{Number: number, State: "open", SourceOwner: target.Owner, SourceRepository: target.Repository, HeadSHA: fullCommitSHA}
+	if len(f.calls) > 0 {
+		result.SourceBranch = f.calls[len(f.calls)-1].input.SourceBranch
+		result.DestinationBranch = f.calls[len(f.calls)-1].input.DestinationBranch
+	}
+	return result, nil
+}
+
+func (f *fakePullRequestCreator) ReplyToPullRequest(_ context.Context, target forge.Target, input forge.ReplyRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replyTargets = append(f.replyTargets, target)
+	f.replies = append(f.replies, input)
+	return f.replyErr
+}
+
+func (f *fakePullRequestCreator) PullRequestReplyExists(_ context.Context, target forge.Target, input forge.ReplyRequest, marker string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.replyExistTargets = append(f.replyExistTargets, target)
+	f.replyExistRequests = append(f.replyExistRequests, input)
+	f.replyMarkers = append(f.replyMarkers, marker)
+	return f.replyExists, f.replyExistsErr
 }
 
 var (

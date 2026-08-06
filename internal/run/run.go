@@ -176,23 +176,33 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 	runtime, err := controllerruntime.NewRuntime(kube, db, control, backend, controllerruntime.Options{
 		Namespace: cfg.Controller.Namespace, SecretRetention: time.Hour, Logger: logger,
 		NotifyPendingPullRequests: control.NotifyPendingPullRequests,
+		ProcessForgeEvents:        control.ProcessForgeEvents,
 	})
 	if err != nil {
 		return err
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", metricsHandler{store: db})
-	mux.Handle("/", api.NewHandler(backend))
+	webhooks, err := newWebhookHandler(cfg, db)
+	if err != nil {
+		return err
+	}
+	mainHandler := http.NewServeMux()
+	mainHandler.Handle("/metrics", metricsHandler{store: db})
+	mainHandler.Handle("/", api.NewHandler(backend))
 	server := &http.Server{
-		Addr: cfg.Controller.ListenAddress, Handler: mux,
+		Addr: cfg.Controller.ListenAddress, Handler: mainHandler,
 		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
 	}
-	logger.InfoContext(ctx, "controller starting", "address", cfg.Controller.ListenAddress, "namespace", cfg.Controller.Namespace)
+	webhookServer := &http.Server{
+		Addr: cfg.Controller.WebhookListenAddress, Handler: webhooks,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
+	}
+	logger.InfoContext(ctx, "controller starting", "address", cfg.Controller.ListenAddress, "webhook_address", cfg.Controller.WebhookListenAddress, "namespace", cfg.Controller.Namespace)
 	components := make([]func(context.Context) error, 1, 3)
 	components[0] = runtime.Run
 	components = append(components, slack.components(db, control, logger)...)
-	return runControllerComponents(ctx, server, components...)
+	return runControllerComponents(ctx, server, webhookServer, components...)
 }
 
 type slackServices struct {
@@ -288,10 +298,10 @@ func (n *pullRequestNotifier) PostPullRequest(ctx context.Context, taskID, url s
 	return n.messenger.PostMessage(ctx, task.SlackOrigin, "Pull request: "+url)
 }
 
-func runControllerComponents(ctx context.Context, server *http.Server, components ...func(context.Context) error) error {
+func runControllerComponents(ctx context.Context, server, webhookServer *http.Server, components ...func(context.Context) error) error {
 	componentCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan error, len(components)+1)
+	results := make(chan error, len(components)+2)
 	var wg sync.WaitGroup
 	start := func(name string, run func(context.Context) error) {
 		wg.Add(1)
@@ -314,6 +324,13 @@ func runControllerComponents(ctx context.Context, server *http.Server, component
 		}
 		return err
 	})
+	start("webhook server", func(context.Context) error {
+		err := webhookServer.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
 	for i, component := range components {
 		start(fmt.Sprintf("controller component %d", i+1), component)
 	}
@@ -325,7 +342,7 @@ func runControllerComponents(ctx context.Context, server *http.Server, component
 	}
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	shutdownErr := server.Shutdown(shutdownCtx)
+	shutdownErr := errors.Join(server.Shutdown(shutdownCtx), webhookServer.Shutdown(shutdownCtx))
 	shutdownCancel()
 	wg.Wait()
 	close(results)
@@ -408,7 +425,10 @@ func readGithubToken(root, secretName string) (string, error) {
 
 type pullRequestClient interface {
 	CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error)
-	FindPullRequest(context.Context, string, string, string, string) (forge.PullRequest, bool, error)
+	FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error)
+	GetPullRequest(context.Context, string, string, int) (forge.PullRequestState, error)
+	PullRequestReplyExists(context.Context, string, string, forge.ReplyRequest, string) (bool, error)
+	ReplyToPullRequest(context.Context, string, string, forge.ReplyRequest) error
 }
 
 type forgeRouter map[forge.Target]pullRequestClient
@@ -503,16 +523,51 @@ func (r forgeRouter) CreatePullRequest(ctx context.Context, target forge.Target,
 	return pullRequest, nil
 }
 
-func (r forgeRouter) FindPullRequest(ctx context.Context, target forge.Target, sourceBranch, taskMarker string) (forge.PullRequest, bool, error) {
+func (r forgeRouter) FindPullRequest(ctx context.Context, target forge.Target, sourceBranch, destinationBranch, taskMarker string) (forge.PullRequest, bool, error) {
 	client, err := r.client(target)
 	if err != nil {
 		return forge.PullRequest{}, false, err
 	}
-	pullRequest, found, err := client.FindPullRequest(ctx, target.Owner, target.Repository, sourceBranch, taskMarker)
+	pullRequest, found, err := client.FindPullRequest(ctx, target.Owner, target.Repository, sourceBranch, destinationBranch, taskMarker)
 	if err != nil {
 		return forge.PullRequest{}, false, fmt.Errorf("find pull request for %s/%s: %w", target.Owner, target.Repository, err)
 	}
 	return pullRequest, found, nil
+}
+
+func (r forgeRouter) GetPullRequest(ctx context.Context, target forge.Target, number int) (forge.PullRequestState, error) {
+	client, err := r.client(target)
+	if err != nil {
+		return forge.PullRequestState{}, err
+	}
+	pullRequest, err := client.GetPullRequest(ctx, target.Owner, target.Repository, number)
+	if err != nil {
+		return forge.PullRequestState{}, fmt.Errorf("get pull request for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return pullRequest, nil
+}
+
+func (r forgeRouter) ReplyToPullRequest(ctx context.Context, target forge.Target, input forge.ReplyRequest) error {
+	client, err := r.client(target)
+	if err != nil {
+		return err
+	}
+	if err := client.ReplyToPullRequest(ctx, target.Owner, target.Repository, input); err != nil {
+		return fmt.Errorf("reply to pull request for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return nil
+}
+
+func (r forgeRouter) PullRequestReplyExists(ctx context.Context, target forge.Target, input forge.ReplyRequest, marker string) (bool, error) {
+	client, err := r.client(target)
+	if err != nil {
+		return false, err
+	}
+	found, err := client.PullRequestReplyExists(ctx, target.Owner, target.Repository, input, marker)
+	if err != nil {
+		return false, fmt.Errorf("find pull request reply for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return found, nil
 }
 
 func (r forgeRouter) client(target forge.Target) (pullRequestClient, error) {

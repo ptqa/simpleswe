@@ -41,7 +41,7 @@ func TestBitbucketRouterRoutesFindAndCreateToRepositoryClient(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			if r.Method == http.MethodGet {
-				fmt.Fprintf(w, `{"values":[{"id":%d,"description":"Created by simpleswe task task-1","source":{"branch":{"name":"feature/task-1"}},"links":{"html":{"href":"https://bitbucket.example/pr/%d"}}}]}`, test.id, test.id)
+				fmt.Fprintf(w, `{"values":[{"id":%d,"state":"OPEN","description":"Created by simpleswe task task-1","source":{"branch":{"name":"feature/task-1"},"repository":{"full_name":%q}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pr/%d"}}}]}`, test.id, test.workspace+"/"+test.repository, test.id)
 				return
 			}
 			fmt.Fprintf(w, `{"id":%d,"links":{"html":{"href":"https://bitbucket.example/pr/%d"}}}`, test.id, test.id)
@@ -62,7 +62,7 @@ func TestBitbucketRouterRoutesFindAndCreateToRepositoryClient(t *testing.T) {
 	for i, test := range tests {
 		target := targets[i]
 		target.Owner, target.Repository = strings.ToUpper(target.Owner), strings.ToUpper(target.Repository)
-		found, ok, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "task-1")
+		found, ok, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "main", "task-1")
 		if err != nil || !ok || found.ID != test.id {
 			t.Fatalf("FindPullRequest(%s/%s) = %#v, %t, %v", test.workspace, test.repository, found, ok, err)
 		}

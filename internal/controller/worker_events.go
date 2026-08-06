@@ -166,7 +166,10 @@ func (c *Controller) eventTransition(ctx context.Context, record store.Task, exp
 
 func (c *Controller) handleBranchPushedLocked(ctx context.Context, record store.Task, attempt store.Attempt, jobName, podName string, event protocol.Event) error {
 	if stateAtOrAfter(record.State, task.PR_OPEN) {
-		return c.notifyDurablePullRequest(ctx, record.ID, attempt.ID)
+		return errors.Join(
+			c.notifyDurablePullRequest(ctx, record.ID, attempt.ID),
+			c.completeForgeEventLocked(ctx, record, attempt),
+		)
 	}
 	if record.CancellationRequested || terminal(record.State) {
 		return nil
@@ -246,7 +249,10 @@ func (c *Controller) resumePullRequestLocked(ctx context.Context, record store.T
 		case task.CREATING_PR:
 			goto create
 		case task.PR_OPEN, task.WAITING_CI, task.WAITING_REVIEW, task.READY:
-			return c.notifyDurablePullRequest(ctx, record.ID, attempt.ID)
+			return errors.Join(
+				c.notifyDurablePullRequest(ctx, record.ID, attempt.ID),
+				c.completeForgeEventLocked(ctx, record, attempt),
+			)
 		default:
 			return fmt.Errorf("durable branch for task %q cannot resume from state %q", record.ID, record.State)
 		}
@@ -272,7 +278,7 @@ create:
 	}
 	if durable.State == "creating" {
 		providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
-		pullRequest, found, findErr := c.pullRequests.FindPullRequest(providerCtx, target, git.Branch, record.ID)
+		pullRequest, found, findErr := c.pullRequests.FindPullRequest(providerCtx, target, git.Branch, manifest.BaseBranch, record.ID)
 		cancel()
 		if findErr != nil {
 			return c.handlePullRequestError(ctx, record, attempt, findErr)
@@ -315,7 +321,7 @@ create:
 		c.logger.ErrorContext(ctx, "notify durable pull request", "task", record.ID, "attempt", attempt.ID, "error", err)
 	}
 	c.logger.InfoContext(ctx, "pull request opened", "task", record.ID, "attempt", attempt.ID, "url", durable.URL)
-	return nil
+	return c.completeForgeEventLocked(ctx, record, attempt)
 }
 
 func (c *Controller) handlePullRequestError(ctx context.Context, record store.Task, attempt store.Attempt, providerErr error) error {
@@ -356,28 +362,29 @@ func attemptManifest(attempt store.Attempt) (protocol.TaskManifest, error) {
 func (c *Controller) attemptForgeTarget(record store.Task, attempt store.Attempt) (forge.Target, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(attempt.ResourceSnapshot, &fields); err != nil {
-		return forge.Target{}, fmt.Errorf("decode immutable resource snapshot for attempt %q: %w", attempt.ID, err)
+		return forge.Target{}, forge.MarkPermanent(fmt.Errorf("decode immutable resource snapshot for attempt %q: %w", attempt.ID, err))
 	}
 	if fields == nil {
-		return forge.Target{}, fmt.Errorf("decode immutable resource snapshot for attempt %q: expected JSON object", attempt.ID)
+		return forge.Target{}, forge.MarkPermanent(fmt.Errorf("decode immutable resource snapshot for attempt %q: expected JSON object", attempt.ID))
 	}
 	raw, snapshotted := fields["forge_target"]
 	if !snapshotted {
 		repository, err := c.repository(record.Repository)
 		if err != nil {
-			return forge.Target{}, err
+			return forge.Target{}, forge.MarkPermanent(err)
 		}
-		return forgeTarget(c.config, repository)
+		target, err := forgeTarget(c.config, repository)
+		return target, forge.MarkPermanent(err)
 	}
 	var target *forge.Target
 	if err := json.Unmarshal(raw, &target); err != nil {
-		return forge.Target{}, fmt.Errorf("decode immutable forge target for attempt %q: %w", attempt.ID, err)
+		return forge.Target{}, forge.MarkPermanent(fmt.Errorf("decode immutable forge target for attempt %q: %w", attempt.ID, err))
 	}
 	if target == nil {
-		return forge.Target{}, fmt.Errorf("validate immutable forge target for attempt %q: target is null", attempt.ID)
+		return forge.Target{}, forge.MarkPermanent(fmt.Errorf("validate immutable forge target for attempt %q: target is null", attempt.ID))
 	}
 	if err := forge.ValidateTarget(*target); err != nil {
-		return forge.Target{}, fmt.Errorf("validate immutable forge target for attempt %q: %w", attempt.ID, err)
+		return forge.Target{}, forge.MarkPermanent(fmt.Errorf("validate immutable forge target for attempt %q: %w", attempt.ID, err))
 	}
 	return *target, nil
 }

@@ -37,7 +37,10 @@ type Notifier interface {
 // PullRequestCreator is the forge surface owned by the pull-request saga.
 type PullRequestCreator interface {
 	CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error)
-	FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error)
+	FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error)
+	GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error)
+	PullRequestReplyExists(context.Context, forge.Target, forge.ReplyRequest, string) (bool, error)
+	ReplyToPullRequest(context.Context, forge.Target, forge.ReplyRequest) error
 }
 
 type Controller struct {
@@ -303,7 +306,34 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 		unlock()
 		return store.Attempt{}, err
 	}
-	attempt, inserted, err := c.store.RetryTaskOnce(ctx, taskID, idempotencyKey)
+	plan, planned, err := c.store.PlanRetryAttempt(ctx, taskID, idempotencyKey)
+	if err != nil {
+		unlock()
+		return store.Attempt{}, err
+	}
+	if !planned {
+		unlock()
+		return plan.Attempt, nil
+	}
+	if event, eventErr := c.store.GetForgeEventByAttempt(ctx, plan.PreviousAttemptID); eventErr == nil && event.Status == store.ForgeEventRunning {
+		previous, getErr := c.store.GetAttempt(ctx, taskID, plan.PreviousAttemptID)
+		if getErr == nil {
+			getErr = c.verifyAttemptProviderOwnership(ctx, current, previous, "")
+		}
+		if getErr != nil {
+			unlock()
+			return store.Attempt{}, getErr
+		}
+	} else if eventErr != nil && !errors.Is(eventErr, store.ErrNotFound) {
+		unlock()
+		return store.Attempt{}, eventErr
+	}
+	plan.Attempt, _, _, err = c.buildAttemptSnapshot(current, plan.Attempt, repository)
+	if err != nil {
+		unlock()
+		return store.Attempt{}, err
+	}
+	attempt, inserted, err := c.store.StartPlannedRetryTaskOnce(ctx, taskID, idempotencyKey, plan)
 	if err != nil {
 		unlock()
 		return store.Attempt{}, err
@@ -311,10 +341,6 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 	if !inserted {
 		unlock()
 		return attempt, nil
-	}
-	if _, _, err := c.prepareAttemptSnapshot(ctx, current, attempt, repository); err != nil {
-		unlock()
-		return attempt, err
 	}
 	unlock()
 	if err := c.startAttempt(ctx, current, attempt, repository); err != nil {
@@ -532,13 +558,24 @@ func (c *Controller) buildAttemptResources(taskRecord store.Task, attempt store.
 	if err != nil {
 		return nil, nil, err
 	}
+	prompt, baseBranch := taskRecord.Prompt, repository.DefaultBranch
+	taskBranch := c.branchName(repository, taskRecord.ID, attempt.Number)
+	if attempt.Prompt != "" {
+		prompt = attempt.Prompt
+	}
+	if attempt.BaseBranch != "" {
+		baseBranch = attempt.BaseBranch
+	}
+	if attempt.TaskBranch != "" {
+		taskBranch = attempt.TaskBranch
+	}
 	job, secret, err := jobs.Build(jobConfig, jobs.TaskManifest{
 		TaskID:             taskRecord.ID,
 		Repository:         repository.Name,
 		CloneURL:           repository.CloneURL,
-		BaseBranch:         repository.DefaultBranch,
-		TaskBranch:         c.branchName(repository, taskRecord.ID, attempt.Number),
-		Prompt:             taskRecord.Prompt,
+		BaseBranch:         baseBranch,
+		TaskBranch:         taskBranch,
+		Prompt:             prompt,
 		Slack:              taskRecord.SlackOrigin,
 		OpenCodeCommand:    c.openCodeCommand(repository),
 		ValidationCommands: c.validationCommands(repository),
@@ -555,30 +592,50 @@ func (c *Controller) buildAttemptResources(taskRecord store.Task, attempt store.
 
 func (c *Controller) prepareAttemptSnapshot(ctx context.Context, taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (*batchv1.Job, *corev1.Secret, error) {
 	if len(attempt.ResourceSnapshot) > 0 {
+		if len(attempt.ManifestJSON) == 0 || strings.TrimSpace(attempt.ConfigDigest) == "" {
+			return nil, nil, forge.MarkPermanent(fmt.Errorf("%w: attempt %q has an incomplete immutable snapshot", store.ErrConflict, attempt.ID))
+		}
 		var snapshot attemptResourceSnapshot
 		if err := json.Unmarshal(attempt.ResourceSnapshot, &snapshot); err != nil {
-			return nil, nil, fmt.Errorf("decode attempt resource snapshot: %w", err)
+			return nil, nil, forge.MarkPermanent(fmt.Errorf("decode attempt resource snapshot: %w", err))
+		}
+		if snapshot.Job.Name == "" || snapshot.Secret.Name == "" {
+			return nil, nil, forge.MarkPermanent(fmt.Errorf("decode attempt resource snapshot: Job and Secret names are required"))
 		}
 		return snapshot.Job.DeepCopy(), snapshot.Secret.DeepCopy(), nil
 	}
-	job, secret, err := c.buildAttemptResources(taskRecord, attempt, repository)
+	if _, err := c.store.GetForgeEventByAttempt(ctx, attempt.ID); err == nil {
+		return nil, nil, forge.MarkPermanent(fmt.Errorf("%w: forge follow-up attempt %q has no immutable snapshot", store.ErrConflict, attempt.ID))
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, nil, err
+	}
+	snapshotted, job, secret, err := c.buildAttemptSnapshot(taskRecord, attempt, repository)
 	if err != nil {
 		return nil, nil, err
 	}
-	target, err := forgeTarget(c.config, repository)
-	if err != nil {
-		return nil, nil, err
-	}
-	resources, err := json.Marshal(attemptResourceSnapshot{Job: *job, Secret: *secret, ForgeTarget: &target})
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal attempt resource snapshot: %w", err)
-	}
-	manifest := secret.Data["task.json"]
-	digest := fmt.Sprintf("sha256:%x", sha256.Sum256(resources))
-	if err := c.store.SaveAttemptSnapshot(ctx, taskRecord.ID, attempt.ID, manifest, resources, digest); err != nil {
+	if err := c.store.SaveAttemptSnapshot(ctx, taskRecord.ID, attempt.ID, snapshotted.ManifestJSON, snapshotted.ResourceSnapshot, snapshotted.ConfigDigest); err != nil {
 		return nil, nil, err
 	}
 	return job, secret, nil
+}
+
+func (c *Controller) buildAttemptSnapshot(taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (store.Attempt, *batchv1.Job, *corev1.Secret, error) {
+	job, secret, err := c.buildAttemptResources(taskRecord, attempt, repository)
+	if err != nil {
+		return store.Attempt{}, nil, nil, err
+	}
+	target, err := forgeTarget(c.config, repository)
+	if err != nil {
+		return store.Attempt{}, nil, nil, err
+	}
+	resources, err := json.Marshal(attemptResourceSnapshot{Job: *job, Secret: *secret, ForgeTarget: &target})
+	if err != nil {
+		return store.Attempt{}, nil, nil, fmt.Errorf("marshal attempt resource snapshot: %w", err)
+	}
+	attempt.ManifestJSON = append([]byte(nil), secret.Data["task.json"]...)
+	attempt.ResourceSnapshot = resources
+	attempt.ConfigDigest = fmt.Sprintf("sha256:%x", sha256.Sum256(resources))
+	return attempt, job, secret, nil
 }
 
 func (c *Controller) validateAttemptConfig(params store.CreateTaskParams, repository config.RepositoryConfig) error {

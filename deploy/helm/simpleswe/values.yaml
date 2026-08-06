@@ -38,6 +38,11 @@ secrets:
     keys:
       botToken: bot-token
       appToken: app-token
+  webhooks:
+    name: simpleswe-webhooks
+    keys:
+      github: github
+      bitbucket: bitbucket
 
 pdb:
   enabled: false
@@ -45,11 +50,14 @@ pdb:
 
 networkPolicy:
   enabled: true
-  # The controller API has no authentication. Empty denies all pod ingress;
+  # The controller API has no authentication. Empty denies API pod ingress;
   # kubectl port-forward remains available because it is node-originated.
   # Entries are native NetworkPolicyPeer objects and may combine namespace and
   # pod selectors to trust only specific callers.
   trustedIngress: []
+  # Peers allowed to reach only the signed webhook listener on port 8081.
+  # Keep empty unless an in-cluster webhook gateway or forwarder needs access.
+  webhookIngress: []
   # Standard NetworkPolicy cannot select DNS names. These CIDRs permit only
   # HTTPS and must cover the Kubernetes API, Slack, Bitbucket, GitHub, and public
   # repository/AI endpoints. The broad practical default can be replaced with
@@ -65,6 +73,7 @@ networkPolicy:
 config:
   controller:
     listen_address: ":8080"
+    webhook_listen_address: ":8081"
     namespace: ""
     deadline: 30m
     max_fix_attempts: 3
@@ -80,6 +89,10 @@ config:
       file: /run/secrets/slack/app-token
   bitbucket:
     base_url: https://api.bitbucket.org
+    webhook_secret:
+      file: /run/secrets/webhooks/bitbucket
   github:
     base_url: https://api.github.com
+    webhook_secret:
+      file: /run/secrets/webhooks/github
   repositories: {}

@@ -10,6 +10,9 @@ import (
 
 func TestLoadAppliesSafeDefaults(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
+bitbucket:
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   - clone_url: https://bitbucket.example/acme/widget.git
     default_branch: main
@@ -26,6 +29,9 @@ repositories:
 
 	if got, want := cfg.Controller.ListenAddress, ":8080"; got != want {
 		t.Errorf("controller listen address = %q, want %q", got, want)
+	}
+	if got, want := cfg.Controller.WebhookListenAddress, ":8081"; got != want {
+		t.Errorf("controller webhook listen address = %q, want %q", got, want)
 	}
 	if got, want := cfg.Controller.Namespace, "simpleswe"; got != want {
 		t.Errorf("controller namespace = %q, want %q", got, want)
@@ -61,6 +67,9 @@ func TestLoadPreservesRepositoryWorkerConfiguration(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
 controller:
   namespace: engineering
+bitbucket:
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   - clone_url: https://bitbucket.example/acme/widget.git
     default_branch: trunk
@@ -230,6 +239,9 @@ repositories:
 
 func TestLoadValidatesRepositoryBitbucketCredentials(t *testing.T) {
 	base := `
+bitbucket:
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   widget:
     worker: {image: worker:v1}
@@ -285,7 +297,10 @@ repositories:
 		}
 	}
 	if _, err := Load(strings.NewReader(`
-bitbucket: {base_url: http://127.0.0.1:8080}
+bitbucket:
+  base_url: http://127.0.0.1:8080
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   widget:
     worker: {image: worker:v1}

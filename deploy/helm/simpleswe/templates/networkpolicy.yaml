@@ -13,13 +13,22 @@ spec:
   policyTypes:
     - Ingress
     - Egress
-  {{- if .Values.networkPolicy.trustedIngress }}
+  {{- if or .Values.networkPolicy.trustedIngress .Values.networkPolicy.webhookIngress }}
   ingress:
+    {{- with .Values.networkPolicy.trustedIngress }}
     - from:
-        {{- toYaml .Values.networkPolicy.trustedIngress | nindent 8 }}
+        {{- toYaml . | nindent 8 }}
       ports:
         - port: 8080
           protocol: TCP
+    {{- end }}
+    {{- with .Values.networkPolicy.webhookIngress }}
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - port: 8081
+          protocol: TCP
+    {{- end }}
   {{- else }}
   ingress: []
   {{- end }}

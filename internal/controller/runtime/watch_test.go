@@ -35,8 +35,17 @@ func (cleanupPullRequests) CreatePullRequest(context.Context, forge.Target, forg
 	return forge.PullRequest{}, errors.New("unexpected pull request creation")
 }
 
-func (cleanupPullRequests) FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error) {
+func (cleanupPullRequests) FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error) {
 	return forge.PullRequest{}, false, nil
+}
+func (cleanupPullRequests) GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error) {
+	return forge.PullRequestState{}, errors.New("unexpected pull request inspection")
+}
+func (cleanupPullRequests) PullRequestReplyExists(context.Context, forge.Target, forge.ReplyRequest, string) (bool, error) {
+	return false, errors.New("unexpected pull request reply lookup")
+}
+func (cleanupPullRequests) ReplyToPullRequest(context.Context, forge.Target, forge.ReplyRequest) error {
+	return errors.New("unexpected pull request reply")
 }
 
 func TestRunWatchesJobsAndPodsRelistsFromResourceVersionAndStopsWithContext(t *testing.T) {

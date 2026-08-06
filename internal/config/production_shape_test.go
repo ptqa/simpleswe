@@ -8,6 +8,9 @@ import (
 
 func TestLoadRepositoryRegistryProductionShape(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
+bitbucket:
+  webhook_secret:
+    file: /run/secrets/webhooks/bitbucket
 repositories:
   widget:
     worker:

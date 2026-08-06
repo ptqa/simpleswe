@@ -143,7 +143,10 @@ func TestRunControllerReportsStartupFailures(t *testing.T) {
 	}
 
 	valid := filepath.Join(t.TempDir(), "config.yaml")
-	configuration := `repositories:
+	configuration := `bitbucket:
+  webhook_secret:
+    env: BITBUCKET_WEBHOOK_SECRET
+repositories:
   - clone_url: https://bitbucket.example/acme/widget.git
     default_branch: main
     worker:
@@ -158,6 +161,7 @@ func TestRunControllerReportsStartupFailures(t *testing.T) {
 	}
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")
 	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+	t.Setenv("BITBUCKET_WEBHOOK_SECRET", "test-secret")
 	err := RunController(context.Background(), valid, filepath.Join(t.TempDir(), "tasks.db"), io.Discard, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "in-cluster Kubernetes config") {
 		t.Fatalf("RunController(outside cluster) error = %v", err)
@@ -255,8 +259,17 @@ func (adapterPullRequests) CreatePullRequest(context.Context, forge.Target, forg
 	return forge.PullRequest{}, nil
 }
 
-func (adapterPullRequests) FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error) {
+func (adapterPullRequests) FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error) {
 	return forge.PullRequest{}, false, nil
+}
+func (adapterPullRequests) GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error) {
+	return forge.PullRequestState{}, nil
+}
+func (adapterPullRequests) PullRequestReplyExists(context.Context, forge.Target, forge.ReplyRequest, string) (bool, error) {
+	return false, nil
+}
+func (adapterPullRequests) ReplyToPullRequest(context.Context, forge.Target, forge.ReplyRequest) error {
+	return nil
 }
 
 func TestLifecycleAdapterDelegatesToController(t *testing.T) {
@@ -311,7 +324,8 @@ func TestRunControllerComponentsStopsAndCancelsPeers(t *testing.T) {
 	server := &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})}
-	err := runControllerComponents(context.Background(), server, func(ctx context.Context) error {
+	webhookServer := &http.Server{Addr: freeAddress(t), Handler: http.NotFoundHandler()}
+	err := runControllerComponents(context.Background(), server, webhookServer, func(ctx context.Context) error {
 		if err := waitForHTTP(ctx, "http://"+address); err != nil {
 			return err
 		}
@@ -325,12 +339,17 @@ func TestRunControllerComponentsStopsAndCancelsPeers(t *testing.T) {
 	server = &http.Server{Addr: address, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})}
+	webhookAddress := freeAddress(t)
+	webhookServer = &http.Server{Addr: webhookAddress, Handler: http.NotFoundHandler()}
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- runControllerComponents(ctx, server, func(componentCtx context.Context) error {
+		done <- runControllerComponents(ctx, server, webhookServer, func(componentCtx context.Context) error {
 			if err := waitForHTTP(componentCtx, "http://"+address); err != nil {
+				return err
+			}
+			if err := waitForHTTP(componentCtx, "http://"+webhookAddress); err != nil {
 				return err
 			}
 			close(ready)
@@ -351,6 +370,34 @@ func TestRunControllerComponentsStopsAndCancelsPeers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("runControllerComponents did not stop")
+	}
+}
+
+func TestRunControllerComponentsStopsWhenWebhookServerFails(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = occupied.Close() })
+
+	componentCancelled := make(chan struct{})
+	err = runControllerComponents(
+		context.Background(),
+		&http.Server{Addr: freeAddress(t), Handler: http.NotFoundHandler()},
+		&http.Server{Addr: occupied.Addr().String(), Handler: http.NotFoundHandler()},
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			close(componentCancelled)
+			return ctx.Err()
+		},
+	)
+	if err == nil {
+		t.Fatal("runControllerComponents(webhook listen failure) error = nil")
+	}
+	select {
+	case <-componentCancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("webhook failure did not cancel controller components")
 	}
 }
 
@@ -513,7 +560,7 @@ func TestBitbucketConfigurationAndMountedSecretErrors(t *testing.T) {
 	if _, err := router.CreatePullRequest(context.Background(), target, forge.CreatePullRequestRequest{}); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("CreatePullRequest(missing route) error = nil")
 	}
-	if _, _, err := router.FindPullRequest(context.Background(), target, "branch", "task"); err == nil || !forge.IsPermanent(err) {
+	if _, _, err := router.FindPullRequest(context.Background(), target, "branch", "main", "task"); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("FindPullRequest(missing route) error = nil")
 	}
 

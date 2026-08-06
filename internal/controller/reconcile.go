@@ -263,13 +263,56 @@ func (c *Controller) reconcileCancellation(ctx context.Context, record store.Tas
 			return nil
 		}
 	}
+	if err := c.deleteCancelledAttemptSecret(ctx, record, attempt); err != nil {
+		return err
+	}
 	if err := c.store.MarkLogsExhausted(ctx, record.ID, attempt.ID); err != nil {
+		return err
+	}
+	if event, err := c.store.GetForgeEventByAttempt(ctx, attempt.ID); err == nil {
+		if event.Status == store.ForgeEventRunning {
+			if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
 	if err := c.transition(ctx, record.ID, record.State, task.CANCELLED, "cancellation confirmed Job and owned Pods absent job="+jobName, "controller"); err != nil {
 		return err
 	}
 	c.logger.InfoContext(ctx, "task cancelled", "task", record.ID, "attempt", attempt.ID, "job", jobName)
+	return nil
+}
+
+func (c *Controller) deleteCancelledAttemptSecret(ctx context.Context, record store.Task, attempt store.Attempt) error {
+	cleanup, err := c.store.GetSecretCleanup(ctx, attempt.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if cleanup.TaskID != record.ID || cleanup.AttemptID != attempt.ID || cleanup.AttemptNumber != attempt.Number {
+		return fmt.Errorf("%w: stale Secret cleanup for task %q attempt %q", store.ErrConflict, record.ID, attempt.ID)
+	}
+	secret, err := c.kubernetes.CoreV1().Secrets(cleanup.Namespace).Get(ctx, cleanup.SecretName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get cancelling Secret %s: %w", cleanup.SecretName, err)
+	}
+	if err := verifyResourceLabels("Secret", secret.Labels, record.ID, attempt); err != nil {
+		return err
+	}
+	options := metav1.DeleteOptions{}
+	if secret.UID != "" {
+		options.Preconditions = &metav1.Preconditions{UID: &secret.UID}
+	}
+	if err := c.kubernetes.CoreV1().Secrets(cleanup.Namespace).Delete(ctx, cleanup.SecretName, options); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("cancel worker Secret %s: %w", cleanup.SecretName, err)
+	}
 	return nil
 }
 

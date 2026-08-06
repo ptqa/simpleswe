@@ -23,7 +23,9 @@ func TestLoadGitHubRepositoryAppliesDefaults(t *testing.T) {
 				ssh = "\n    git:\n      ssh_secret: " + test.sshSecret
 			}
 			cfg, err := Load(strings.NewReader(`
-github: {}
+github:
+  webhook_secret:
+    file: /run/secrets/webhooks/github
 repositories:
   - worker: {image: worker:v1}
     github:
@@ -138,7 +140,9 @@ repositories:
 
 func TestLoadAllowsDuplicateGitHubCoordinatesOnlyWithSameCredentials(t *testing.T) {
 	valid := `
-github: {}
+github:
+  webhook_secret:
+    file: /run/secrets/webhooks/github
 repositories:
   widget-a:
     worker: {image: worker:v1}
@@ -177,7 +181,10 @@ repositories:
 	}
 
 	if _, err := Load(strings.NewReader(`
-github: {base_url: http://127.0.0.1:8080}
+github:
+  base_url: http://127.0.0.1:8080
+  webhook_secret:
+    file: /run/secrets/webhooks/github
 repositories:
   widget:
     worker: {image: worker:v1}

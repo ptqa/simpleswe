@@ -88,7 +88,7 @@ func TestAttemptForgeTargetFallsBackOnlyWhenSnapshotFieldIsAbsent(t *testing.T) 
 		"unknown": `{"forge_target":{"provider":"gitlab","base_url":"https://gitlab.example/api","owner":"acme","repository":"widget","credentials_secret_name":"gitlab"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := control.attemptForgeTarget(record, store.Attempt{ID: name, ResourceSnapshot: []byte(snapshot)}); err == nil {
+			if _, err := control.attemptForgeTarget(record, store.Attempt{ID: name, ResourceSnapshot: []byte(snapshot)}); err == nil || !forge.IsPermanent(err) {
 				t.Fatal("invalid snapshotted target was accepted")
 			}
 		})

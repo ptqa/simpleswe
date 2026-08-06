@@ -10,19 +10,25 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
-const maxResponseBody = 1 << 20
+const (
+	maxResponseBody            = 1 << 20
+	maxCommentListResponseBody = 32 << 20
+)
 
 // HTTPError preserves provider status so lifecycle reconciliation can retry
 // transient failures without treating malformed requests as recoverable.
 type HTTPError struct {
-	StatusCode int
-	Status     string
-	Message    string
+	StatusCode      int
+	Status          string
+	Message         string
+	RetryAfterDelay time.Duration
 }
 
 func (e *HTTPError) Error() string {
@@ -32,7 +38,19 @@ func (e *HTTPError) Error() string {
 	return "Bitbucket returned " + e.Status + ": " + e.Message
 }
 
-func (e *HTTPError) HTTPStatusCode() int { return e.StatusCode }
+func (e *HTTPError) HTTPStatusCode() int       { return e.StatusCode }
+func (e *HTTPError) RetryDelay() time.Duration { return e.RetryAfterDelay }
+func (e *HTTPError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.RetryAfterDelay > 0
+}
+
+func (c *Client) httpError(response *http.Response, body []byte) *HTTPError {
+	return &HTTPError{
+		StatusCode: response.StatusCode, Status: response.Status,
+		Message:         c.redact(strings.TrimSpace(string(body))),
+		RetryAfterDelay: forge.ParseRetryAfter(response.Header.Get("Retry-After"), time.Now()),
+	}
+}
 
 // IsPermanent reports only clear client errors. Timeout, conflict, locked,
 // too-early, and rate-limit responses remain retryable.
@@ -72,7 +90,7 @@ func NewClient(baseURL, username, appPassword string) (*Client, error) {
 func (c *Client) CreatePullRequest(ctx context.Context, workspace, repository string, input CreatePullRequestRequest) (_ PullRequest, resultErr error) {
 	endpoint, err := c.endpoint(workspace, repository)
 	if err != nil {
-		return PullRequest{}, err
+		return PullRequest{}, forge.MarkPermanent(err)
 	}
 
 	body, err := json.Marshal(pullRequestPayload{
@@ -119,23 +137,22 @@ func (c *Client) CreatePullRequest(ctx context.Context, workspace, repository st
 		return PullRequest{}, fmt.Errorf("read Bitbucket response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		message := c.redact(strings.TrimSpace(string(responseBody)))
-		return PullRequest{}, &HTTPError{StatusCode: response.StatusCode, Status: response.Status, Message: message}
+		return PullRequest{}, c.httpError(response, responseBody)
 	}
 
 	var decoded pullRequestResponse
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return PullRequest{}, fmt.Errorf("decode Bitbucket response: %w", err)
+		return PullRequest{}, forge.MarkPermanent(fmt.Errorf("decode Bitbucket response: %w", err))
 	}
 	if decoded.ID <= 0 {
-		return PullRequest{}, errors.New("decode Bitbucket response: missing pull request id")
+		return PullRequest{}, forge.MarkPermanent(errors.New("decode Bitbucket response: missing pull request id"))
 	}
 	if decoded.Links.HTML.Href == "" {
-		return PullRequest{}, errors.New("decode Bitbucket response: missing pull request URL")
+		return PullRequest{}, forge.MarkPermanent(errors.New("decode Bitbucket response: missing pull request URL"))
 	}
 	link, err := url.Parse(decoded.Links.HTML.Href)
 	if err != nil || link.Scheme == "" || link.Host == "" {
-		return PullRequest{}, errors.New("decode Bitbucket response: invalid pull request URL")
+		return PullRequest{}, forge.MarkPermanent(errors.New("decode Bitbucket response: invalid pull request URL"))
 	}
 
 	return PullRequest{ID: decoded.ID, HTMLURL: decoded.Links.HTML.Href}, nil
@@ -143,10 +160,10 @@ func (c *Client) CreatePullRequest(ctx context.Context, workspace, repository st
 
 // FindPullRequest finds an open pull request by both source branch and the
 // simpleswe task marker embedded in its description.
-func (c *Client) FindPullRequest(ctx context.Context, workspace, repository, sourceBranch, taskMarker string) (_ PullRequest, _ bool, resultErr error) {
+func (c *Client) FindPullRequest(ctx context.Context, workspace, repository, sourceBranch, destinationBranch, taskMarker string) (_ PullRequest, _ bool, resultErr error) {
 	endpoint, err := c.endpoint(workspace, repository)
 	if err != nil {
-		return PullRequest{}, false, err
+		return PullRequest{}, false, forge.MarkPermanent(err)
 	}
 	target, err := url.Parse(endpoint)
 	if err != nil {
@@ -155,7 +172,7 @@ func (c *Client) FindPullRequest(ctx context.Context, workspace, repository, sou
 	query := target.Query()
 	query.Set("state", "OPEN")
 	query.Set("pagelen", "50")
-	query.Set("q", fmt.Sprintf(`source.branch.name=%q`, sourceBranch))
+	query.Set("q", fmt.Sprintf(`source.branch.name=%q AND destination.branch.name=%q`, sourceBranch, destinationBranch))
 	target.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
@@ -180,27 +197,80 @@ func (c *Client) FindPullRequest(ctx context.Context, workspace, repository, sou
 		return PullRequest{}, false, fmt.Errorf("read Bitbucket lookup response: %w", err)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return PullRequest{}, false, &HTTPError{StatusCode: response.StatusCode, Status: response.Status, Message: c.redact(strings.TrimSpace(string(body)))}
+		return PullRequest{}, false, c.httpError(response, body)
 	}
 	var decoded pullRequestListResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {
-		return PullRequest{}, false, fmt.Errorf("decode Bitbucket lookup response: %w", err)
+		return PullRequest{}, false, forge.MarkPermanent(fmt.Errorf("decode Bitbucket lookup response: %w", err))
 	}
 	marker := "simpleswe task " + taskMarker
 	for _, candidate := range decoded.Values {
-		if candidate.Source.Branch.Name != sourceBranch || !strings.Contains(candidate.Description, marker) {
+		if candidate.Source.Branch.Name != sourceBranch || candidate.Destination.Branch.Name != destinationBranch || !strings.Contains(candidate.Description, marker) {
+			continue
+		}
+		if !strings.EqualFold(candidate.State, "open") {
+			continue
+		}
+		sourceWorkspace, sourceRepository, ok := bitbucketRepositoryCoordinates(candidate.Source.Repository)
+		if !ok {
+			return PullRequest{}, false, forge.MarkPermanent(errors.New("decode Bitbucket lookup response: missing source repository identity"))
+		}
+		if !strings.EqualFold(sourceWorkspace, workspace) || !strings.EqualFold(sourceRepository, repository) {
 			continue
 		}
 		if candidate.ID <= 0 || candidate.Links.HTML.Href == "" {
-			return PullRequest{}, false, errors.New("decode Bitbucket lookup response: incomplete pull request")
+			return PullRequest{}, false, forge.MarkPermanent(errors.New("decode Bitbucket lookup response: incomplete pull request"))
 		}
 		link, err := url.Parse(candidate.Links.HTML.Href)
 		if err != nil || link.Scheme == "" || link.Host == "" {
-			return PullRequest{}, false, errors.New("decode Bitbucket lookup response: invalid pull request URL")
+			return PullRequest{}, false, forge.MarkPermanent(errors.New("decode Bitbucket lookup response: invalid pull request URL"))
 		}
 		return PullRequest{ID: candidate.ID, HTMLURL: candidate.Links.HTML.Href}, true, nil
 	}
 	return PullRequest{}, false, nil
+}
+
+// GetPullRequest reads current provider truth from the configured repository
+// endpoint. Response URLs are intentionally ignored.
+func (c *Client) GetPullRequest(ctx context.Context, workspace, repository string, number int) (_ forge.PullRequestState, resultErr error) {
+	endpoint, err := c.pullRequestEndpoint(workspace, repository, number)
+	if err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(err)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(fmt.Errorf("create Bitbucket pull request request: %w", err))
+	}
+	request.SetBasicAuth(c.username, c.appPassword)
+	request.Header.Set("Accept", "application/json")
+	httpClient := c.httpClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	response, err := httpClient.Do(request)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return forge.PullRequestState{}, contextErr
+		}
+		return forge.PullRequestState{}, fmt.Errorf("Bitbucket pull request failed: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, response.Body.Close()) }()
+	body, err := readBounded(response.Body)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return forge.PullRequestState{}, contextErr
+		}
+		return forge.PullRequestState{}, fmt.Errorf("read Bitbucket pull request response: %w", err)
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return forge.PullRequestState{}, c.httpError(response, body)
+	}
+	var decoded pullRequestResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return forge.PullRequestState{}, forge.MarkPermanent(fmt.Errorf("decode Bitbucket pull request response: %w", err))
+	}
+	state, err := validatePullRequestState(decoded)
+	return state, forge.MarkPermanent(err)
 }
 
 func (c *Client) redact(message string) string {
@@ -238,6 +308,25 @@ func (c *Client) endpoint(workspace, repository string) (string, error) {
 	return target.String(), nil
 }
 
+func (c *Client) pullRequestEndpoint(workspace, repository string, number int) (string, error) {
+	if number <= 0 {
+		return "", errors.New("Bitbucket pull request number must be positive")
+	}
+	endpoint, err := c.endpoint(workspace, repository)
+	if err != nil {
+		return "", err
+	}
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("parse Bitbucket pull request endpoint: %w", err)
+	}
+	suffix := "/" + strconv.Itoa(number)
+	escapedPath := target.EscapedPath()
+	target.Path += suffix
+	target.RawPath = escapedPath + suffix
+	return target.String(), nil
+}
+
 func isLoopback(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
@@ -247,12 +336,20 @@ func isLoopback(host string) bool {
 }
 
 func readBounded(reader io.Reader) ([]byte, error) {
-	body, err := io.ReadAll(io.LimitReader(reader, maxResponseBody+1))
+	return readBoundedTo(reader, maxResponseBody)
+}
+
+func readCommentListBounded(reader io.Reader) ([]byte, error) {
+	return readBoundedTo(reader, maxCommentListResponseBody)
+}
+
+func readBoundedTo(reader io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > maxResponseBody {
-		return nil, fmt.Errorf("response body exceeds %d bytes", maxResponseBody)
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response body exceeds %d bytes", limit)
 	}
 	return body, nil
 }
@@ -274,8 +371,12 @@ type payloadBranch struct {
 }
 
 type pullRequestResponse struct {
-	ID    int `json:"id"`
-	Links struct {
+	ID          int                  `json:"id"`
+	State       string               `json:"state"`
+	Description string               `json:"description"`
+	Source      pullRequestBranchRef `json:"source"`
+	Destination pullRequestBranchRef `json:"destination"`
+	Links       struct {
 		HTML struct {
 			Href string `json:"href"`
 		} `json:"html"`
@@ -283,9 +384,53 @@ type pullRequestResponse struct {
 }
 
 type pullRequestListResponse struct {
-	Values []struct {
-		pullRequestResponse
-		Description string           `json:"description"`
-		Source      payloadBranchRef `json:"source"`
-	} `json:"values"`
+	Values []pullRequestResponse `json:"values"`
+}
+
+type pullRequestBranchRef struct {
+	Branch payloadBranch `json:"branch"`
+	Commit struct {
+		Hash string `json:"hash"`
+	} `json:"commit"`
+	Repository bitbucketPullRequestRepository `json:"repository"`
+}
+
+type bitbucketPullRequestRepository struct {
+	Name      string `json:"name"`
+	FullName  string `json:"full_name"`
+	Workspace struct {
+		Slug string `json:"slug"`
+	} `json:"workspace"`
+}
+
+func bitbucketRepositoryCoordinates(repository bitbucketPullRequestRepository) (string, string, bool) {
+	workspace, name, found := strings.Cut(repository.FullName, "/")
+	if found && workspace != "" && name != "" && !strings.Contains(name, "/") {
+		return workspace, name, true
+	}
+	if repository.Workspace.Slug != "" && repository.Name != "" {
+		return repository.Workspace.Slug, repository.Name, true
+	}
+	return "", "", false
+}
+
+func validatePullRequestState(decoded pullRequestResponse) (forge.PullRequestState, error) {
+	workspace, repository, ok := bitbucketRepositoryCoordinates(decoded.Source.Repository)
+	state := strings.ToLower(decoded.State)
+	if decoded.ID <= 0 || !ok || decoded.Source.Branch.Name == "" || decoded.Destination.Branch.Name == "" {
+		return forge.PullRequestState{}, errors.New("decode Bitbucket pull request response: incomplete pull request state or refs")
+	}
+	if err := forge.ValidateNormalizedIdentity("Bitbucket pull request head SHA", decoded.Source.Commit.Hash, true); err != nil {
+		return forge.PullRequestState{}, fmt.Errorf("decode Bitbucket pull request response: %w", err)
+	}
+	switch state {
+	case "open", "merged", "declined", "superseded":
+	default:
+		return forge.PullRequestState{}, errors.New("decode Bitbucket pull request response: invalid pull request state")
+	}
+	return forge.PullRequestState{
+		Number: decoded.ID, State: state, SourceOwner: workspace, SourceRepository: repository,
+		SourceBranch: decoded.Source.Branch.Name, DestinationBranch: decoded.Destination.Branch.Name,
+		HeadSHA: decoded.Source.Commit.Hash,
+	}, nil
 }

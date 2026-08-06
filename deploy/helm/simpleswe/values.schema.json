@@ -15,18 +15,63 @@
     "config": {
       "type": "object",
       "properties": {
+        "controller": {
+          "type": "object",
+          "properties": {
+            "listen_address": { "type": "string", "pattern": ".*\\S.*" },
+            "webhook_listen_address": { "const": ":8081" }
+          }
+        },
+        "bitbucket": {
+          "type": "object",
+          "properties": {
+            "webhook_secret": { "$ref": "#/definitions/bitbucketWebhookSecretSource" }
+          }
+        },
+        "github": {
+          "type": "object",
+          "properties": {
+            "webhook_secret": { "$ref": "#/definitions/githubWebhookSecretSource" }
+          }
+        },
         "repositories": {
           "type": "object",
           "additionalProperties": { "$ref": "#/definitions/repository" }
         }
       }
     },
+    "secrets": {
+      "type": "object",
+      "properties": {
+        "webhooks": {
+          "type": "object",
+          "required": ["name", "keys"],
+          "properties": {
+            "name": { "$ref": "#/definitions/kubernetesName" },
+            "keys": {
+              "type": "object",
+              "required": ["github", "bitbucket"],
+              "properties": {
+                "github": { "type": "string", "minLength": 1 },
+                "bitbucket": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
     "networkPolicy": {
       "type": "object",
-      "required": ["enabled", "trustedIngress", "httpsCIDRs", "repositoryEgress"],
+      "required": ["enabled", "trustedIngress", "webhookIngress", "httpsCIDRs", "repositoryEgress"],
       "properties": {
         "enabled": { "type": "boolean" },
         "trustedIngress": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
+        "webhookIngress": {
           "type": "array",
           "items": { "$ref": "#/definitions/networkPolicyPeer" }
         },
@@ -43,6 +88,22 @@
     }
   },
   "definitions": {
+    "githubWebhookSecretSource": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "const": "/run/secrets/webhooks/github" }
+      },
+      "additionalProperties": false
+    },
+    "bitbucketWebhookSecretSource": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "const": "/run/secrets/webhooks/bitbucket" }
+      },
+      "additionalProperties": false
+    },
     "repository": {
       "type": "object",
       "oneOf": [

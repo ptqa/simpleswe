@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	defaultListenAddress  = ":8080"
-	defaultNamespace      = "simpleswe"
-	defaultWorkerCommand  = "opencode"
-	defaultBranchPrefix   = "simpleswe/"
-	defaultDeadline       = 30 * time.Minute
-	defaultMaxFixAttempts = 3
+	defaultListenAddress        = ":8080"
+	defaultWebhookListenAddress = ":8081"
+	defaultNamespace            = "simpleswe"
+	defaultWorkerCommand        = "opencode"
+	defaultBranchPrefix         = "simpleswe/"
+	defaultDeadline             = 30 * time.Minute
+	defaultMaxFixAttempts       = 3
 )
 
 // Config is the controller configuration file.
@@ -47,19 +48,22 @@ type SlackConfig struct {
 }
 
 type BitbucketConfig struct {
-	BaseURL string `yaml:"base_url,omitempty"`
+	BaseURL       string       `yaml:"base_url,omitempty"`
+	WebhookSecret SecretSource `yaml:"webhook_secret,omitempty"`
 }
 
 type GitHubConfig struct {
-	BaseURL string `yaml:"base_url,omitempty"`
+	BaseURL       string       `yaml:"base_url,omitempty"`
+	WebhookSecret SecretSource `yaml:"webhook_secret,omitempty"`
 }
 
 type ControllerConfig struct {
-	ListenAddress     string        `yaml:"listen_address"`
-	Namespace         string        `yaml:"namespace"`
-	Deadline          time.Duration `yaml:"deadline"`
-	MaxFixAttempts    int           `yaml:"max_fix_attempts"`
-	maxFixAttemptsSet bool
+	ListenAddress        string        `yaml:"listen_address"`
+	WebhookListenAddress string        `yaml:"webhook_listen_address"`
+	Namespace            string        `yaml:"namespace"`
+	Deadline             time.Duration `yaml:"deadline"`
+	MaxFixAttempts       int           `yaml:"max_fix_attempts"`
+	maxFixAttemptsSet    bool
 }
 
 type WorkerConfig struct {
@@ -281,6 +285,9 @@ func (c *Config) applyDefaults() {
 	if c.Controller.ListenAddress == "" {
 		c.Controller.ListenAddress = defaultListenAddress
 	}
+	if c.Controller.WebhookListenAddress == "" {
+		c.Controller.WebhookListenAddress = defaultWebhookListenAddress
+	}
 	if c.Controller.Namespace == "" {
 		c.Controller.Namespace = defaultNamespace
 	}
@@ -334,6 +341,12 @@ func (c Config) validate() error {
 	if c.Controller.ListenAddress == "" {
 		return fmt.Errorf("controller.listen_address must not be empty")
 	}
+	if strings.TrimSpace(c.Controller.WebhookListenAddress) == "" {
+		return fmt.Errorf("controller.webhook_listen_address must not be blank")
+	}
+	if c.Controller.WebhookListenAddress == c.Controller.ListenAddress {
+		return fmt.Errorf("controller.webhook_listen_address must differ from controller.listen_address")
+	}
 	if !validDNSName(c.Controller.Namespace) {
 		return fmt.Errorf("controller.namespace must be a valid Kubernetes namespace")
 	}
@@ -353,6 +366,12 @@ func (c Config) validate() error {
 		return err
 	}
 	if err := validateSecretSource(c.Slack.AppToken, "slack.app_token"); err != nil {
+		return err
+	}
+	if err := validateSecretSource(c.Bitbucket.WebhookSecret, "bitbucket.webhook_secret"); err != nil {
+		return err
+	}
+	if err := validateSecretSource(c.GitHub.WebhookSecret, "github.webhook_secret"); err != nil {
 		return err
 	}
 	if err := validateBitbucketBaseURL(c.Bitbucket.BaseURL); err != nil {
@@ -457,7 +476,22 @@ func (c Config) validate() error {
 			return err
 		}
 	}
+	if hasProviderRepository(c.Repositories, "bitbucket") && c.Bitbucket.WebhookSecret.File == "" && c.Bitbucket.WebhookSecret.Env == "" {
+		return fmt.Errorf("bitbucket.webhook_secret must configure either file or env")
+	}
+	if hasProviderRepository(c.Repositories, "github") && c.GitHub.WebhookSecret.File == "" && c.GitHub.WebhookSecret.Env == "" {
+		return fmt.Errorf("github.webhook_secret must configure either file or env")
+	}
 	return nil
+}
+
+func hasProviderRepository(repositories RepositoryConfigs, provider string) bool {
+	for _, repository := range repositories {
+		if provider == "bitbucket" && repository.bitbucketSet || provider == "github" && repository.githubSet {
+			return true
+		}
+	}
+	return false
 }
 
 func hasPassword(user *url.Userinfo) bool { _, set := user.Password(); return set }
@@ -631,10 +665,11 @@ func decodeNodeStrict(node *yaml.Node, target any) error {
 
 func (c *ControllerConfig) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
-		ListenAddress  string `yaml:"listen_address"`
-		Namespace      string `yaml:"namespace"`
-		Deadline       string `yaml:"deadline"`
-		MaxFixAttempts *int   `yaml:"max_fix_attempts"`
+		ListenAddress        string `yaml:"listen_address"`
+		WebhookListenAddress string `yaml:"webhook_listen_address"`
+		Namespace            string `yaml:"namespace"`
+		Deadline             string `yaml:"deadline"`
+		MaxFixAttempts       *int   `yaml:"max_fix_attempts"`
 	}
 	if err := decodeNodeStrict(node, &raw); err != nil {
 		return err
@@ -648,10 +683,11 @@ func (c *ControllerConfig) UnmarshalYAML(node *yaml.Node) error {
 		deadline = parsed
 	}
 	*c = ControllerConfig{
-		ListenAddress:     raw.ListenAddress,
-		Namespace:         raw.Namespace,
-		Deadline:          deadline,
-		maxFixAttemptsSet: raw.MaxFixAttempts != nil,
+		ListenAddress:        raw.ListenAddress,
+		WebhookListenAddress: raw.WebhookListenAddress,
+		Namespace:            raw.Namespace,
+		Deadline:             deadline,
+		maxFixAttemptsSet:    raw.MaxFixAttempts != nil,
 	}
 	if raw.MaxFixAttempts != nil {
 		c.MaxFixAttempts = *raw.MaxFixAttempts

@@ -94,3 +94,20 @@ func TestMachineRetryIsTheOnlyFailedToQueuedOperation(t *testing.T) {
 		}
 	}
 }
+
+func TestMachineForgeFollowUpResetsOnlyReviewStates(t *testing.T) {
+	var machine Machine
+	allowed := map[State]bool{PR_OPEN: true, WAITING_CI: true, WAITING_REVIEW: true, READY: true}
+	for _, from := range append(append([]State(nil), lifecycle...), FAILED, CANCELLED) {
+		err := machine.ForgeFollowUp(from, QUEUED)
+		if allowed[from] && err != nil {
+			t.Errorf("forge follow-up %q -> queued: %v", from, err)
+		}
+		if !allowed[from] && err == nil {
+			t.Errorf("forge follow-up %q -> queued was accepted", from)
+		}
+	}
+	if err := machine.ForgeFollowUp(PR_OPEN, RUNNING); err == nil {
+		t.Fatal("forge follow-up to running was accepted")
+	}
+}

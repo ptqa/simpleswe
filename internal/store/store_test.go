@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -202,6 +203,9 @@ func TestRetryCreatesAttemptTwoWithoutChangingAttemptOne(t *testing.T) {
 	}
 	if retried.State != task.QUEUED {
 		t.Fatalf("retry state = %q; want %q", retried.State, task.QUEUED)
+	}
+	if retried.Prompt != "" || retried.BaseBranch != "" || retried.TaskBranch != "" {
+		t.Fatalf("ordinary retry overrides = %q/%q/%q; want existing empty fallback behavior", retried.Prompt, retried.BaseBranch, retried.TaskBranch)
 	}
 
 	after, err := db.ListAttempts(ctx, created.ID)
@@ -496,6 +500,59 @@ func TestOpenEnablesRequiredSQLitePragmas(t *testing.T) {
 	}
 	if pragmas.BusyTimeout <= 0 {
 		t.Fatalf("busy_timeout = %d; want enabled", pragmas.BusyTimeout)
+	}
+}
+
+func TestOpenMigratesPreWebhookDatabaseAndPreservesAttempts(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-webhook.sqlite")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	now := stamp(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
+	_, err = legacy.Exec(`
+		CREATE TABLE tasks (
+			id TEXT PRIMARY KEY, repository TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, current_attempt_id TEXT NOT NULL,
+			slack_event_id TEXT, slack_workspace_id TEXT NOT NULL DEFAULT '', slack_channel_id TEXT NOT NULL DEFAULT '',
+			slack_message_ts TEXT NOT NULL DEFAULT '', slack_thread_ts TEXT NOT NULL DEFAULT '', slack_user_id TEXT NOT NULL DEFAULT '',
+			cancellation_requested INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE TABLE task_attempts (
+			id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
+			immutable INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL, logs_exhausted INTEGER NOT NULL DEFAULT 0,
+			validation_state TEXT NOT NULL DEFAULT '', manifest_json BLOB NOT NULL DEFAULT '',
+			resource_snapshot BLOB NOT NULL DEFAULT '', config_digest TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			UNIQUE(task_id, number)
+		);
+		INSERT INTO tasks (id, repository, prompt, state, created_at, updated_at, current_attempt_id)
+		VALUES ('legacy-task', 'legacy-repo', 'legacy prompt', 'failed', ?, ?, 'legacy-attempt');
+		INSERT INTO task_attempts (id, task_id, number, state, logs_exhausted, created_at)
+		VALUES ('legacy-attempt', 'legacy-task', 1, 'failed', 1, ?);`, now, now, now)
+	if err != nil {
+		_ = legacy.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	db, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatalf("open migrated database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	got, err := db.GetTask(context.Background(), "legacy-task")
+	if err != nil || got.Prompt != "legacy prompt" || got.CurrentAttemptID != "legacy-attempt" {
+		t.Fatalf("migrated task = %#v, %v", got, err)
+	}
+	attempt, err := db.CurrentAttempt(context.Background(), got.ID)
+	if err != nil || attempt.Number != 1 || attempt.State != task.FAILED || !attempt.LogsExhausted || attempt.Prompt != "" || attempt.BaseBranch != "" || attempt.TaskBranch != "" {
+		t.Fatalf("migrated attempt = %#v, %v", attempt, err)
+	}
+	event := testForgeEvent("legacy-db-event", "quality_gate_failed")
+	if _, err := db.PutForgeEvent(context.Background(), event); err != nil {
+		t.Fatalf("insert forge event after migration: %v", err)
 	}
 }
 

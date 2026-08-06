@@ -41,6 +41,7 @@ The initial vertical slice supports:
 - a default or configured `ReadWriteOnce` StorageClass suitable for SQLite WAL locking;
 - Slack bot and app-level tokens for Socket Mode;
 - Bitbucket or GitHub credentials for each configured repository;
+- a webhook signing secret for each configured forge provider;
 - a repository-specific worker image containing `simpleswe`, OpenCode, Git, SSH, language runtimes, and validation tools;
 - Go 1.26.5 when building locally;
 - `kubectl` locally for automatic port-forwarding and TUI shell access.
@@ -80,7 +81,7 @@ With Docker, kind, kubectl, and Helm 3 installed, start or refresh the local con
 make local
 ```
 
-This creates a pinned Kubernetes 1.36 cluster, builds and loads the controller image, installs the Helm chart, and verifies the API through a port-forward. Slack is explicitly disabled and no repositories are registered in [`examples/values-kind.yaml`](examples/values-kind.yaml).
+This creates a pinned Kubernetes 1.36 cluster, builds and loads the controller image, installs the Helm chart, and verifies the API through a port-forward. Slack is explicitly disabled; [`examples/values-kind.yaml`](examples/values-kind.yaml) registers the committed `ptqa/simpleswe` GitHub repository. `make local` creates non-overwriting placeholder Secrets so the controller can start and observe.
 
 Inspect the controller:
 
@@ -89,7 +90,7 @@ Inspect the controller:
 ./simpleswe tui --context kind-simpleswe --namespace simpleswe
 ```
 
-The kind values intentionally register no repositories. To execute tasks, build and load a worker image, then add repository configuration and the corresponding Git, OpenCode, and forge Secrets:
+The placeholders are only for startup and observation. Before executing tasks, replace or provide real GitHub, webhook, and OpenAI credentials, then build and load a worker image:
 
 ```sh
 mkdir -p bin
@@ -158,6 +159,7 @@ Repositories are registered by name. A minimal configuration is:
 ```yaml
 controller:
   listen_address: ":8080"
+  webhook_listen_address: ":8081"
   namespace: simpleswe
   deadline: 30m
   max_fix_attempts: 3
@@ -176,9 +178,13 @@ slack:
 
 bitbucket:
   base_url: https://api.bitbucket.org
+  webhook_secret:
+    env: BITBUCKET_WEBHOOK_SECRET
 
 github:
   base_url: https://api.github.com
+  webhook_secret:
+    env: GITHUB_WEBHOOK_SECRET
 
 repositories:
   widget:
@@ -227,16 +233,26 @@ repositories:
 
 Configuration is strict: unknown fields, inline credentials, invalid Secret names, and invalid resource settings fail controller startup. See [`examples/config.yaml`](examples/config.yaml) and [`examples/values-eks.yaml`](examples/values-eks.yaml) for complete examples.
 
+For a standalone controller, set `BITBUCKET_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_SECRET` to the exact secrets for configured providers, then run `./simpleswe controller --config config.yaml --database tasks.db`. Configure Bitbucket to POST to `/v1/webhooks/bitbucket`; GitHub uses `/v1/webhooks/github`.
+
 Validation commands are argv arrays and are executed directly without shell interpolation.
 
 ## Install
 
-Create a values file containing image references and repository configuration, then install the chart:
+Create the namespace and provider signing keys first (omit an unconfigured provider):
+
+```sh
+kubectl create namespace simpleswe
+kubectl -n simpleswe create secret generic simpleswe-webhooks \
+  --from-literal=github='github-webhook-secret' \
+  --from-literal=bitbucket='bitbucket-webhook-secret'
+```
+
+Then install a values file containing image references and repository configuration:
 
 ```sh
 helm upgrade --install simpleswe ./deploy/helm/simpleswe \
   --namespace simpleswe \
-  --create-namespace \
   --values path/to/values.yaml
 ```
 
@@ -249,7 +265,7 @@ helm upgrade --install simpleswe ./deploy/helm/simpleswe \
   --values examples/values-eks.yaml
 ```
 
-The chart creates one controller Deployment, ClusterIP Service, ServiceAccount, namespace Role and RoleBinding, PVC, ConfigMap, and default-deny NetworkPolicies. It references pre-existing Secrets and never creates credential values.
+The chart creates one controller Deployment, private API Service, signed `simpleswe-webhooks` Service, ServiceAccount, namespace Role and RoleBinding, PVC, ConfigMap, and default-deny NetworkPolicies. It references pre-existing Secrets and never creates credential values. Deliberately expose only the signed webhook listener and configure `networkPolicy.webhookIngress`; keep the unauthenticated API private.
 
 The API is unauthenticated and is intended for `kubectl port-forward` access only. Keep the default NetworkPolicy enabled unless another access boundary is in place.
 

@@ -1,11 +1,14 @@
 {{- $bitbucketSecrets := dict -}}
 {{- $githubSecrets := dict -}}
+{{- $webhookProviders := dict "github" false "bitbucket" false -}}
 {{- range $_, $repository := .Values.config.repositories -}}
 {{- with $repository.github -}}
 {{- $_ := set $githubSecrets .credentials_secret_name true -}}
+{{- $_ := set $webhookProviders "github" true -}}
 {{- end -}}
 {{- with $repository.bitbucket -}}
 {{- $_ := set $bitbucketSecrets .credentials_secret_name true -}}
+{{- $_ := set $webhookProviders "bitbucket" true -}}
 {{- end -}}
 {{- end -}}
 {{- $bitbucketSecretNames := keys $bitbucketSecrets | sortAlpha -}}
@@ -72,6 +75,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: webhooks
+              containerPort: 8081
+              protocol: TCP
           readinessProbe:
             httpGet:
               path: /v1/health
@@ -118,6 +124,11 @@ spec:
               mountPath: {{ printf "/run/secrets/github/%s" $secretName | quote }}
               readOnly: true
           {{- end }}
+          {{- if or (index $webhookProviders "github") (index $webhookProviders "bitbucket") }}
+            - name: webhook-credentials
+              mountPath: /run/secrets/webhooks
+              readOnly: true
+          {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -155,4 +166,18 @@ spec:
             items:
               - key: token
                 path: token
+      {{- end }}
+      {{- if or (index $webhookProviders "github") (index $webhookProviders "bitbucket") }}
+        - name: webhook-credentials
+          secret:
+            secretName: {{ .Values.secrets.webhooks.name | quote }}
+            items:
+      {{- if index $webhookProviders "github" }}
+              - key: {{ .Values.secrets.webhooks.keys.github | quote }}
+                path: github
+      {{- end }}
+      {{- if index $webhookProviders "bitbucket" }}
+              - key: {{ .Values.secrets.webhooks.keys.bitbucket | quote }}
+                path: bitbucket
+      {{- end }}
       {{- end }}

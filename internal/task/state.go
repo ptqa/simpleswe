@@ -74,6 +74,18 @@ func (Machine) Retry(from, to State) error {
 	return nil
 }
 
+// ForgeFollowUp validates the explicit aggregate reset used to address forge
+// feedback on an existing pull request with a new immutable attempt.
+func (Machine) ForgeFollowUp(from, to State) error {
+	if to == QUEUED {
+		switch from {
+		case PR_OPEN, WAITING_CI, WAITING_REVIEW, READY:
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid forge follow-up %q -> %q", from, to)
+}
+
 func known(state State) bool {
 	if state == FAILED || state == CANCELLED {
 		return true
