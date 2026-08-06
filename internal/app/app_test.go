@@ -23,7 +23,8 @@ const (
 	usageController = "usage: simpleswe controller --config PATH --database PATH"
 	usageWorker     = "usage: simpleswe worker [--manifest PATH]"
 	usageTUI        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
-	usageTask       = "usage: simpleswe task <list|show|cancel|retry|logs>"
+	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs>"
+	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] REPOSITORY PROMPT"
 	usageTaskList   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	usageTaskShow   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	usageTaskCancel = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
@@ -80,6 +81,15 @@ func TestRunDispatchesCommandsAndRuntimeConfiguration(t *testing.T) {
 			args: []string{"task", "logs", "--context", "production", "--namespace", "simpleswe-prod", "task-10"},
 			want: []string{"port-forward context=production namespace=simpleswe-prod", "logs address=http://127.0.0.1:18080 id=task-10", "close port-forward"},
 		},
+		{
+			name: "task create with hyphen-prefixed prompt",
+			args: []string{"task", "create", "--context", "staging", "--namespace", "team-a", "widget", "- update the failing test"},
+			want: []string{
+				"port-forward context=staging namespace=team-a",
+				"create address=http://127.0.0.1:18080 repository=widget prompt=- update the failing test",
+				"close port-forward",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -119,6 +129,14 @@ func TestRunReportsExactUsageErrors(t *testing.T) {
 		{name: "tui positional argument", args: []string{"tui", "extra"}, want: usageTUI},
 		{name: "missing task command", args: []string{"task"}, want: usageTask},
 		{name: "unknown task command", args: []string{"task", "delete"}, want: `unknown task command "delete"; ` + usageTask},
+		{name: "task create missing values", args: []string{"task", "create"}, want: usageTaskCreate},
+		{name: "task create missing prompt", args: []string{"task", "create", "repo"}, want: usageTaskCreate},
+		{name: "task create empty repository", args: []string{"task", "create", "", "prompt"}, want: usageTaskCreate},
+		{name: "task create empty prompt", args: []string{"task", "create", "repo", ""}, want: usageTaskCreate},
+		{name: "task create whitespace repository", args: []string{"task", "create", " \t", "prompt"}, want: usageTaskCreate},
+		{name: "task create whitespace prompt", args: []string{"task", "create", "repo", " \n"}, want: usageTaskCreate},
+		{name: "task create extra value", args: []string{"task", "create", "repo", "prompt", "extra"}, want: usageTaskCreate},
+		{name: "task create flag after values", args: []string{"task", "create", "repo", "prompt", "--address", "http://controller"}, want: usageTaskCreate},
 		{name: "task list positional argument", args: []string{"task", "list", "task-1"}, want: usageTaskList},
 		{name: "task show missing ID", args: []string{"task", "show"}, want: usageTaskShow},
 		{name: "task show extra ID", args: []string{"task", "show", "task-1", "task-2"}, want: usageTaskShow},
@@ -192,6 +210,14 @@ func TestTaskCommandsWriteJSONAndLogsWriteLines(t *testing.T) {
 				return client.TaskList{Tasks: []client.Task{{ID: "task-list"}}, NextCursor: "next"}, nil
 			}},
 			wantID: "task-list", wantKey: "tasks",
+		},
+		{
+			name: "create",
+			args: []string{"task", "create", "--address", "http://controller", "https://bitbucket.example/acme/widget", "fix the failing test now"},
+			deps: Dependencies{CreateTask: func(context.Context, string, client.CreateTaskRequest) (client.Task, error) {
+				return client.Task{ID: "task-create"}, nil
+			}},
+			wantID: "task-create",
 		},
 		{
 			name: "show",
@@ -425,6 +451,11 @@ func recordingDependencies(t *testing.T, wantCtx context.Context, wantStdin io.R
 			}
 			*calls = append(*calls, "logs address="+address+" id="+id)
 			return nil
+		},
+		CreateTask: func(ctx context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {
+			checkContext(ctx)
+			*calls = append(*calls, "create address="+address+" repository="+request.Repository+" prompt="+request.Prompt)
+			return client.Task{ID: "task-create", Repository: request.Repository, Prompt: request.Prompt}, nil
 		},
 	}
 }

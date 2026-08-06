@@ -50,6 +50,9 @@ func Dependencies() app.Dependencies {
 		RunWorker:     RunWorker,
 		RunTUI:        runTUI,
 		PortForward:   portForward,
+		CreateTask: func(ctx context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {
+			return client.New(address, nil).CreateTask(ctx, request)
+		},
 		ListTasks: func(ctx context.Context, address string) (client.TaskList, error) {
 			return client.New(address, nil).ListTasks(ctx, client.ListOptions{})
 		},

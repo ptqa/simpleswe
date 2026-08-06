@@ -20,7 +20,8 @@ const (
 	controllerUsage = "usage: simpleswe controller --config PATH --database PATH"
 	workerUsage     = "usage: simpleswe worker [--manifest PATH]"
 	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
-	taskUsage       = "usage: simpleswe task <list|show|cancel|retry|logs>"
+	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs>"
+	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] REPOSITORY PROMPT"
 	taskListUsage   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	taskShowUsage   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskCancelUsage = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
@@ -38,6 +39,7 @@ type Dependencies struct {
 	RunTUI        func(context.Context, string, string, string, io.Reader, io.Writer, io.Writer) error
 	PortForward   func(context.Context, string, string) (string, func() error, error)
 
+	CreateTask func(context.Context, string, client.CreateTaskRequest) (client.Task, error)
 	ListTasks  func(context.Context, string) (client.TaskList, error)
 	ShowTask   func(context.Context, string, string) (client.Task, error)
 	CancelTask func(context.Context, string, string) (client.Task, error)
@@ -110,7 +112,7 @@ func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer, dep
 }
 
 func runTUI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
-	flags, ok := parseRuntimeArgs(args, false)
+	flags, _, ok := parseRuntimeArgs(args, 0)
 	if !ok {
 		return errors.New(tuiUsage)
 	}
@@ -130,12 +132,15 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		return errors.New(taskUsage)
 	}
 	command := args[0]
-	usage, ok := taskCommandUsage(command)
+	usage, positionalCount, ok := taskCommandUsage(command)
 	if !ok {
 		return fmt.Errorf("unknown task command %q; %s", command, taskUsage)
 	}
-	flags, ok := parseRuntimeArgs(args[1:], command != "list")
+	flags, positional, ok := parseRuntimeArgs(args[1:], positionalCount)
 	if !ok {
+		return errors.New(usage)
+	}
+	if command == "create" && (strings.TrimSpace(positional[0]) == "" || strings.TrimSpace(positional[1]) == "") {
 		return errors.New(usage)
 	}
 
@@ -146,6 +151,18 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	defer func() { runErr = errors.Join(runErr, closeForward()) }()
 
 	switch command {
+	case "create":
+		if deps.CreateTask == nil {
+			return errors.New("task create runtime is not configured")
+		}
+		result, err := deps.CreateTask(ctx, address, client.CreateTaskRequest{
+			Repository: positional[0],
+			Prompt:     positional[1],
+		})
+		if err != nil {
+			return err
+		}
+		return encodeJSON(stdout, result)
 	case "list":
 		if deps.ListTasks == nil {
 			return errors.New("task list runtime is not configured")
@@ -156,16 +173,16 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		}
 		return encodeJSON(stdout, result)
 	case "show":
-		return runTaskJSON(ctx, address, flags.id, stdout, deps.ShowTask, "task show runtime is not configured")
+		return runTaskJSON(ctx, address, positional[0], stdout, deps.ShowTask, "task show runtime is not configured")
 	case "cancel":
-		return runTaskJSON(ctx, address, flags.id, stdout, deps.CancelTask, "task cancel runtime is not configured")
+		return runTaskJSON(ctx, address, positional[0], stdout, deps.CancelTask, "task cancel runtime is not configured")
 	case "retry":
-		return runTaskJSON(ctx, address, flags.id, stdout, deps.RetryTask, "task retry runtime is not configured")
+		return runTaskJSON(ctx, address, positional[0], stdout, deps.RetryTask, "task retry runtime is not configured")
 	case "logs":
 		if deps.StreamLogs == nil {
 			return errors.New("task logs runtime is not configured")
 		}
-		return deps.StreamLogs(ctx, address, flags.id, stdout)
+		return deps.StreamLogs(ctx, address, positional[0], stdout)
 	default:
 		return errors.New(usage)
 	}
@@ -192,59 +209,58 @@ type runtimeFlags struct {
 	kubeContext string
 	namespace   string
 	address     string
-	id          string
 }
 
-func parseRuntimeArgs(args []string, requireID bool) (runtimeFlags, bool) {
+func parseRuntimeArgs(args []string, positionalCount int) (runtimeFlags, []string, bool) {
 	flags := runtimeFlags{namespace: defaultNamespace}
 	contextSet := false
 	namespaceSet := false
 	addressSet := false
-	positional := false
+	var positional []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
-		if positional {
-			return runtimeFlags{}, false
+		if arg == "" {
+			return runtimeFlags{}, nil, false
+		}
+		if len(positional) > 0 {
+			positional = append(positional, arg)
+			continue
 		}
 		if strings.HasPrefix(arg, "-") {
 			switch arg {
 			case "--context":
 				value, next, ok := nextValue(args, i)
 				if !ok || contextSet {
-					return runtimeFlags{}, false
+					return runtimeFlags{}, nil, false
 				}
 				flags.kubeContext, i = value, next
 				contextSet = true
 			case "--namespace":
 				value, next, ok := nextValue(args, i)
 				if !ok || namespaceSet {
-					return runtimeFlags{}, false
+					return runtimeFlags{}, nil, false
 				}
 				flags.namespace, i = value, next
 				namespaceSet = true
 			case "--address":
 				value, next, ok := nextValue(args, i)
 				if !ok || addressSet {
-					return runtimeFlags{}, false
+					return runtimeFlags{}, nil, false
 				}
 				flags.address, i = value, next
 				addressSet = true
 			default:
-				return runtimeFlags{}, false
+				return runtimeFlags{}, nil, false
 			}
 			continue
 		}
 
-		if !requireID || positional || arg == "" {
-			return runtimeFlags{}, false
-		}
-		flags.id = arg
-		positional = true
+		positional = append(positional, arg)
 	}
-	if requireID != positional || flags.namespace == "" {
-		return runtimeFlags{}, false
+	if len(positional) != positionalCount || flags.namespace == "" {
+		return runtimeFlags{}, nil, false
 	}
-	return flags, true
+	return flags, positional, true
 }
 
 func parseControllerArgs(args []string) (configPath, databasePath string, ok bool) {
@@ -298,20 +314,22 @@ func nextValue(args []string, index int) (string, int, bool) {
 	return args[index+1], index + 1, true
 }
 
-func taskCommandUsage(command string) (string, bool) {
+func taskCommandUsage(command string) (string, int, bool) {
 	switch command {
+	case "create":
+		return taskCreateUsage, 2, true
 	case "list":
-		return taskListUsage, true
+		return taskListUsage, 0, true
 	case "show":
-		return taskShowUsage, true
+		return taskShowUsage, 1, true
 	case "cancel":
-		return taskCancelUsage, true
+		return taskCancelUsage, 1, true
 	case "retry":
-		return taskRetryUsage, true
+		return taskRetryUsage, 1, true
 	case "logs":
-		return taskLogsUsage, true
+		return taskLogsUsage, 1, true
 	default:
-		return "", false
+		return "", 0, false
 	}
 }
 
