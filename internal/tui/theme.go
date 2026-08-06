@@ -57,6 +57,11 @@ var themes = []colorPalette{
 		selected: 0x268bd2, selectedForeground: 0xfdf6e3, border: 0x93a1a1,
 		ok: 0x657b83, warn: 0x8b5d00, bad: 0xdc322f, info: 0x076678, overlay: 0xeee8d5,
 	}),
+	newPalette("Neon Pop", paletteColors{
+		background: 0x120b24, foreground: 0xf7f0ff, header: 0x2a1552, title: 0x00f5ff, dim: 0xc0a9d9,
+		selected: 0xff2bd6, selectedForeground: 0x120b24, border: 0x8b5cf6,
+		ok: 0x39ff88, warn: 0xffe14f, bad: 0xff4d6d, info: 0x44a8ff, overlay: 0x21103d,
+	}),
 	newPalette("Tokyo Night", paletteColors{
 		background: 0x1a1b26, foreground: 0xc0caf5, header: 0x24283b, title: 0x7dcfff, dim: 0x9aa5ce,
 		selected: 0x7aa2f7, selectedForeground: 0x1a1b26, border: 0x414868,
