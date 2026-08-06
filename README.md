@@ -72,6 +72,38 @@ docker build \
 
 Repository-specific worker images should extend this target or reproduce its non-root runtime and add only the runtimes and tools required by that repository.
 
+## Local Kubernetes with kind
+
+With Docker, kind, kubectl, and Helm 3 installed, start or refresh the local controller:
+
+```sh
+make local
+```
+
+This creates a pinned Kubernetes 1.36 cluster, builds and loads the controller image, installs the Helm chart, and verifies the API through a port-forward. Slack is explicitly disabled and no repositories are registered in [`examples/values-kind.yaml`](examples/values-kind.yaml).
+
+Inspect the controller:
+
+```sh
+./simpleswe task list --context kind-simpleswe --namespace simpleswe
+./simpleswe tui --context kind-simpleswe --namespace simpleswe
+```
+
+The kind values intentionally register no repositories. To execute tasks, build and load a worker image, then add repository configuration and the corresponding Git, OpenCode, and Bitbucket Secrets:
+
+```sh
+mkdir -p bin
+cp /path/to/opencode bin/opencode
+docker build --target worker --build-arg OPENCODE_BINARY=bin/opencode -t simpleswe-worker:kind .
+kind load docker-image --name simpleswe simpleswe-worker:kind
+```
+
+Delete the local cluster when finished:
+
+```sh
+make local-down
+```
+
 ## Slack Setup
 
 Create a Slack app with:

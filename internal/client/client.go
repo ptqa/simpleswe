@@ -444,6 +444,7 @@ type PortForward struct {
 	done      chan struct{}
 	readyOnce sync.Once
 	stopOnce  sync.Once
+	killed    bool
 	readyErr  error
 	waitErr   error
 }
@@ -546,9 +547,18 @@ func (p *PortForward) Close() error {
 
 func (p *PortForward) stop() error {
 	p.stopOnce.Do(func() {
-		if p.cmd.Process != nil {
-			_ = p.cmd.Process.Kill()
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+		if p.cmd.Process != nil && p.cmd.Process.Kill() == nil {
+			p.killed = true
 		}
 	})
-	return p.Wait()
+	err := p.Wait()
+	if p.killed {
+		return nil
+	}
+	return err
 }

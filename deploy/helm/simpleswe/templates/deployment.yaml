@@ -5,6 +5,7 @@
 {{- end -}}
 {{- end -}}
 {{- $bitbucketSecretNames := keys $bitbucketSecrets | sortAlpha -}}
+{{- $slackDisabled := dig "slack" "disabled" false .Values.config -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -97,9 +98,11 @@ spec:
             - name: config
               mountPath: /etc/simpleswe
               readOnly: true
+          {{- if not $slackDisabled }}
             - name: slack-credentials
               mountPath: /run/secrets/slack
               readOnly: true
+          {{- end }}
           {{- range $index, $secretName := $bitbucketSecretNames }}
             - name: bitbucket-credentials-{{ $index }}
               mountPath: {{ printf "/run/secrets/bitbucket/%s" $secretName | quote }}
@@ -115,6 +118,7 @@ spec:
             items:
               - key: config.yaml
                 path: config.yaml
+      {{- if not $slackDisabled }}
         - name: slack-credentials
           secret:
             secretName: {{ .Values.secrets.slack.name | quote }}
@@ -123,6 +127,7 @@ spec:
                 path: bot-token
               - key: {{ .Values.secrets.slack.keys.appToken | quote }}
                 path: app-token
+      {{- end }}
       {{- range $index, $secretName := $bitbucketSecretNames }}
         - name: bitbucket-credentials-{{ $index }}
           secret:

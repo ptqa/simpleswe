@@ -47,6 +47,16 @@ repositories:
 	}
 }
 
+func TestLoadAllowsDisabledSlack(t *testing.T) {
+	cfg, err := Load(strings.NewReader("slack:\n  disabled: true\nrepositories: []\n"))
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Slack.Disabled {
+		t.Fatal("Slack disabled setting was not preserved")
+	}
+}
+
 func TestLoadPreservesRepositoryWorkerConfiguration(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
 controller:

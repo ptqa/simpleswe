@@ -42,6 +42,7 @@ type SecretSource struct {
 type SlackConfig struct {
 	BotToken SecretSource `yaml:"bot_token"`
 	AppToken SecretSource `yaml:"app_token"`
+	Disabled bool         `yaml:"disabled,omitempty"`
 }
 
 type BitbucketConfig struct {

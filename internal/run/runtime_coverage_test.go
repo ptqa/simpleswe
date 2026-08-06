@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -202,6 +203,45 @@ func TestReadSecretSelectionAndValidation(t *testing.T) {
 	t.Setenv("EMPTY_SECRET", " \n")
 	if _, err := readSecret(config.SecretSource{Env: "EMPTY_SECRET"}, "", "", "", "token"); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("readSecret(empty env) error = %v", err)
+	}
+}
+
+func TestSlackServicesCanBeDisabled(t *testing.T) {
+	missing := config.SecretSource{Env: "MISSING_SLACK_TOKEN"}
+	if _, err := newSlackServices(config.Config{Slack: config.SlackConfig{BotToken: missing}}); err == nil {
+		t.Fatal("newSlackServices accepted missing bot token")
+	}
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
+	if _, err := newSlackServices(config.Config{Slack: config.SlackConfig{
+		BotToken: config.SecretSource{Env: "SLACK_BOT_TOKEN"},
+		AppToken: missing,
+	}}); err == nil {
+		t.Fatal("newSlackServices accepted missing app token")
+	}
+
+	disabled, err := newSlackServices(config.Config{Slack: config.SlackConfig{Disabled: true}})
+	if err != nil {
+		t.Fatalf("newSlackServices(disabled) error = %v", err)
+	}
+	if disabled.socket != nil || disabled.messenger != nil || len(disabled.components(nil, nil, nil)) != 0 {
+		t.Fatal("disabled Slack configured runtime services")
+	}
+	if err := disabled.notifier(nil).PostPullRequest(context.Background(), "task", "url"); err != nil {
+		t.Fatalf("disabled Slack notifier error = %v", err)
+	}
+
+	t.Setenv("SIMPLESWE_SLACK_BOT_TOKEN", "xoxb-test")
+	t.Setenv("SIMPLESWE_SLACK_APP_TOKEN", "xapp-test")
+	enabled, err := newSlackServices(config.Config{})
+	if err != nil {
+		t.Fatalf("newSlackServices(enabled) error = %v", err)
+	}
+	db := openRunTestStore(t)
+	if enabled.socket == nil || enabled.messenger == nil || len(enabled.components(db, nil, slog.Default())) != 2 {
+		t.Fatal("enabled Slack omitted runtime services")
+	}
+	if _, ok := enabled.notifier(db).(*pullRequestNotifier); !ok {
+		t.Fatal("enabled Slack did not configure pull-request notifier")
 	}
 }
 

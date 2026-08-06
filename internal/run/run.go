@@ -153,26 +153,17 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 		return fmt.Errorf("create Kubernetes client: %w", err)
 	}
 
-	botToken, err := readSecret(cfg.Slack.BotToken, "SIMPLESWE_SLACK_BOT_TOKEN", "SIMPLESWE_SLACK_BOT_TOKEN_FILE", "/run/secrets/slack/bot-token", "Slack bot token")
-	if err != nil {
-		return err
-	}
-	appToken, err := readSecret(cfg.Slack.AppToken, "SIMPLESWE_SLACK_APP_TOKEN", "SIMPLESWE_SLACK_APP_TOKEN_FILE", "/run/secrets/slack/app-token", "Slack app token")
-	if err != nil {
-		return err
-	}
 	forge, err := newBitbucketRouter(cfg, "/run/secrets/bitbucket")
 	if err != nil {
 		return err
 	}
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
-	slackClient := slackapi.New(botToken, slackapi.OptionAppLevelToken(appToken))
-	sdkClient := slacksocket.New(slackClient)
-	sdkSocket := internalSocketMode.NewSDKSocket(sdkClient)
-	messenger := internalSocketMode.NewMessenger(internalSocketMode.SDKChatAPI{Client: slackClient})
-	notifier := &pullRequestNotifier{store: db, messenger: messenger}
-	control, err := controller.New(db, kube, cfg, notifier, forge)
+	slack, err := newSlackServices(cfg)
+	if err != nil {
+		return err
+	}
+	control, err := controller.New(db, kube, cfg, slack.notifier(db), forge)
 	if err != nil {
 		return err
 	}
@@ -184,8 +175,6 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 	if err != nil {
 		return err
 	}
-	slackHandler := internalslack.NewHandler(lifecycleAdapter{controller: control}, messenger)
-	transport := internalSocketMode.NewTransport(sdkSocket, db, slackHandler, logger)
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", metricsHandler{store: db})
 	mux.Handle("/", api.NewHandler(backend))
@@ -195,8 +184,55 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
 	}
 	logger.InfoContext(ctx, "controller starting", "address", cfg.Controller.ListenAddress, "namespace", cfg.Controller.Namespace)
-	return runControllerComponents(ctx, server, runtime.Run, sdkSocket.Run, transport.Run)
+	components := make([]func(context.Context) error, 1, 3)
+	components[0] = runtime.Run
+	components = append(components, slack.components(db, control, logger)...)
+	return runControllerComponents(ctx, server, components...)
 }
+
+type slackServices struct {
+	socket    *internalSocketMode.SDKSocket
+	messenger internalslack.Messenger
+}
+
+func newSlackServices(cfg config.Config) (slackServices, error) {
+	if cfg.Slack.Disabled {
+		return slackServices{}, nil
+	}
+	botToken, err := readSecret(cfg.Slack.BotToken, "SIMPLESWE_SLACK_BOT_TOKEN", "SIMPLESWE_SLACK_BOT_TOKEN_FILE", "/run/secrets/slack/bot-token", "Slack bot token")
+	if err != nil {
+		return slackServices{}, err
+	}
+	appToken, err := readSecret(cfg.Slack.AppToken, "SIMPLESWE_SLACK_APP_TOKEN", "SIMPLESWE_SLACK_APP_TOKEN_FILE", "/run/secrets/slack/app-token", "Slack app token")
+	if err != nil {
+		return slackServices{}, err
+	}
+	slackClient := slackapi.New(botToken, slackapi.OptionAppLevelToken(appToken))
+	return slackServices{
+		socket:    internalSocketMode.NewSDKSocket(slacksocket.New(slackClient)),
+		messenger: internalSocketMode.NewMessenger(internalSocketMode.SDKChatAPI{Client: slackClient}),
+	}, nil
+}
+
+func (s slackServices) notifier(db *store.Store) controller.Notifier {
+	if s.messenger == nil {
+		return discardNotifier{}
+	}
+	return &pullRequestNotifier{store: db, messenger: s.messenger}
+}
+
+func (s slackServices) components(db *store.Store, control *controller.Controller, logger *slog.Logger) []func(context.Context) error {
+	if s.socket == nil {
+		return nil
+	}
+	handler := internalslack.NewHandler(lifecycleAdapter{controller: control}, s.messenger)
+	transport := internalSocketMode.NewTransport(s.socket, db, handler, logger)
+	return []func(context.Context) error{s.socket.Run, transport.Run}
+}
+
+type discardNotifier struct{}
+
+func (discardNotifier) PostPullRequest(context.Context, string, string) error { return nil }
 
 type lifecycleAdapter struct{ controller *controller.Controller }
 

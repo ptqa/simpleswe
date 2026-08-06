@@ -1,0 +1,36 @@
+namespace:
+  create: false
+  name: simpleswe
+
+image:
+  repository: simpleswe-controller
+  tag: kind
+  pullPolicy: Never
+
+storage:
+  size: 1Gi
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+config:
+  controller:
+    listen_address: ":8080"
+    namespace: simpleswe
+    deadline: 10m
+    max_fix_attempts: 1
+  worker:
+    image: simpleswe-worker:kind
+    command: opencode
+    branch_prefix: simpleswe/
+    deadline: 10m
+  slack:
+    disabled: true
+  bitbucket:
+    base_url: https://api.bitbucket.org
+  repositories: {}

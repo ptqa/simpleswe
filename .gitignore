@@ -1,4 +1,5 @@
 /simpleswe
+/bin/
 /tmp/
 *.db
 *.sqlite

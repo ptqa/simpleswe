@@ -460,11 +460,11 @@ func TestPortForwardLifecycle(t *testing.T) {
 	default:
 		t.Fatal("Ready() channel is not closed")
 	}
-	if err := forward.Close(); err == nil {
-		t.Fatal("Close() error = nil, want killed process error")
+	if err := forward.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil", err)
 	}
-	if err := forward.Close(); err == nil {
-		t.Fatal("second Close() error = nil, want process error")
+	if err := forward.Close(); err != nil {
+		t.Fatalf("second Close() error = %v, want nil", err)
 	}
 	if err := forward.Wait(); err == nil {
 		t.Fatal("Wait() error = nil, want killed process error")
@@ -482,6 +482,9 @@ func TestPortForwardReportsEarlyExitAndContextErrors(t *testing.T) {
 	}
 	if err := forward.Wait(); err == nil {
 		t.Fatal("Wait() error = nil, want process error")
+	}
+	if err := forward.Close(); err == nil {
+		t.Fatal("Close() error = nil after early process exit")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
