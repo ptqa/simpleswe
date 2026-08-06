@@ -1,6 +1,7 @@
 /simpleswe
 /bin/
 /tmp/
+/.secrets/
 *.db
 *.sqlite
 *.sqlite3

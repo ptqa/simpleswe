@@ -33,4 +33,21 @@ config:
     disabled: true
   bitbucket:
     base_url: https://api.bitbucket.org
-  repositories: {}
+  repositories:
+    simpleswe:
+      worker:
+        image: simpleswe-worker:kind
+        env:
+          - name: ANTHROPIC_API_KEY
+            secret:
+              name: opencode-provider
+              key: ANTHROPIC_API_KEY
+      opencode:
+        command: [opencode, run]
+      validation:
+        commands:
+          - [git, diff, --check]
+      github:
+        owner: ptqa
+        repository: simpleswe
+        credentials_secret_name: github-simpleswe
