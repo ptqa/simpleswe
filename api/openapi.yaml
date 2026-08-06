@@ -307,8 +307,10 @@ components:
   schemas:
     CreateTaskRequest:
       type: object
-      description: Repository and instruction submitted as a new task.
+      description: Repository and instruction submitted as a new task. At most one of idempotency_key and slack_event_id may be provided.
       additionalProperties: false
+      not:
+        required: [idempotency_key, slack_event_id]
       required: [repository, prompt]
       example:
         repository: https://github.com/simpleswe/example-service
@@ -322,12 +324,19 @@ components:
           type: string
           minLength: 1
           description: User instruction for the software-engineering task.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: .*\S.*
+          description: Optional generic, caller-generated opaque key used to deduplicate task-creation retries; mutually exclusive with slack_event_id.
         slack_origin:
           $ref: '#/components/schemas/SlackOrigin'
         slack_event_id:
           type: string
           minLength: 1
-          description: Provider event identifier used for idempotency and tracing.
+          pattern: .*\S.*
+          description: Optional Slack-specific event identifier used to deduplicate retries of a Slack-originated task and support tracing; mutually exclusive with idempotency_key.
 
     ErrorResponse:
       type: object

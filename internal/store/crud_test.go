@@ -4,10 +4,141 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/simpleswe/simpleswe/internal/task"
 )
+
+func TestCreateTaskOnceUsesGenericIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	params := CreateTaskParams{
+		Repository:     "repo",
+		Prompt:         "generic request",
+		IdempotencyKey: strings.Repeat("k", 256),
+	}
+
+	first, inserted, err := db.CreateTaskOnce(ctx, params)
+	if err != nil || !inserted {
+		t.Fatalf("first CreateTaskOnce() = %#v, %t, %v; want inserted task", first, inserted, err)
+	}
+	byKey, err := db.GetTaskByIdempotencyKey(ctx, params.IdempotencyKey)
+	if err != nil || byKey.ID != first.ID {
+		t.Fatalf("GetTaskByIdempotencyKey() = %#v, %v; want task %q", byKey, err, first.ID)
+	}
+	replayed, inserted, err := db.CreateTaskOnce(ctx, params)
+	if err != nil || inserted || replayed.ID != first.ID {
+		t.Fatalf("replayed CreateTaskOnce() = %#v, %t, %v; want original task without insert", replayed, inserted, err)
+	}
+	tasks, err := db.ListTasks(ctx)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("tasks after replay = %#v, %v; want one atomically recorded task", tasks, err)
+	}
+	attempts, err := db.ListAttempts(ctx, first.ID)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("attempts after replay = %#v, %v; want one attempt", attempts, err)
+	}
+	if _, err := db.GetTaskByIdempotencyKey(ctx, " "); err == nil {
+		t.Fatal("GetTaskByIdempotencyKey() accepted a blank key")
+	}
+	if _, err := db.GetTaskByIdempotencyKey(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing idempotency lookup error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestCreateTaskIdempotencySurvivesStoreRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	params := CreateTaskParams{Repository: "repo", Prompt: "original", IdempotencyKey: "create-1"}
+	first, inserted, err := db.CreateTaskOnce(ctx, params)
+	if err != nil || !inserted {
+		t.Fatalf("first CreateTaskOnce() = %#v, %t, %v; want inserted task", first, inserted, err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	byKey, err := db.GetTaskByIdempotencyKey(ctx, params.IdempotencyKey)
+	if err != nil || byKey.ID != first.ID {
+		t.Fatalf("reopened GetTaskByIdempotencyKey() = %#v, %v; want task %q", byKey, err, first.ID)
+	}
+	replayed, inserted, err := db.CreateTaskOnce(ctx, CreateTaskParams{
+		Repository: "different-repo", Prompt: "different payload", IdempotencyKey: params.IdempotencyKey,
+	})
+	if err != nil || inserted || replayed.ID != first.ID || replayed.Repository != first.Repository || replayed.Prompt != first.Prompt {
+		t.Fatalf("reopened replay = %#v, %t, %v; want original task %#v without insert", replayed, inserted, err, first)
+	}
+	tasks, err := db.ListTasks(ctx)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("tasks after reopened replay = %#v, %v; want one task", tasks, err)
+	}
+	attempts, err := db.ListAttempts(ctx, first.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != first.CurrentAttemptID {
+		t.Fatalf("attempts after reopened replay = %#v, %v; want original attempt %q", attempts, err, first.CurrentAttemptID)
+	}
+}
+
+func TestCreateTaskOnceRejectsInvalidIdempotencyKeysWithoutWrites(t *testing.T) {
+	tests := []struct {
+		name   string
+		params CreateTaskParams
+	}{
+		{
+			name: "whitespace-only generic key",
+			params: CreateTaskParams{
+				Repository: "repo", Prompt: "prompt", IdempotencyKey: " \t\n",
+			},
+		},
+		{
+			name: "generic key over 256 characters",
+			params: CreateTaskParams{
+				Repository: "repo", Prompt: "prompt", IdempotencyKey: strings.Repeat("k", 257),
+			},
+		},
+		{
+			name: "generic and Slack keys",
+			params: CreateTaskParams{
+				Repository: "repo", Prompt: "prompt", IdempotencyKey: "generic-1", SlackEventID: "slack-1",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openTestStore(t)
+			created, inserted, err := db.CreateTaskOnce(context.Background(), test.params)
+			if err == nil {
+				t.Error("CreateTaskOnce() error = nil, want rejection")
+			}
+			if inserted || created.ID != "" {
+				t.Errorf("CreateTaskOnce() = %#v, inserted %t; want no task", created, inserted)
+			}
+			assertNoCreateRows(t, db)
+		})
+	}
+}
+
+func assertNoCreateRows(t *testing.T, db *Store) {
+	t.Helper()
+	for _, table := range []string{"tasks", "task_attempts", "task_create_intents", "slack_events", "task_events"} {
+		var count int
+		if err := db.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Errorf("%s rows = %d, want 0", table, count)
+		}
+	}
+}
 
 func TestStoreOpenAndInboxValidationEdges(t *testing.T) {
 	ctx := context.Background()

@@ -48,10 +48,11 @@ type ListOptions struct {
 }
 
 type CreateTaskRequest struct {
-	Repository   string        `json:"repository"`
-	Prompt       string        `json:"prompt"`
-	SlackOrigin  *SlackDetails `json:"slack_origin,omitempty"`
-	SlackEventID string        `json:"slack_event_id,omitempty"`
+	Repository     string        `json:"repository"`
+	Prompt         string        `json:"prompt"`
+	IdempotencyKey string        `json:"idempotency_key,omitempty"`
+	SlackOrigin    *SlackDetails `json:"slack_origin,omitempty"`
+	SlackEventID   string        `json:"slack_event_id,omitempty"`
 }
 
 type TaskList struct {

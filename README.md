@@ -287,6 +287,7 @@ TUI keys:
 | --- | --- |
 | `j` / `k`, `↑` / `↓` | Move selection |
 | `g` / `G` | Jump to first or last task |
+| `n` | Create task |
 | `enter` | Task and attempt details |
 | `l` | Live logs |
 | `e` | Event history |

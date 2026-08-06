@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -95,6 +96,69 @@ func TestCreateTaskPersistsQueuesAndCreatesSecretBeforeOneJob(t *testing.T) {
 	}
 	if len(attempts) != 1 || attempts[0].Number != 1 {
 		t.Fatalf("replayed event attempts = %#v; want only attempt 1", attempts)
+	}
+}
+
+func TestCreateTaskIdempotencyReplayDoesNotCreateAnotherJobOrAttempt(t *testing.T) {
+	fixture := newFixture(t)
+	params := store.CreateTaskParams{
+		Repository:     repositoryURL,
+		Prompt:         "generic create",
+		IdempotencyKey: "request-123",
+	}
+	created, err := fixture.controller.CreateTask(fixture.ctx, params)
+	if err != nil {
+		t.Fatalf("CreateTask() error = %v", err)
+	}
+	creates := createResources(fixture.kube.Actions())
+
+	replayed, err := fixture.controller.CreateTask(fixture.ctx, store.CreateTaskParams{
+		Repository:     params.Repository,
+		Prompt:         "payload ignored on replay",
+		IdempotencyKey: params.IdempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask(idempotency replay) error = %v", err)
+	}
+	if replayed.ID != created.ID || replayed.Prompt != params.Prompt {
+		t.Fatalf("replayed task = %#v, want original %#v", replayed, created)
+	}
+	if got := createResources(fixture.kube.Actions()); !reflect.DeepEqual(got, creates) {
+		t.Fatalf("idempotency replay created more resources: before %v, after %v", creates, got)
+	}
+	attempts, err := fixture.store.ListAttempts(fixture.ctx, created.ID)
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(attempts) != 1 || attempts[0].Number != 1 {
+		t.Fatalf("idempotency replay attempts = %#v; want only attempt 1", attempts)
+	}
+}
+
+func TestCreateTaskRejectsGenericAndSlackKeysBeforeCreatingResources(t *testing.T) {
+	fixture := newFixture(t)
+	created, err := fixture.controller.CreateTask(fixture.ctx, store.CreateTaskParams{
+		Repository:     repositoryURL,
+		Prompt:         "ambiguous idempotency source",
+		IdempotencyKey: "generic-1",
+		SlackEventID:   "slack-1",
+	})
+
+	if !errors.Is(err, store.ErrConflict) {
+		t.Errorf("CreateTask() error = %v, want store.ErrConflict", err)
+	}
+	if created.ID != "" {
+		t.Errorf("CreateTask() task = %#v, want zero task", created)
+	}
+	if resources := createResources(fixture.kube.Actions()); len(resources) != 0 {
+		t.Errorf("CreateTask() created Kubernetes resources: %v", resources)
+	}
+	tasks, listErr := fixture.store.ListTasks(fixture.ctx)
+	if listErr != nil {
+		t.Fatalf("ListTasks(): %v", listErr)
+	}
+	if len(tasks) != 0 {
+		t.Errorf("CreateTask() persisted tasks: %#v", tasks)
 	}
 }
 

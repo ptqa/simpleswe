@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -9,7 +10,9 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/simpleswe/simpleswe/internal/client"
 	"go.rockorager.dev/vaxis"
+	"go.rockorager.dev/vaxis/widgets/textinput"
 )
 
 func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
@@ -18,6 +21,10 @@ func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
 		a.vx.Resize(event)
 	case vaxis.SyncFunc:
 		event()
+	case vaxis.PasteEndEvent:
+		if a.createModal && !a.createPending && !a.createAccepted {
+			a.updateCreateInput(event)
+		}
 	case vaxis.QuitEvent:
 		return true, nil
 	case vaxis.Key:
@@ -30,6 +37,18 @@ func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
 }
 
 func (a *application) handleKey(key vaxis.Key) (bool, error) {
+	if key.EventType == vaxis.EventPaste {
+		if a.createModal && !a.createPending && !a.createAccepted {
+			a.updateCreateInput(key)
+		}
+		return false, nil
+	}
+	if a.createModal {
+		if key.MatchString("Ctrl+c") {
+			return true, nil
+		}
+		return a.handleCreateTaskKey(key)
+	}
 	if a.themePicker {
 		switch {
 		case key.MatchString("j"), key.Matches(vaxis.KeyDown):
@@ -72,6 +91,8 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	}
 
 	switch {
+	case key.MatchString("n"):
+		a.openCreateTask()
 	case key.MatchString("Ctrl+c"):
 		return true, nil
 	case key.MatchString("k"), key.Matches(vaxis.KeyUp):
@@ -130,6 +151,113 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	return false, nil
 }
 
+func (a *application) openCreateTask() {
+	if a.createRepo != nil {
+		a.createModal = true
+		return
+	}
+	a.createModal = true
+	a.createField = createRepositoryField
+	a.createRepo = textinput.New().SetPrompt("Repository: ")
+	a.createPrompt = textinput.New().SetPrompt("Prompt: ")
+	a.createEventKey = "tui-" + rand.Text()
+	a.createEventPayload = [2]string{}
+	a.createError = ""
+	a.createAccepted = false
+}
+
+func (a *application) resetCreateTask() {
+	a.createModal = false
+	a.createPending = false
+	a.createField = createRepositoryField
+	a.createRepo = nil
+	a.createPrompt = nil
+	a.createEventKey = ""
+	a.createEventPayload = [2]string{}
+	a.createError = ""
+	a.createAccepted = false
+}
+
+func (a *application) handleCreateTaskKey(key vaxis.Key) (bool, error) {
+	if a.createAccepted {
+		a.resetCreateTask()
+		return false, nil
+	}
+	if key.Matches(vaxis.KeyEsc) {
+		if a.createPending {
+			a.createModal = false
+		} else {
+			a.resetCreateTask()
+		}
+		return false, nil
+	}
+	if a.createPending {
+		return false, nil
+	}
+	switch {
+	case key.Matches(vaxis.KeyTab):
+		a.createField = (a.createField + 1) % 2
+	case key.Matches(vaxis.KeyEnter):
+		if a.createField == createRepositoryField {
+			if strings.TrimSpace(a.createRepo.String()) == "" {
+				a.createError = "repository required"
+				return false, nil
+			}
+			a.createField = createPromptField
+			return false, nil
+		}
+		a.submitCreateTask()
+	default:
+		a.updateCreateInput(key)
+	}
+	return false, nil
+}
+
+func (a *application) updateCreateInput(event vaxis.Event) {
+	input := a.createRepo
+	if a.createField == createPromptField {
+		input = a.createPrompt
+	}
+	before := input.String()
+	input.Update(event)
+	if input.String() != before {
+		a.createError = ""
+	}
+}
+
+func (a *application) submitCreateTask() {
+	a.createError = ""
+	repository := strings.TrimSpace(a.createRepo.String())
+	prompt := strings.TrimSpace(a.createPrompt.String())
+	if repository == "" {
+		a.createError = "repository required"
+		return
+	}
+	if prompt == "" {
+		a.createError = "prompt required"
+		return
+	}
+	payload := [2]string{repository, prompt}
+	if a.createEventPayload != [2]string{} && a.createEventPayload != payload {
+		a.createEventKey = "tui-" + rand.Text()
+	}
+	a.createEventPayload = payload
+	a.createPending = true
+	a.message = "create requested"
+	eventKey := a.createEventKey
+	go func() {
+		ctx, cancel := context.WithTimeout(a.ctx, a.options.RequestTimeout)
+		defer cancel()
+		task, err := a.client.CreateTask(ctx, client.CreateTaskRequest{
+			Repository: repository, Prompt: prompt, IdempotencyKey: eventKey,
+		})
+		select {
+		case a.actionCh <- actionResult{name: "create", task: task, err: err}:
+		case <-a.ctx.Done():
+		}
+	}()
+}
+
 func (a *application) performAction(name string) {
 	if a.actionPending {
 		return
@@ -162,6 +290,35 @@ func (a *application) performAction(name string) {
 }
 
 func (a *application) applyAction(result actionResult) {
+	if result.name == "create" {
+		a.createPending = false
+		if result.err != nil {
+			a.message = "create failed"
+			a.createError = "create failed: " + shortError(result.err)
+			return
+		}
+		if a.createModal {
+			a.createAccepted = true
+			a.createError = ""
+		}
+		existing := a.model.Tasks()
+		tasks := make([]Task, 0, min(a.options.TaskLimit, len(existing)+1))
+		tasks = append(tasks, result.task)
+		for _, task := range existing {
+			if task.ID != result.task.ID && len(tasks) < a.options.TaskLimit {
+				tasks = append(tasks, task)
+			}
+		}
+		a.model.RefreshTasks(tasks)
+		a.selectTask(result.task.ID)
+		a.message = "create accepted"
+		a.refreshing = false
+		a.refresh()
+		if !a.createModal {
+			a.resetCreateTask()
+		}
+		return
+	}
 	a.actionPending = false
 	if result.err != nil {
 		a.message = result.name + " failed: " + shortError(result.err)

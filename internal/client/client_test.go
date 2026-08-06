@@ -39,7 +39,7 @@ func TestClientCallsControllerEndpointsAndDecodesDataEnvelopes(t *testing.T) {
 			if err != nil {
 				t.Errorf("read create body: %v", err)
 			}
-			if got := string(body); got != `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix the bug"}` {
+			if got := string(body); got != `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix the bug","idempotency_key":"generic-request-1"}` {
 				t.Errorf("create body = %s", got)
 			}
 			_, _ = fmt.Fprintf(w, `{"data":%s}`, clientTaskJSON)
@@ -85,8 +85,9 @@ func TestClientCallsControllerEndpointsAndDecodesDataEnvelopes(t *testing.T) {
 	}
 
 	created, err := c.CreateTask(ctx, CreateTaskRequest{
-		Repository: "https://bitbucket.example/acme/widget",
-		Prompt:     "fix the bug",
+		Repository:     "https://bitbucket.example/acme/widget",
+		Prompt:         "fix the bug",
+		IdempotencyKey: "generic-request-1",
 	})
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)

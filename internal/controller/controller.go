@@ -104,6 +104,18 @@ func New(db *store.Store, client kubernetes.Interface, cfg config.Config, notifi
 }
 
 func (c *Controller) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
+	if params.IdempotencyKey != "" && params.SlackEventID != "" {
+		return store.Task{}, fmt.Errorf("%w: idempotency key and Slack event ID are mutually exclusive", store.ErrConflict)
+	}
+	if params.IdempotencyKey != "" {
+		existing, err := c.store.GetTaskByIdempotencyKey(ctx, params.IdempotencyKey)
+		if err == nil {
+			return existing, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return store.Task{}, fmt.Errorf("load task by idempotency key: %w", err)
+		}
+	}
 	if params.SlackEventID != "" {
 		existing, err := c.store.GetTaskBySlackEventID(ctx, params.SlackEventID)
 		if err == nil {

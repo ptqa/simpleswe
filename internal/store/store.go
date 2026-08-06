@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -29,10 +30,11 @@ type Store struct {
 }
 
 type CreateTaskParams struct {
-	Repository   string
-	Prompt       string
-	SlackEventID string
-	SlackOrigin  protocol.SlackOrigin
+	Repository     string
+	Prompt         string
+	IdempotencyKey string
+	SlackEventID   string
+	SlackOrigin    protocol.SlackOrigin
 }
 
 type Task struct {
@@ -184,6 +186,11 @@ CREATE TABLE IF NOT EXISTS task_attempts (
 	config_digest TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE (task_id, number)
+);
+
+CREATE TABLE IF NOT EXISTS task_create_intents (
+	idempotency_key TEXT PRIMARY KEY,
+	task_id TEXT NOT NULL REFERENCES tasks(id)
 );
 
 CREATE TABLE IF NOT EXISTS retry_intents (
@@ -589,8 +596,18 @@ func (s *Store) CreateTask(ctx context.Context, params CreateTaskParams) (Task, 
 }
 
 // CreateTaskOnce creates a task or returns the task already associated with a
-// Slack event. The boolean reports whether this call inserted the task.
+// generic idempotency key or Slack event. The boolean reports whether this call
+// inserted the task.
 func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Task, bool, error) {
+	if params.IdempotencyKey != "" && params.SlackEventID != "" {
+		return Task{}, false, fmt.Errorf("%w: idempotency key and Slack event ID are mutually exclusive", ErrConflict)
+	}
+	if params.IdempotencyKey != "" && strings.TrimSpace(params.IdempotencyKey) == "" {
+		return Task{}, false, errors.New("task create idempotency key is empty")
+	}
+	if utf8.RuneCountInString(params.IdempotencyKey) > 256 {
+		return Task{}, false, errors.New("task create idempotency key exceeds 256 characters")
+	}
 	if strings.TrimSpace(params.Repository) == "" {
 		return Task{}, false, errors.New("repository is empty")
 	}
@@ -604,24 +621,32 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if params.SlackEventID != "" {
-		var existingID string
+	var existingID string
+	if params.IdempotencyKey != "" {
+		err := tx.QueryRowContext(ctx,
+			"SELECT task_id FROM task_create_intents WHERE idempotency_key = ?", params.IdempotencyKey,
+		).Scan(&existingID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Task{}, false, fmt.Errorf("look up task create intent: %w", err)
+		}
+	}
+	if existingID == "" && params.SlackEventID != "" {
 		err := tx.QueryRowContext(ctx,
 			"SELECT task_id FROM slack_events WHERE event_id = ?", params.SlackEventID,
 		).Scan(&existingID)
-		switch {
-		case err == nil:
-			existing, getErr := scanTask(tx.QueryRowContext(ctx, taskSelect, existingID))
-			if getErr != nil {
-				return Task{}, false, fmt.Errorf("read deduplicated task: %w", getErr)
-			}
-			if err := tx.Commit(); err != nil {
-				return Task{}, false, fmt.Errorf("commit task deduplication: %w", err)
-			}
-			return existing, false, nil
-		case !errors.Is(err, sql.ErrNoRows):
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return Task{}, false, fmt.Errorf("look up Slack event: %w", err)
 		}
+	}
+	if existingID != "" {
+		existing, err := scanTask(tx.QueryRowContext(ctx, taskSelect, existingID))
+		if err != nil {
+			return Task{}, false, fmt.Errorf("read deduplicated task: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return Task{}, false, fmt.Errorf("commit task deduplication: %w", err)
+		}
+		return existing, false, nil
 	}
 
 	now := time.Now().UTC()
@@ -650,6 +675,13 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 		VALUES (?, ?, 1, 1, ?, ?)`, attemptID, taskID, task.RECEIVED, stamp(now)); err != nil {
 		return Task{}, false, fmt.Errorf("insert first task attempt: %w", err)
 	}
+	if params.IdempotencyKey != "" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO task_create_intents (idempotency_key, task_id)
+			VALUES (?, ?)`, params.IdempotencyKey, taskID); err != nil {
+			return Task{}, false, fmt.Errorf("record task create intent: %w", err)
+		}
+	}
 	if params.SlackEventID != "" {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO slack_events (event_id, task_id, processed_at)
@@ -671,6 +703,32 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 		SlackEventID:     params.SlackEventID,
 		SlackOrigin:      params.SlackOrigin,
 	}, true, nil
+}
+
+// GetTaskByIdempotencyKey returns the task already associated with a generic
+// create idempotency key.
+func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey string) (Task, error) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return Task{}, errors.New("task create idempotency key is empty")
+	}
+	if utf8.RuneCountInString(idempotencyKey) > 256 {
+		return Task{}, errors.New("task create idempotency key exceeds 256 characters")
+	}
+	got, err := scanTask(s.db.QueryRowContext(ctx, `
+		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at,
+		       tasks.updated_at, tasks.current_attempt_id, tasks.slack_event_id,
+		       tasks.slack_workspace_id, tasks.slack_channel_id, tasks.slack_message_ts,
+		       tasks.slack_thread_ts, tasks.slack_user_id,
+		       tasks.cancellation_requested
+		FROM task_create_intents JOIN tasks ON tasks.id = task_create_intents.task_id
+		WHERE task_create_intents.idempotency_key = ?`, idempotencyKey))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Task{}, fmt.Errorf("%w: task create intent %s", ErrNotFound, idempotencyKey)
+	}
+	if err != nil {
+		return Task{}, fmt.Errorf("get task for idempotency key %q: %w", idempotencyKey, err)
+	}
+	return got, nil
 }
 
 // GetTaskBySlackEventID returns the task already associated with an event.

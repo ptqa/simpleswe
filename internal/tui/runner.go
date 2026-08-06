@@ -10,6 +10,7 @@ import (
 
 	"github.com/simpleswe/simpleswe/internal/client"
 	"go.rockorager.dev/vaxis"
+	"go.rockorager.dev/vaxis/widgets/textinput"
 )
 
 const (
@@ -126,14 +127,16 @@ const (
 )
 
 type taskResult struct {
-	tasks []Task
-	err   error
+	generation uint64
+	tasks      []Task
+	err        error
 }
 
 type detailResult struct {
-	taskID string
-	detail TaskDetail
-	err    error
+	taskID     string
+	generation uint64
+	detail     TaskDetail
+	err        error
 }
 
 type logResult struct {
@@ -150,6 +153,11 @@ type actionResult struct {
 	err  error
 }
 
+const (
+	createRepositoryField = iota
+	createPromptField
+)
+
 type application struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -158,17 +166,27 @@ type application struct {
 	options Options
 	model   *Model
 
-	mode          viewMode
-	theme         themeName
-	themePicker   bool
-	themeCursor   int
-	themePrevious themeName
-	help          bool
-	confirmCancel bool
-	narrowDetail  bool
-	message       string
-	refreshing    bool
-	actionPending bool
+	mode               viewMode
+	theme              themeName
+	themePicker        bool
+	themeCursor        int
+	themePrevious      themeName
+	help               bool
+	confirmCancel      bool
+	narrowDetail       bool
+	message            string
+	refreshing         bool
+	refreshGen         uint64
+	actionPending      bool
+	createModal        bool
+	createPending      bool
+	createField        int
+	createRepo         *textinput.Model
+	createPrompt       *textinput.Model
+	createEventKey     string
+	createEventPayload [2]string
+	createError        string
+	createAccepted     bool
 
 	tasksCh    chan taskResult
 	detailCh   chan detailResult
@@ -176,6 +194,7 @@ type application struct {
 	actionCh   chan actionResult
 	detailStop context.CancelFunc
 	logStop    context.CancelFunc
+	detailGen  uint64
 	logGen     uint64
 }
 
@@ -249,11 +268,13 @@ func (a *application) refresh() {
 		return
 	}
 	a.refreshing = true
+	a.refreshGen++
+	generation := a.refreshGen
 	go func() {
 		ctx, cancel := context.WithTimeout(a.ctx, a.options.RequestTimeout)
 		defer cancel()
 		list, err := a.client.ListTasks(ctx, client.ListOptions{Limit: a.options.TaskLimit})
-		result := taskResult{tasks: list.Tasks, err: err}
+		result := taskResult{generation: generation, tasks: list.Tasks, err: err}
 		select {
 		case a.tasksCh <- result:
 		case <-a.ctx.Done():
@@ -262,6 +283,9 @@ func (a *application) refresh() {
 }
 
 func (a *application) applyTasks(result taskResult) {
+	if result.generation != a.refreshGen {
+		return
+	}
 	a.refreshing = false
 	if result.err != nil {
 		a.model.SetConnectivity(ConnectivityLost, "controller connection lost: "+shortError(result.err))
@@ -304,6 +328,8 @@ func (a *application) fetchDetail(taskID string) {
 	if a.detailStop != nil {
 		a.detailStop()
 	}
+	a.detailGen++
+	generation := a.detailGen
 	ctx, stop := context.WithCancel(a.ctx)
 	a.detailStop = stop
 	go func() {
@@ -319,9 +345,10 @@ func (a *application) fetchDetail(taskID string) {
 			events, err = a.client.ListEvents(requestCtx, taskID, client.ListOptions{Limit: 100})
 		}
 		result := detailResult{
-			taskID: taskID,
-			detail: TaskDetail{Task: task, Attempts: attempts.Attempts, Events: events.Events},
-			err:    err,
+			taskID:     taskID,
+			generation: generation,
+			detail:     TaskDetail{Task: task, Attempts: attempts.Attempts, Events: events.Events},
+			err:        err,
 		}
 		select {
 		case a.detailCh <- result:
@@ -331,7 +358,7 @@ func (a *application) fetchDetail(taskID string) {
 }
 
 func (a *application) applyDetail(result detailResult) {
-	if result.taskID != a.model.SelectedTaskID() {
+	if result.taskID != a.model.SelectedTaskID() || result.generation != a.detailGen {
 		return
 	}
 	if result.err != nil {

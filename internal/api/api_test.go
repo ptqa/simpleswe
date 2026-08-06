@@ -14,8 +14,9 @@ import (
 )
 
 type fakeHandlerDependency struct {
-	mu    sync.Mutex
-	calls []string
+	mu         sync.Mutex
+	calls      []string
+	createBody []byte
 }
 
 func (f *fakeHandlerDependency) Health(context.Context) ([]byte, error) {
@@ -23,8 +24,11 @@ func (f *fakeHandlerDependency) Health(context.Context) ([]byte, error) {
 	return []byte(`{"status":"ok","service":"simpleswe","checked_at":"2026-08-06T00:00:00Z","dependencies":[]}`), nil
 }
 
-func (f *fakeHandlerDependency) CreateTask(context.Context, []byte) ([]byte, error) {
-	f.record("create")
+func (f *fakeHandlerDependency) CreateTask(_ context.Context, body []byte) ([]byte, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, "create")
+	f.createBody = append([]byte(nil), body...)
+	f.mu.Unlock()
 	return []byte(taskJSON), nil
 }
 
@@ -88,7 +92,84 @@ func (f *fakeHandlerDependency) wasCalled(call string) bool {
 	return false
 }
 
+func (f *fakeHandlerDependency) lastCreateBody() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.createBody...)
+}
+
 const taskJSON = `{"task_id":"task-1","repository":"https://bitbucket.example/acme/widget","prompt":"fix the bug","state":"queued","created_at":"2026-08-06T00:00:00Z","updated_at":"2026-08-06T00:00:00Z","cancellation_requested":false,"validation_runs":[],"git_result":{"state":"not_run"},"pull_request":{"state":"not_created"}}`
+
+func TestHandlerAcceptsAndForwardsIdempotencyKey(t *testing.T) {
+	dependency := new(fakeHandlerDependency)
+	body := `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"` + strings.Repeat("k", 256) + `"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
+
+	NewHandler(dependency).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusCreated, recorder.Body.String())
+	}
+	if got := string(dependency.lastCreateBody()); got != body {
+		t.Fatalf("forwarded create body = %q, want %q", got, body)
+	}
+}
+
+func TestHandlerRejectsInvalidCreateIdempotencyKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "257 characters",
+			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"` + strings.Repeat("k", 257) + `"}`,
+		},
+		{
+			name: "generic and Slack keys",
+			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"generic-1","slack_event_id":"slack-1"}`,
+		},
+		{
+			name: "explicit null",
+			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":null}`,
+		},
+		{
+			name: "explicit null Slack event ID",
+			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":null}`,
+		},
+		{
+			name: "explicit null and Slack key",
+			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":null,"slack_event_id":"slack-1"}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dependency := new(fakeHandlerDependency)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(test.body))
+
+			NewHandler(dependency).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			var envelope struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if envelope.Error.Code != "invalid_request" {
+				t.Fatalf("error code = %q, want invalid_request", envelope.Error.Code)
+			}
+			if dependency.wasCalled("create") {
+				t.Fatal("invalid create request reached dependency")
+			}
+		})
+	}
+}
 
 func TestHandlerExposesOpenAPITaskRoutes(t *testing.T) {
 	dependency := new(fakeHandlerDependency)
@@ -453,6 +534,8 @@ func TestHandlerRejectsInvalidQueriesAndCreateBodies(t *testing.T) {
 		{name: "unknown field", method: http.MethodPost, path: "/v1/tasks", body: validCreate[:len(validCreate)-1] + `,"unknown":true}`},
 		{name: "multiple values", method: http.MethodPost, path: "/v1/tasks", body: validCreate + ` {}`},
 		{name: "inline credentials", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://user:pass@bitbucket.example/acme/widget","prompt":"fix"}`},
+		{name: "empty idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":""}`},
+		{name: "whitespace idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":" \t"}`},
 		{name: "empty event ID", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":" "}`},
 		{name: "incomplete Slack origin", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_origin":{"workspace_id":"T1"}}`},
 	}

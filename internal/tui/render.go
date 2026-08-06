@@ -22,12 +22,32 @@ func (a *application) draw() {
 	a.vx.HideCursor()
 	a.drawHeader(root.New(0, 0, width, 1))
 	if height == 1 {
+		if a.createModal {
+			message := "CREATE TASK · Esc cancels"
+			if a.createAccepted {
+				message = "CREATE TASK · accepted · press any key"
+			} else if a.createPending {
+				message = "CREATE TASK · Esc hides; request continues"
+			}
+			root.PrintTruncate(0, vaxis.Segment{Text: message, Style: palette.warn})
+		}
 		a.vx.Render()
 		return
 	}
 	a.drawFooter(root.New(0, height-1, width, 1))
 	if height <= 4 {
-		root.New(0, 1, width, height-2).PrintTruncate(0, vaxis.Segment{Text: "Terminal too small", Style: palette.warn})
+		message := "Terminal too small"
+		if a.createModal {
+			switch {
+			case a.createAccepted:
+				message += " · create accepted · press any key"
+			case a.createPending:
+				message += " · Esc hides; request continues"
+			default:
+				message += " · Esc cancels create"
+			}
+		}
+		root.New(0, 1, width, 1).PrintTruncate(0, vaxis.Segment{Text: message, Style: palette.warn})
 		a.vx.Render()
 		return
 	}
@@ -70,6 +90,9 @@ func (a *application) draw() {
 	if a.confirmCancel {
 		a.drawCancelConfirmation(root)
 	}
+	if a.createModal {
+		a.drawCreateTask(root)
+	}
 	a.vx.Render()
 }
 
@@ -106,9 +129,9 @@ func (a *application) drawFooter(win vaxis.Window) {
 	palette := a.colors()
 	fill(win, palette.header)
 	width, _ := win.Size()
-	keys := " j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  ? help  q back"
+	keys := " n create  j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  ? help  q back"
 	if width < 82 {
-		keys = " j/k move  enter details  t themes  ? help  q back"
+		keys = " n create  j/k move  enter details  t themes  ? help  q back"
 	}
 	statusMessage := a.message
 	if state := a.model.Connectivity(); state == ConnectivityLost || state == ConnectivityRestored {
@@ -117,6 +140,10 @@ func (a *application) drawFooter(win vaxis.Window) {
 	message := "  " + statusMessage
 	if len(keys)+len(message) < width {
 		keys += strings.Repeat(" ", width-len(keys)-len(message)) + message
+	} else if available := width - len(message) - 2; available > 0 {
+		keys = strings.TrimRight(keys[:min(len(keys), available)], " ") + "  " + message
+	} else {
+		keys = message
 	}
 	win.PrintTruncate(0, vaxis.Segment{Text: keys, Style: palette.header})
 }
@@ -320,6 +347,7 @@ func (a *application) drawHelp(root vaxis.Window) {
 	lines := []string{
 		"KEYS",
 		"j / k   select task     g / G  first / last",
+		"n       create task",
 		"enter   task and attempt details",
 		"l       logs          e  events",
 		"d       Job details   p  Pod details",
@@ -342,6 +370,58 @@ func (a *application) drawCancelConfirmation(root vaxis.Window) {
 		"y / enter  confirm     n / esc  keep running",
 	}
 	a.drawOverlay(root, min(68, root.Width-4), min(8, root.Height-2), " CONFIRM CANCELLATION ", lines)
+}
+
+func (a *application) drawCreateTask(root vaxis.Window) {
+	if a.createAccepted {
+		width, height := min(72, root.Width-4), min(8, root.Height-2)
+		lines := []string{"Task accepted.", "Press any key to close."}
+		if width < len(lines[1])+4 || height < len(lines)+3 {
+			row := max(1, root.Height/2-1)
+			style := a.colors().warn
+			compact := root.New(0, row, root.Width, 3)
+			fill(compact, style)
+			compact.PrintTruncate(0, vaxis.Segment{Text: "CREATE TASK", Style: style})
+			compact.PrintTruncate(1, vaxis.Segment{Text: "accepted", Style: style})
+			compact.PrintTruncate(2, vaxis.Segment{Text: "any key", Style: style})
+			return
+		}
+		a.drawOverlay(root, width, height, " CREATE TASK ", lines)
+		return
+	}
+	width := min(72, root.Width-4)
+	height := min(18, root.Height-2)
+	if width < 32 || height < 8 {
+		text := "CREATE TASK · Esc cancels"
+		if a.createPending {
+			text = "Esc hides; request continues"
+		}
+		root.New(0, max(1, root.Height/2), root.Width, 1).PrintTruncate(0, vaxis.Segment{Text: text, Style: a.colors().warn})
+		return
+	}
+	win := root.New((root.Width-width)/2, (root.Height-height)/2, width, height)
+	a.drawOverlayFrame(win, " CREATE TASK ")
+	palette := a.colors()
+	repositoryStyle, promptStyle := palette.overlay, palette.overlay
+	if a.createField == createRepositoryField {
+		repositoryStyle = palette.selected
+	} else {
+		promptStyle = palette.selected
+	}
+	a.createRepo.Content, a.createRepo.Prompt = repositoryStyle, repositoryStyle
+	a.createRepo.HideCursor = a.createField != createRepositoryField || a.createPending
+	a.createRepo.Draw(win.New(2, 2, width-4, 1))
+	a.createPrompt.Content, a.createPrompt.Prompt = promptStyle, promptStyle
+	a.createPrompt.HideCursor = a.createField != createPromptField || a.createPending
+	a.createPrompt.Draw(win.New(2, 3, width-4, 1))
+	if a.createError != "" {
+		win.New(2, 5, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: a.createError, Style: palette.bad})
+	}
+	instructions := "tab next field  enter submit  esc cancel"
+	if a.createPending {
+		instructions = "creating task…  Esc hides; request continues"
+	}
+	win.New(2, height-2, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: instructions, Style: palette.overlay})
 }
 
 func (a *application) drawThemeSwitcher(root vaxis.Window) {

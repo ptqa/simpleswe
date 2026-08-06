@@ -55,16 +55,18 @@ func (b *Backend) Health(ctx context.Context) ([]byte, error) {
 
 func (b *Backend) CreateTask(ctx context.Context, body []byte) ([]byte, error) {
 	var request struct {
-		Repository   string               `json:"repository"`
-		Prompt       string               `json:"prompt"`
-		SlackEventID string               `json:"slack_event_id"`
-		SlackOrigin  protocol.SlackOrigin `json:"slack_origin"`
+		Repository     string               `json:"repository"`
+		Prompt         string               `json:"prompt"`
+		IdempotencyKey string               `json:"idempotency_key"`
+		SlackEventID   string               `json:"slack_event_id"`
+		SlackOrigin    protocol.SlackOrigin `json:"slack_origin"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, api.ErrInvalid
 	}
 	created, err := b.controller.CreateTask(ctx, store.CreateTaskParams{
-		Repository: request.Repository, Prompt: request.Prompt, SlackEventID: request.SlackEventID, SlackOrigin: request.SlackOrigin,
+		Repository: request.Repository, Prompt: request.Prompt, IdempotencyKey: request.IdempotencyKey,
+		SlackEventID: request.SlackEventID, SlackOrigin: request.SlackOrigin,
 	})
 	if err != nil {
 		return nil, mapCreateError(err)

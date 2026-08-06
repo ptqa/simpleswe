@@ -398,7 +398,7 @@ func (*failingResponseWriter) WriteHeader(int)           {}
 func TestMetricsHandlerReportsTaskStateAndFailures(t *testing.T) {
 	db := openRunTestStore(t)
 	ctx := context.Background()
-	active, err := db.CreateTask(ctx, store.CreateTaskParams{Repository: "repo", Prompt: "active"})
+	active, err := db.CreateTask(ctx, store.CreateTaskParams{Repository: "repo", Prompt: "active", IdempotencyKey: "generic-1"})
 	if err != nil {
 		t.Fatal(err)
 	}

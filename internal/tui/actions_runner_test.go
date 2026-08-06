@@ -240,15 +240,15 @@ func TestApplicationRefreshDetailLogsAndSelection(t *testing.T) {
 		t.Fatalf("detail = %#v", detail)
 	}
 
-	app.applyTasks(taskResult{tasks: []Task{fixture.task}})
+	app.applyTasks(taskResult{generation: app.refreshGen, tasks: []Task{fixture.task}})
 	app.applyDetail(receive(t, app.detailCh))
-	app.applyDetail(detailResult{taskID: "stale", detail: TaskDetail{Task: Task{ID: "stale"}}})
+	app.applyDetail(detailResult{taskID: "stale", generation: app.detailGen, detail: TaskDetail{Task: Task{ID: "stale"}}})
 	app.message = "unchanged"
-	app.applyDetail(detailResult{taskID: "task-1", err: context.Canceled})
+	app.applyDetail(detailResult{taskID: "task-1", generation: app.detailGen, err: context.Canceled})
 	if app.message != "unchanged" {
 		t.Fatalf("canceled detail changed message to %q", app.message)
 	}
-	app.applyDetail(detailResult{taskID: "task-1", err: errors.New("detail failed")})
+	app.applyDetail(detailResult{taskID: "task-1", generation: app.detailGen, err: errors.New("detail failed")})
 	if app.message != "details: detail failed" {
 		t.Fatalf("detail error message = %q", app.message)
 	}
@@ -285,20 +285,43 @@ func TestApplicationRefreshDetailLogsAndSelection(t *testing.T) {
 	app.moveSelection(1)
 
 	app.logStop = func() {}
-	app.applyTasks(taskResult{tasks: nil})
+	app.applyTasks(taskResult{generation: app.refreshGen, tasks: nil})
 	if app.model.SelectedTaskID() != "" || app.logStop != nil || app.model.Detail().Task.ID != "" {
 		t.Fatalf("empty task result left state: selected %q, stop %v, detail %#v", app.model.SelectedTaskID(), app.logStop != nil, app.model.Detail())
 	}
-	app.applyTasks(taskResult{err: errors.New("controller down")})
+	app.applyTasks(taskResult{generation: app.refreshGen, err: errors.New("controller down")})
 	if app.model.Connectivity() != ConnectivityLost || app.message != "refresh failed" {
 		t.Fatalf("failed refresh = connectivity %q, message %q", app.model.Connectivity(), app.message)
 	}
-	app.applyTasks(taskResult{tasks: nil})
+	app.applyTasks(taskResult{generation: app.refreshGen, tasks: nil})
 	if app.model.Connectivity() != ConnectivityRestored || app.message != "controller connection restored" {
 		t.Fatalf("restored refresh = connectivity %q, message %q", app.model.Connectivity(), app.message)
 	}
 	app.fetchDetail("")
 	app.startLogs("")
+}
+
+func TestApplyDetailRejectsOlderGenerationForSameTask(t *testing.T) {
+	fixture := newControllerFixture(t)
+	app := newTestApplication(t, fixture.client())
+	app.model.RefreshTasks([]Task{fixture.task})
+	app.model.SetDetail(TaskDetail{Task: Task{ID: fixture.task.ID, CurrentAttemptID: "attempt-1"}})
+	app.detailGen = 2
+
+	newest := TaskDetail{Task: Task{ID: fixture.task.ID, CurrentAttemptID: "attempt-2"}}
+	app.applyDetail(detailResult{taskID: fixture.task.ID, generation: 2, detail: newest})
+	logGeneration := app.logGen
+	app.applyDetail(detailResult{
+		taskID: fixture.task.ID, generation: 1,
+		detail: TaskDetail{Task: Task{ID: fixture.task.ID, CurrentAttemptID: "attempt-1"}},
+	})
+
+	if got := app.model.Detail().Task.CurrentAttemptID; got != "attempt-2" {
+		t.Fatalf("stale detail replaced current attempt with %q", got)
+	}
+	if app.logGen != logGeneration {
+		t.Fatalf("stale detail restarted logs: generation %d, want %d", app.logGen, logGeneration)
+	}
 }
 
 func TestRunnerEntrypointsAndDefaults(t *testing.T) {

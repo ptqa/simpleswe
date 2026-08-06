@@ -16,12 +16,14 @@ import (
 
 type backendErrorController struct {
 	*fakeController
-	createErr error
-	cancelErr error
-	retryErr  error
+	createErr    error
+	createParams store.CreateTaskParams
+	cancelErr    error
+	retryErr     error
 }
 
 func (c *backendErrorController) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
+	c.createParams = params
 	if c.createErr != nil {
 		return store.Task{}, c.createErr
 	}
@@ -58,8 +60,17 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	if created["repository"] != "repo" || created["slack_event_id"] != "event-1" {
 		t.Fatalf("created task = %#v", created)
 	}
+	if controller.createParams.SlackEventID != "event-1" {
+		t.Fatalf("create params = %#v, want Slack event ID", controller.createParams)
+	}
 	if origin, ok := created["slack_origin"].(map[string]any); !ok || origin["channel_id"] != "channel-1" {
 		t.Fatalf("created Slack origin = %#v", created["slack_origin"])
+	}
+	if _, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"generic work","idempotency_key":"generic-1"}`)); err != nil {
+		t.Fatalf("CreateTask with generic key: %v", err)
+	}
+	if controller.createParams.IdempotencyKey != "generic-1" || controller.createParams.SlackEventID != "" {
+		t.Fatalf("generic create params = %#v", controller.createParams)
 	}
 	if _, err := backend.CreateTask(context.Background(), []byte("{")); !errors.Is(err, api.ErrInvalid) {
 		t.Fatalf("malformed CreateTask error = %v, want ErrInvalid", err)
