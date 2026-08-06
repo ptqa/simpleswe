@@ -1,16 +1,16 @@
 # simpleswe
 
-`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks triggered from Slack. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, creates a Bitbucket or GitHub pull request, and reports the result in the original Slack thread.
+`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks created from Slack, the CLI, or the terminal UI. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, and creates a Bitbucket or GitHub pull request. Slack-originated tasks report the result in the original Slack thread.
 
 ```text
-Slack
+Slack / CLI / TUI
   -> simpleswe controller
   -> Kubernetes Job
   -> OpenCode
   -> repository validation
   -> Git push
   -> forge pull request
-  -> Slack thread
+  -> Slack thread (Slack-originated tasks)
 ```
 
 A Vaxis terminal UI provides a k9s-style operational view of tasks, attempts, Kubernetes resources, logs, validation results, and pull requests.
@@ -29,7 +29,7 @@ The initial vertical slice supports:
 - deterministic task branches, commits, and non-force pushes;
 - Bitbucket Cloud and GitHub pull-request creation;
 - cancellation and retry without rewriting attempt history;
-- an internal HTTP API, CLI, and Vaxis TUI;
+- task creation and operations through the internal HTTP API, CLI, and Vaxis TUI;
 - namespace-scoped Helm installation without public ingress.
 
 `simpleswe` is intentionally not a generic workflow engine, CI system, Kubernetes operator, browser dashboard, or autonomous merge service.
@@ -272,12 +272,15 @@ The local commands automatically run `kubectl port-forward` to the `simpleswe` S
 ```sh
 simpleswe tui --context production --namespace simpleswe
 
+simpleswe task create --context production --namespace simpleswe widget "Fix the failing ClaimService tests"
 simpleswe task list --context production --namespace simpleswe
 simpleswe task show --context production --namespace simpleswe swe-...
 simpleswe task logs --context production --namespace simpleswe swe-...
 simpleswe task cancel --context production --namespace simpleswe swe-...
 simpleswe task retry --context production --namespace simpleswe swe-...
 ```
+
+The create command accepts a configured repository name followed by the task prompt. Quote prompts that contain spaces.
 
 Use `--address http://127.0.0.1:8080` to connect to an existing port-forward instead.
 

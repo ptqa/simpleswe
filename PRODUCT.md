@@ -4,17 +4,17 @@ This file is authoritative. Do not modify it unless the user explicitly asks to 
 
 ## Product
 
-simpleswe runs OpenCode in Kubernetes from a Slack trigger and returns a Github/Bitbucket pull request.
+simpleswe runs OpenCode in Kubernetes from a task created through Slack, the CLI, or the terminal UI and returns a GitHub/Bitbucket pull request.
 
 ```text
-Slack
+Slack / CLI / TUI
   → simpleswe controller
   → Kubernetes Job
   → OpenCode
   → validation
   → Git push
   → PR
-  → Slack thread
+  → Slack thread (Slack-originated tasks)
 ```
 
 A K9s-style TUI is the primary operational interface for observing, inspecting, and controlling tasks.
@@ -24,6 +24,7 @@ A K9s-style TUI is the primary operational interface for observing, inspecting, 
 * Go.
 * K9s-style terminal interface built with Vaxis.
 * Slack Socket Mode.
+* Tasks can be created through Slack, the CLI, or the terminal UI.
 * Kubernetes-native controller.
 * One Kubernetes Job per task attempt.
 * OpenCode first.
