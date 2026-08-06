@@ -19,13 +19,27 @@ local:
 	fi
 	@kubectl --context "$(CONTEXT)" -n simpleswe get secret simpleswe-webhooks >/dev/null 2>&1 || kubectl --context "$(CONTEXT)" -n simpleswe create secret generic simpleswe-webhooks --from-literal=github=placeholder --from-literal=bitbucket=placeholder
 	@if test -f .secrets/github-simpleswe/webhook; then \
-		GITHUB_WEBHOOK=$$(kubectl --context "$(CONTEXT)" -n simpleswe create secret generic simpleswe-webhooks --from-file=github=.secrets/github-simpleswe/webhook --dry-run=client -o jsonpath='{.data.github}'); \
+		GITHUB_FILE=.secrets/github-simpleswe/webhook; \
+	elif test -f .secrets/github/webhook; then \
+		GITHUB_FILE=.secrets/github/webhook; \
+	else \
+		GITHUB_FILE=""; \
+	fi; \
+	if test -n "$$GITHUB_FILE"; then \
+		GITHUB_WEBHOOK=$$(kubectl --context "$(CONTEXT)" -n simpleswe create secret generic simpleswe-webhooks --from-file=github=$$GITHUB_FILE --dry-run=client -o jsonpath='{.data.github}'); \
 		kubectl --context "$(CONTEXT)" -n simpleswe patch secret simpleswe-webhooks --type=merge -p "{\"data\":{\"github\":\"$$GITHUB_WEBHOOK\"}}"; \
 	else \
-		echo "warning: .secrets/github-simpleswe/webhook missing, preserving existing Secret key"; \
+		echo "warning: .secrets github webhook missing, preserving existing Secret key"; \
 	fi
 	@if test -f .secrets/bitbucket/webhook; then \
-		BITBUCKET_WEBHOOK=$$(kubectl --context "$(CONTEXT)" -n simpleswe create secret generic simpleswe-webhooks --from-file=bitbucket=.secrets/bitbucket/webhook --dry-run=client -o jsonpath='{.data.bitbucket}'); \
+		BITBUCKET_FILE=.secrets/bitbucket/webhook; \
+	elif test -f .secrets/bitbucket-simpleswe/webhook; then \
+		BITBUCKET_FILE=.secrets/bitbucket-simpleswe/webhook; \
+	else \
+		BITBUCKET_FILE=""; \
+	fi; \
+	if test -n "$$BITBUCKET_FILE"; then \
+		BITBUCKET_WEBHOOK=$$(kubectl --context "$(CONTEXT)" -n simpleswe create secret generic simpleswe-webhooks --from-file=bitbucket=$$BITBUCKET_FILE --dry-run=client -o jsonpath='{.data.bitbucket}'); \
 		kubectl --context "$(CONTEXT)" -n simpleswe patch secret simpleswe-webhooks --type=merge -p "{\"data\":{\"bitbucket\":\"$$BITBUCKET_WEBHOOK\"}}"; \
 	else \
 		echo "warning: .secrets/bitbucket/webhook missing, preserving existing Secret key"; \
