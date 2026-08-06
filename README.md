@@ -47,6 +47,8 @@ The initial vertical slice supports:
 
 ## Build
 
+Local task workers use repository-specific images.
+
 Build the binary:
 
 ```sh
