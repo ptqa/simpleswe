@@ -27,7 +27,9 @@ components:
   slack: { in: internal/slack }
   slackSocketmode: { in: internal/slack/socketmode }
   slackCommands: { in: internal/slack/commands }
+  forge: { in: internal/forge }
   forgeBitbucket: { in: internal/forge/bitbucket }
+  forgeGithub: { in: internal/forge/github }
   tui: { in: internal/tui }
   app: { in: internal/app }
   run: { in: internal/run }
@@ -41,7 +43,7 @@ deps:
   controller:
     mayDependOn:
       - config
-      - forgeBitbucket
+      - forge
       - kubernetesJobs
       - store
       - task
@@ -57,6 +59,14 @@ deps:
   kubernetesJobs:
     mayDependOn:
       - workerProtocol
+
+  forgeBitbucket:
+    mayDependOn:
+      - forge
+
+  forgeGithub:
+    mayDependOn:
+      - forge
 
   worker:
     mayDependOn:
@@ -91,7 +101,9 @@ deps:
       - config
       - controller
       - controllerRuntime
+      - forge
       - forgeBitbucket
+      - forgeGithub
       - slack
       - slackSocketmode
       - store

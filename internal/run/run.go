@@ -25,7 +25,9 @@ import (
 	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/controller"
 	controllerruntime "github.com/simpleswe/simpleswe/internal/controller/runtime"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge/github"
 	internalslack "github.com/simpleswe/simpleswe/internal/slack"
 	internalSocketMode "github.com/simpleswe/simpleswe/internal/slack/socketmode"
 	"github.com/simpleswe/simpleswe/internal/store"
@@ -153,7 +155,7 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 		return fmt.Errorf("create Kubernetes client: %w", err)
 	}
 
-	forge, err := newBitbucketRouter(cfg, "/run/secrets/bitbucket")
+	pullRequests, err := newForgeRouter(cfg, "/run/secrets/bitbucket", "/run/secrets/github")
 	if err != nil {
 		return err
 	}
@@ -163,7 +165,7 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 	if err != nil {
 		return err
 	}
-	control, err := controller.New(db, kube, cfg, slack.notifier(db), forge)
+	control, err := controller.New(db, kube, cfg, slack.notifier(db), pullRequests)
 	if err != nil {
 		return err
 	}
@@ -367,80 +369,9 @@ func readSecret(source config.SecretSource, valueEnv, fileEnv, defaultFile, desc
 	return value, nil
 }
 
-type bitbucketRepository struct {
-	workspace  string
-	repository string
-}
-
-type bitbucketRouter map[bitbucketRepository]*bitbucket.Client
-
-func newBitbucketRouter(cfg config.Config, credentialRoot string) (bitbucketRouter, error) {
-	router := make(bitbucketRouter, len(cfg.Repositories))
-	credentials := make(map[bitbucketRepository]string, len(cfg.Repositories))
-	for _, repository := range cfg.Repositories {
-		key := bitbucketRoute(repository.Bitbucket.Workspace, repository.Bitbucket.Repository)
-		secretName := repository.Bitbucket.CredentialsSecret
-		if key.workspace == "" || key.repository == "" || secretName == "" {
-			return nil, errors.New("Bitbucket workspace, repository, and credentials Secret name are required")
-		}
-		if filepath.Base(secretName) != secretName || secretName == "." || strings.Contains(secretName, `\`) {
-			return nil, fmt.Errorf("unsafe Bitbucket credentials Secret name %q", secretName)
-		}
-		if previous, exists := credentials[key]; exists {
-			if previous != secretName {
-				return nil, fmt.Errorf("conflicting Bitbucket credentials configured for %s/%s", repository.Bitbucket.Workspace, repository.Bitbucket.Repository)
-			}
-			continue
-		}
-		username, err := readBitbucketCredential(credentialRoot, secretName, "username")
-		if err != nil {
-			return nil, err
-		}
-		appPassword, err := readBitbucketCredential(credentialRoot, secretName, "app-password")
-		if err != nil {
-			return nil, err
-		}
-		client, err := bitbucket.NewClient(cfg.Bitbucket.BaseURL, username, appPassword)
-		if err != nil {
-			return nil, err
-		}
-		router[key] = client
-		credentials[key] = secretName
-	}
-	return router, nil
-}
-
-func (r bitbucketRouter) CreatePullRequest(ctx context.Context, workspace, repository string, input bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error) {
-	client, err := r.client(workspace, repository)
-	if err != nil {
-		return bitbucket.PullRequest{}, err
-	}
-	return client.CreatePullRequest(ctx, workspace, repository, input)
-}
-
-func (r bitbucketRouter) FindPullRequest(ctx context.Context, workspace, repository, sourceBranch, taskMarker string) (bitbucket.PullRequest, bool, error) {
-	client, err := r.client(workspace, repository)
-	if err != nil {
-		return bitbucket.PullRequest{}, false, err
-	}
-	return client.FindPullRequest(ctx, workspace, repository, sourceBranch, taskMarker)
-}
-
-func (r bitbucketRouter) client(workspace, repository string) (*bitbucket.Client, error) {
-	client := r[bitbucketRoute(workspace, repository)]
-	if client == nil {
-		return nil, fmt.Errorf("no Bitbucket client configured for %s/%s", workspace, repository)
-	}
-	return client, nil
-}
-
-func bitbucketRoute(workspace, repository string) bitbucketRepository {
-	return bitbucketRepository{workspace: strings.ToLower(workspace), repository: strings.ToLower(repository)}
-}
-
 func readBitbucketCredential(root, secretName, key string) (string, error) {
 	path := filepath.Join(root, secretName, key)
-	// #nosec G304 -- secretName is validated as one path component by newBitbucketRouter.
+	// #nosec G304 -- secretName is validated as one path component by newForgeRouter.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read Bitbucket credential %s/%s: %w", secretName, key, err)
@@ -453,6 +384,154 @@ func readBitbucketCredential(root, secretName, key string) (string, error) {
 		return "", fmt.Errorf("Bitbucket credential %s/%s is empty", secretName, key)
 	}
 	return value, nil
+}
+
+func readGithubToken(root, secretName string) (string, error) {
+	path := filepath.Join(root, secretName, "token")
+	// #nosec G304 -- secretName is validated as one path component by newForgeRouter.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read GitHub credential %s/token: %w", secretName, err)
+	}
+	if len(data) > 1<<20 {
+		return "", fmt.Errorf("GitHub credential %s/token is too large", secretName)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("GitHub credential %s/token is empty", secretName)
+	}
+	return token, nil
+}
+
+type pullRequestClient interface {
+	CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error)
+	FindPullRequest(context.Context, string, string, string, string) (forge.PullRequest, bool, error)
+}
+
+type forgeRouter map[forge.Target]pullRequestClient
+
+func newForgeClient(target forge.Target, credentialRoot string) (pullRequestClient, error) {
+	if target.Provider == forge.ProviderBitbucket {
+		username, err := readBitbucketCredential(credentialRoot, target.CredentialsSecret, "username")
+		if err != nil {
+			return nil, err
+		}
+		appPassword, err := readBitbucketCredential(credentialRoot, target.CredentialsSecret, "app-password")
+		if err != nil {
+			return nil, err
+		}
+		client, err := bitbucket.NewClient(target.BaseURL, username, appPassword)
+		if err != nil {
+			return nil, fmt.Errorf("create Bitbucket client for %s/%s: %w", target.Owner, target.Repository, err)
+		}
+		return client, nil
+	}
+
+	token, err := readGithubToken(credentialRoot, target.CredentialsSecret)
+	if err != nil {
+		return nil, err
+	}
+	client, err := github.NewClient(target.BaseURL, token)
+	if err != nil {
+		return nil, fmt.Errorf("create GitHub client for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return client, nil
+}
+
+func newForgeRouter(cfg config.Config, bitbucketRoot, githubRoot string) (forgeRouter, error) {
+	router := make(forgeRouter, len(cfg.Repositories))
+	credentials := make(map[[3]string]string, len(cfg.Repositories))
+	for _, repository := range cfg.Repositories {
+		bitbucketConfigured := repository.Bitbucket.Workspace != "" || repository.Bitbucket.Repository != "" || repository.Bitbucket.CredentialsSecret != ""
+		githubConfigured := repository.GitHub.Owner != "" || repository.GitHub.Repository != "" || repository.GitHub.CredentialsSecret != ""
+		if bitbucketConfigured == githubConfigured {
+			return nil, fmt.Errorf("repository %q must configure exactly one forge", repository.Name)
+		}
+
+		target := forge.Target{
+			Provider: forge.ProviderBitbucket, BaseURL: cfg.Bitbucket.BaseURL,
+			Owner: repository.Bitbucket.Workspace, Repository: repository.Bitbucket.Repository,
+			CredentialsSecret: repository.Bitbucket.CredentialsSecret,
+		}
+		credentialRoot := bitbucketRoot
+		if githubConfigured {
+			target = forge.Target{
+				Provider: forge.ProviderGitHub, BaseURL: cfg.GitHub.BaseURL,
+				Owner: repository.GitHub.Owner, Repository: repository.GitHub.Repository,
+				CredentialsSecret: repository.GitHub.CredentialsSecret,
+			}
+			credentialRoot = githubRoot
+		}
+		if err := forge.ValidateTarget(target); err != nil {
+			return nil, fmt.Errorf("invalid %s route for repository %q: %w", target.Provider, repository.Name, err)
+		}
+		if filepath.Base(target.CredentialsSecret) != target.CredentialsSecret || target.CredentialsSecret == "." || target.CredentialsSecret == ".." || strings.Contains(target.CredentialsSecret, `\`) {
+			return nil, fmt.Errorf("unsafe %s credentials Secret name %q", target.Provider, target.CredentialsSecret)
+		}
+
+		key := forgeRoute(target)
+		coordinate := [3]string{string(key.Provider), key.Owner, key.Repository}
+		if previous, exists := credentials[coordinate]; exists {
+			if previous != key.CredentialsSecret {
+				return nil, fmt.Errorf("conflicting %s credentials configured for %s/%s", target.Provider, target.Owner, target.Repository)
+			}
+			continue
+		}
+
+		client, err := newForgeClient(target, credentialRoot)
+		if err != nil {
+			return nil, err
+		}
+		router[key] = client
+		credentials[coordinate] = key.CredentialsSecret
+	}
+	return router, nil
+}
+
+func (r forgeRouter) CreatePullRequest(ctx context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
+	client, err := r.client(target)
+	if err != nil {
+		return forge.PullRequest{}, err
+	}
+	pullRequest, err := client.CreatePullRequest(ctx, target.Owner, target.Repository, input)
+	if err != nil {
+		return forge.PullRequest{}, fmt.Errorf("create pull request for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return pullRequest, nil
+}
+
+func (r forgeRouter) FindPullRequest(ctx context.Context, target forge.Target, sourceBranch, taskMarker string) (forge.PullRequest, bool, error) {
+	client, err := r.client(target)
+	if err != nil {
+		return forge.PullRequest{}, false, err
+	}
+	pullRequest, found, err := client.FindPullRequest(ctx, target.Owner, target.Repository, sourceBranch, taskMarker)
+	if err != nil {
+		return forge.PullRequest{}, false, fmt.Errorf("find pull request for %s/%s: %w", target.Owner, target.Repository, err)
+	}
+	return pullRequest, found, nil
+}
+
+func (r forgeRouter) client(target forge.Target) (pullRequestClient, error) {
+	if err := forge.ValidateTarget(target); err != nil {
+		permanentErr := forge.MarkPermanent(fmt.Errorf("invalid immutable forge route: %w", err))
+		return nil, fmt.Errorf("resolve immutable forge route: %w", permanentErr)
+	}
+	client := r[forgeRoute(target)]
+	if client == nil {
+		permanentErr := forge.MarkPermanent(fmt.Errorf(
+			"no client configured for immutable forge route provider=%q base_url=%q owner=%q repository=%q credentials_secret_name=%q",
+			target.Provider, target.BaseURL, target.Owner, target.Repository, target.CredentialsSecret,
+		))
+		return nil, fmt.Errorf("resolve immutable forge route: %w", permanentErr)
+	}
+	return client, nil
+}
+
+func forgeRoute(target forge.Target) forge.Target {
+	target.Owner = strings.ToLower(target.Owner)
+	target.Repository = strings.ToLower(target.Repository)
+	return target
 }
 
 func mountedSecrets(root string) (_ []string, resultErr error) {

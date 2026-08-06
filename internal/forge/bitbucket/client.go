@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
 const maxResponseBody = 1 << 20
@@ -30,19 +32,12 @@ func (e *HTTPError) Error() string {
 	return "Bitbucket returned " + e.Status + ": " + e.Message
 }
 
+func (e *HTTPError) HTTPStatusCode() int { return e.StatusCode }
+
 // IsPermanent reports only clear client errors. Timeout, conflict, locked,
 // too-early, and rate-limit responses remain retryable.
 func IsPermanent(err error) bool {
-	var provider *HTTPError
-	if !errors.As(err, &provider) || provider.StatusCode < 400 || provider.StatusCode >= 500 {
-		return false
-	}
-	switch provider.StatusCode {
-	case http.StatusRequestTimeout, http.StatusConflict, http.StatusLocked, http.StatusTooEarly, http.StatusTooManyRequests:
-		return false
-	default:
-		return true
-	}
+	return forge.IsPermanent(err)
 }
 
 // Client is a Bitbucket Cloud pull-request client.
@@ -54,18 +49,10 @@ type Client struct {
 }
 
 // CreatePullRequestRequest contains the fields Bitbucket needs to create a pull request.
-type CreatePullRequestRequest struct {
-	Title             string
-	Description       string
-	SourceBranch      string
-	DestinationBranch string
-}
+type CreatePullRequestRequest = forge.CreatePullRequestRequest
 
 // PullRequest is the subset of a Bitbucket pull request returned by this client.
-type PullRequest struct {
-	ID      int
-	HTMLURL string
-}
+type PullRequest = forge.PullRequest
 
 // NewClient creates a Bitbucket Cloud client using app-password Basic Auth.
 func NewClient(baseURL, username, appPassword string) (*Client, error) {

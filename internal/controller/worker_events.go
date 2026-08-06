@@ -5,14 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
-	"path"
 	"strconv"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -255,20 +253,13 @@ func (c *Controller) resumePullRequestLocked(ctx context.Context, record store.T
 	}
 
 create:
-	repository, err := c.repository(record.Repository)
-	if err != nil {
-		return err
-	}
-	workspace, repositoryName := repository.Bitbucket.Workspace, repository.Bitbucket.Repository
 	manifest, err := attemptManifest(attempt)
 	if err != nil {
 		return err
 	}
-	if workspace == "" || repositoryName == "" {
-		workspace, repositoryName, err = bitbucketRepository(manifest.CloneURL)
-		if err != nil {
-			return err
-		}
+	target, err := c.attemptForgeTarget(record, attempt)
+	if err != nil {
+		return c.handlePullRequestError(ctx, record, attempt, forge.MarkPermanent(err))
 	}
 	title := strings.TrimSpace(record.Prompt)
 	_, err = c.store.ReservePullRequest(ctx, attempt.ID, title, git.Branch, manifest.BaseBranch)
@@ -281,14 +272,14 @@ create:
 	}
 	if durable.State == "creating" {
 		providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
-		pullRequest, found, findErr := c.pullRequests.FindPullRequest(providerCtx, workspace, repositoryName, git.Branch, record.ID)
+		pullRequest, found, findErr := c.pullRequests.FindPullRequest(providerCtx, target, git.Branch, record.ID)
 		cancel()
 		if findErr != nil {
 			return c.handlePullRequestError(ctx, record, attempt, findErr)
 		}
 		if !found {
 			providerCtx, cancel = context.WithTimeout(ctx, c.providerTimeout)
-			created, createErr := c.pullRequests.CreatePullRequest(providerCtx, workspace, repositoryName, bitbucket.CreatePullRequestRequest{
+			created, createErr := c.pullRequests.CreatePullRequest(providerCtx, target, forge.CreatePullRequestRequest{
 				Title:             title,
 				Description:       "Created by simpleswe task " + record.ID,
 				SourceBranch:      git.Branch,
@@ -328,7 +319,7 @@ create:
 }
 
 func (c *Controller) handlePullRequestError(ctx context.Context, record store.Task, attempt store.Attempt, providerErr error) error {
-	if !bitbucket.IsPermanent(providerErr) {
+	if !forge.IsPermanent(providerErr) {
 		if err := c.store.RecordObservation(ctx, record.ID, "transient pull request provider failure; retry pending: "+providerErr.Error(), "controller"); err != nil {
 			return errors.Join(providerErr, err)
 		}
@@ -360,6 +351,35 @@ func attemptManifest(attempt store.Attempt) (protocol.TaskManifest, error) {
 		return manifest, fmt.Errorf("decode immutable manifest for attempt %q: %w", attempt.ID, err)
 	}
 	return manifest, nil
+}
+
+func (c *Controller) attemptForgeTarget(record store.Task, attempt store.Attempt) (forge.Target, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(attempt.ResourceSnapshot, &fields); err != nil {
+		return forge.Target{}, fmt.Errorf("decode immutable resource snapshot for attempt %q: %w", attempt.ID, err)
+	}
+	if fields == nil {
+		return forge.Target{}, fmt.Errorf("decode immutable resource snapshot for attempt %q: expected JSON object", attempt.ID)
+	}
+	raw, snapshotted := fields["forge_target"]
+	if !snapshotted {
+		repository, err := c.repository(record.Repository)
+		if err != nil {
+			return forge.Target{}, err
+		}
+		return forgeTarget(c.config, repository)
+	}
+	var target *forge.Target
+	if err := json.Unmarshal(raw, &target); err != nil {
+		return forge.Target{}, fmt.Errorf("decode immutable forge target for attempt %q: %w", attempt.ID, err)
+	}
+	if target == nil {
+		return forge.Target{}, fmt.Errorf("validate immutable forge target for attempt %q: target is null", attempt.ID)
+	}
+	if err := forge.ValidateTarget(*target); err != nil {
+		return forge.Target{}, fmt.Errorf("validate immutable forge target for attempt %q: %w", attempt.ID, err)
+	}
+	return *target, nil
 }
 
 // WorkerLogsExhausted durably records that structured replay has finished.
@@ -443,24 +463,6 @@ func (c *Controller) notifyDurablePullRequest(ctx context.Context, taskID, attem
 		return fmt.Errorf("notify pull request for task %q: %w", taskID, err)
 	}
 	return c.store.MarkPullRequestNotified(ctx, attemptID)
-}
-
-func bitbucketRepository(cloneURL string) (string, string, error) {
-	parsed, err := url.Parse(cloneURL)
-	if err != nil || parsed.Host == "" {
-		return "", "", fmt.Errorf("repository clone URL %q is invalid", cloneURL)
-	}
-	cleaned := strings.Trim(path.Clean(parsed.Path), "/")
-	parts := strings.Split(cleaned, "/")
-	if len(parts) < 2 {
-		return "", "", fmt.Errorf("repository clone URL %q has no workspace and repository", cloneURL)
-	}
-	repository := strings.TrimSuffix(parts[len(parts)-1], ".git")
-	workspace := parts[len(parts)-2]
-	if workspace == "" || repository == "" {
-		return "", "", fmt.Errorf("repository clone URL %q has no workspace and repository", cloneURL)
-	}
-	return workspace, repository, nil
 }
 
 func failureMessage(stage, job, pod string, command []string, exitCode int, cause error) string {

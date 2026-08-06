@@ -20,7 +20,7 @@ import (
 
 	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/controller"
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -251,12 +251,12 @@ func (adapterNotifier) PostPullRequest(context.Context, string, string) error { 
 
 type adapterPullRequests struct{}
 
-func (adapterPullRequests) CreatePullRequest(context.Context, string, string, bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error) {
-	return bitbucket.PullRequest{}, nil
+func (adapterPullRequests) CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
+	return forge.PullRequest{}, nil
 }
 
-func (adapterPullRequests) FindPullRequest(context.Context, string, string, string, string) (bitbucket.PullRequest, bool, error) {
-	return bitbucket.PullRequest{}, false, nil
+func (adapterPullRequests) FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error) {
+	return forge.PullRequest{}, false, nil
 }
 
 func TestLifecycleAdapterDelegatesToController(t *testing.T) {
@@ -264,9 +264,11 @@ func TestLifecycleAdapterDelegatesToController(t *testing.T) {
 	cfg := config.Config{
 		Controller: config.ControllerConfig{Namespace: "simpleswe-workers", Deadline: time.Minute},
 		Worker:     config.WorkerConfig{Command: "opencode", BranchPrefix: "simpleswe/"},
+		Bitbucket:  config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"},
 		Repositories: config.RepositoryConfigs{{
 			Name: "widget", CloneURL: "https://bitbucket.example/acme/widget.git", DefaultBranch: "main",
-			Worker: config.WorkerConfig{Image: "registry.example/widget:latest"},
+			Worker:    config.WorkerConfig{Image: "registry.example/widget:latest"},
+			Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
 		}},
 	}
 	control, err := controller.New(db, fake.NewSimpleClientset(), cfg, adapterNotifier{}, adapterPullRequests{})
@@ -493,36 +495,41 @@ func TestBitbucketConfigurationAndMountedSecretErrors(t *testing.T) {
 	}
 	repository := config.RepositoryConfig{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "Acme", Repository: "Widget", CredentialsSecret: "credentials"}}
 	cfg := config.Config{Bitbucket: config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"}, Repositories: config.RepositoryConfigs{repository, repository}}
-	router, err := newBitbucketRouter(cfg, root)
+	router, err := newForgeRouter(cfg, root, t.TempDir())
 	if err != nil || len(router) != 1 {
-		t.Fatalf("newBitbucketRouter(duplicate) = %#v, %v", router, err)
+		t.Fatalf("newForgeRouter(duplicate) = %#v, %v", router, err)
 	}
-	if _, err := router.client("ACME", "WIDGET"); err != nil {
+	target := forge.Target{
+		Provider: forge.ProviderBitbucket, BaseURL: cfg.Bitbucket.BaseURL,
+		Owner: "ACME", Repository: "WIDGET", CredentialsSecret: "credentials",
+	}
+	if _, err := router.client(target); err != nil {
 		t.Fatalf("case-insensitive route error = %v", err)
 	}
-	if _, err := router.client("missing", "repo"); err == nil {
+	target.Owner, target.Repository = "missing", "repo"
+	if _, err := router.client(target); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("router.client(missing) error = nil")
 	}
-	if _, err := router.CreatePullRequest(context.Background(), "missing", "repo", bitbucket.CreatePullRequestRequest{}); err == nil {
+	if _, err := router.CreatePullRequest(context.Background(), target, forge.CreatePullRequestRequest{}); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("CreatePullRequest(missing route) error = nil")
 	}
-	if _, _, err := router.FindPullRequest(context.Background(), "missing", "repo", "branch", "task"); err == nil {
+	if _, _, err := router.FindPullRequest(context.Background(), target, "branch", "task"); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("FindPullRequest(missing route) error = nil")
 	}
 
 	invalid := config.Config{Repositories: config.RepositoryConfigs{{}}}
-	if _, err := newBitbucketRouter(invalid, root); err == nil {
-		t.Fatal("newBitbucketRouter(missing fields) error = nil")
+	if _, err := newForgeRouter(invalid, root, t.TempDir()); err == nil {
+		t.Fatal("newForgeRouter(missing fields) error = nil")
 	}
 	conflicting := repository
 	conflicting.Bitbucket.CredentialsSecret = "other"
 	cfg.Repositories[1] = conflicting
-	if _, err := newBitbucketRouter(cfg, root); err == nil || !strings.Contains(err.Error(), "conflicting") {
-		t.Fatalf("newBitbucketRouter(conflicting credentials) error = %v", err)
+	if _, err := newForgeRouter(cfg, root, t.TempDir()); err == nil || !strings.Contains(err.Error(), "conflicting") {
+		t.Fatalf("newForgeRouter(conflicting credentials) error = %v", err)
 	}
 	cfg = config.Config{Bitbucket: config.BitbucketConfig{BaseURL: "://invalid"}, Repositories: config.RepositoryConfigs{repository}}
-	if _, err := newBitbucketRouter(cfg, root); err == nil {
-		t.Fatal("newBitbucketRouter(invalid URL) error = nil")
+	if _, err := newForgeRouter(cfg, root, t.TempDir()); err == nil {
+		t.Fatal("newForgeRouter(invalid URL) error = nil")
 	}
 
 	empty := filepath.Join(root, "empty")

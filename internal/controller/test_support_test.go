@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/simpleswe/simpleswe/internal/config"
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
@@ -77,12 +78,15 @@ func newFixture(t *testing.T) *fixture {
 			Namespace: workerNamespace,
 			Deadline:  10 * time.Minute,
 		},
-		Worker: config.WorkerConfig{Command: "opencode", BranchPrefix: "simpleswe/"},
+		Worker:    config.WorkerConfig{Command: "opencode", BranchPrefix: "simpleswe/"},
+		Bitbucket: config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"},
+		GitHub:    config.GitHubConfig{BaseURL: "https://api.github.com"},
 		Repositories: config.RepositoryConfigs{{
 			Name:          "widget",
 			CloneURL:      repositoryURL,
 			DefaultBranch: "main",
 			Worker:        config.WorkerConfig{Image: workerImage},
+			Bitbucket:     config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
 		}},
 	}
 	notifier := new(fakeNotifier)
@@ -135,37 +139,40 @@ func (f *fakeNotifier) PostPullRequest(ctx context.Context, taskID, url string) 
 }
 
 type pullRequestCall struct {
+	target     forge.Target
 	workspace  string
 	repository string
-	input      bitbucket.CreatePullRequestRequest
+	input      forge.CreatePullRequestRequest
 }
 
 type fakePullRequestCreator struct {
-	mu        sync.Mutex
-	calls     []pullRequestCall
-	found     *bitbucket.PullRequest
-	findCalls int
-	failFind  int
-	findErr   error
-	blocked   chan struct{}
-	release   chan struct{}
+	mu          sync.Mutex
+	calls       []pullRequestCall
+	found       *forge.PullRequest
+	findCalls   int
+	findTargets []forge.Target
+	failFind    int
+	findErr     error
+	blocked     chan struct{}
+	release     chan struct{}
 }
 
-func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, workspace, repository string, input bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error) {
+func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, pullRequestCall{workspace: workspace, repository: repository, input: input})
-	return bitbucket.PullRequest{ID: 42, HTMLURL: pullRequestURL}, nil
+	f.calls = append(f.calls, pullRequestCall{target: target, workspace: target.Owner, repository: target.Repository, input: input})
+	return forge.PullRequest{ID: 42, HTMLURL: pullRequestURL}, nil
 }
 
-func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, _, _, _, _ string) (bitbucket.PullRequest, bool, error) {
+func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, target forge.Target, _, _ string) (forge.PullRequest, bool, error) {
 	f.mu.Lock()
 	f.findCalls++
+	f.findTargets = append(f.findTargets, target)
 	if f.failFind > 0 {
 		f.failFind--
 		err := f.findErr
 		f.mu.Unlock()
-		return bitbucket.PullRequest{}, false, err
+		return forge.PullRequest{}, false, err
 	}
 	blocked, release := f.blocked, f.release
 	found := f.found
@@ -178,11 +185,11 @@ func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, _, _, _, _
 		select {
 		case <-release:
 		case <-ctx.Done():
-			return bitbucket.PullRequest{}, false, ctx.Err()
+			return forge.PullRequest{}, false, fmt.Errorf("wait for fake pull request release: %w", ctx.Err())
 		}
 	}
 	if found == nil {
-		return bitbucket.PullRequest{}, false, nil
+		return forge.PullRequest{}, false, nil
 	}
 	return *found, true, nil
 }

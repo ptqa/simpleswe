@@ -51,7 +51,7 @@ networkPolicy:
   # pod selectors to trust only specific callers.
   trustedIngress: []
   # Standard NetworkPolicy cannot select DNS names. These CIDRs permit only
-  # HTTPS and must cover the Kubernetes API, Slack, Bitbucket, and public
+  # HTTPS and must cover the Kubernetes API, Slack, Bitbucket, GitHub, and public
   # repository/AI endpoints. The broad practical default can be replaced with
   # maintained provider CIDRs where stable ranges are available.
   httpsCIDRs:
@@ -80,4 +80,6 @@ config:
       file: /run/secrets/slack/app-token
   bitbucket:
     base_url: https://api.bitbucket.org
+  github:
+    base_url: https://api.github.com
   repositories: {}

@@ -1,6 +1,6 @@
 # simpleswe
 
-`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks triggered from Slack. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, creates a Bitbucket pull request, and reports the result in the original Slack thread.
+`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks triggered from Slack. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, creates a Bitbucket or GitHub pull request, and reports the result in the original Slack thread.
 
 ```text
 Slack
@@ -9,7 +9,7 @@ Slack
   -> OpenCode
   -> repository validation
   -> Git push
-  -> Bitbucket pull request
+  -> forge pull request
   -> Slack thread
 ```
 
@@ -27,7 +27,7 @@ The initial vertical slice supports:
 - live and persisted Pod logs;
 - bounded OpenCode validation/fix loops;
 - deterministic task branches, commits, and non-force pushes;
-- Bitbucket Cloud pull-request creation;
+- Bitbucket Cloud and GitHub pull-request creation;
 - cancellation and retry without rewriting attempt history;
 - an internal HTTP API, CLI, and Vaxis TUI;
 - namespace-scoped Helm installation without public ingress.
@@ -40,7 +40,7 @@ The initial vertical slice supports:
 - Helm 3;
 - a default or configured `ReadWriteOnce` StorageClass suitable for SQLite WAL locking;
 - Slack bot and app-level tokens for Socket Mode;
-- Bitbucket credentials for each configured repository;
+- Bitbucket or GitHub credentials for each configured repository;
 - a repository-specific worker image containing `simpleswe`, OpenCode, Git, SSH, language runtimes, and validation tools;
 - Go 1.26.5 when building locally;
 - `kubectl` locally for automatic port-forwarding and TUI shell access.
@@ -89,7 +89,7 @@ Inspect the controller:
 ./simpleswe tui --context kind-simpleswe --namespace simpleswe
 ```
 
-The kind values intentionally register no repositories. To execute tasks, build and load a worker image, then add repository configuration and the corresponding Git, OpenCode, and Bitbucket Secrets:
+The kind values intentionally register no repositories. To execute tasks, build and load a worker image, then add repository configuration and the corresponding Git, OpenCode, and forge Secrets:
 
 ```sh
 mkdir -p bin
@@ -133,12 +133,21 @@ kubectl -n simpleswe create secret generic bitbucket-widget \
   --from-literal=app-password='...'
 ```
 
+For GitHub, create a repository-scoped fine-grained token. `github.credentials_secret_name` identifies the controller Secret, whose `token` key is used to find and create pull requests. When no separate worker Secret is configured, HTTPS workers also mount this Secret to clone and push:
+
+```sh
+kubectl -n simpleswe create secret generic github-widget \
+  --from-literal=token='github_pat_...'
+```
+
 For SSH Git access, create a worker Secret whose private key is named `ssh-privatekey`:
 
 ```sh
 kubectl -n simpleswe create secret generic widget-git-ssh \
   --from-file=ssh-privatekey="$HOME/.ssh/widget_deploy_key"
 ```
+
+With GitHub SSH clone URLs, `git.ssh_secret` supplies worker clone/push credentials while `github.credentials_secret_name` still supplies the controller PR token. To separate GitHub HTTPS privileges, set `credentials.secret_name` to a worker-only Secret containing a `token` key. Only that Secret is mounted in the worker at `/run/secrets/repository`; the controller PR Secret does not enter the Job. Git scopes the token helper to the configured clone URL and will not return it for another host or repository.
 
 Use repository-scoped credentials with only the permissions needed to clone, push task branches, read pull requests, and create pull requests. Secret values never belong in Helm values or controller configuration.
 
@@ -167,6 +176,9 @@ slack:
 
 bitbucket:
   base_url: https://api.bitbucket.org
+
+github:
+  base_url: https://api.github.com
 
 repositories:
   widget:
@@ -198,6 +210,19 @@ repositories:
       workspace: acme
       repository: widget
       credentials_secret_name: bitbucket-widget
+```
+
+A public GitHub repository can omit `clone_url` and `default_branch`; they default to its public HTTPS URL and `main`:
+
+```yaml
+repositories:
+  public-widget:
+    worker:
+      image: ghcr.io/example/widget-worker:0.1.0
+    github:
+      owner: octo-org
+      repository: widget
+      credentials_secret_name: github-widget
 ```
 
 Configuration is strict: unknown fields, inline credentials, invalid Secret names, and invalid resource settings fail controller startup. See [`examples/config.yaml`](examples/config.yaml) and [`examples/values-eks.yaml`](examples/values-eks.yaml) for complete examples.
@@ -282,7 +307,7 @@ The controller is the only component that owns task intent and logical state. Ku
 - SQLite stores task intent, attempts, events, Slack origins, validation results, Git results, pull requests, log checkpoints, and deduplication records.
 - One immutable attempt maps to one deterministic Kubernetes Job.
 - The task prompt is delivered in a task-specific read-only Secret.
-- Long-lived Git, OpenCode, and Bitbucket credentials are mounted from separate existing Secrets.
+- Long-lived Git, OpenCode, and forge credentials are mounted from separate existing Secrets.
 - Workers have no Kubernetes API token and cannot create tasks or retries.
 - Only `@@simpleswe:` JSON log lines are interpreted as lifecycle events; all other output remains raw logs.
 - Retrying creates a new attempt, Job, task branch, and history entry.
@@ -311,7 +336,7 @@ go run github.com/daveshanley/vacuum@v0.29.2 lint \
   --fail-severity warn api/openapi.yaml
 ```
 
-Normal tests use fake Kubernetes clients, fake executables, and local HTTP servers; they do not require real Slack, OpenCode, or Bitbucket credentials.
+Normal tests use fake Kubernetes clients, fake executables, and local HTTP servers; they do not require real Slack, OpenCode, or forge credentials.
 
 ## Operating Constraints
 

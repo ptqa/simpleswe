@@ -507,17 +507,12 @@ func TestWorkerEventStateErrorsDoNotMutateTask(t *testing.T) {
 	}
 }
 
-func TestManifestAndRepositoryParsingErrors(t *testing.T) {
+func TestManifestParsingErrors(t *testing.T) {
 	if _, err := attemptManifest(store.Attempt{ID: "missing"}); err == nil || !strings.Contains(err.Error(), "no immutable task manifest") {
 		t.Fatalf("missing manifest error = %v", err)
 	}
 	if _, err := attemptManifest(store.Attempt{ID: "malformed", ManifestJSON: []byte("{")}); err == nil || !strings.Contains(err.Error(), "decode immutable manifest") {
 		t.Fatalf("malformed manifest error = %v", err)
-	}
-	for _, cloneURL := range []string{"not a URL", "https://bitbucket.example/only-workspace", "https://bitbucket.example/acme/.git"} {
-		if _, _, err := bitbucketRepository(cloneURL); err == nil {
-			t.Errorf("bitbucketRepository(%q) unexpectedly succeeded", cloneURL)
-		}
 	}
 }
 

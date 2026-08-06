@@ -20,7 +20,7 @@ import (
 
 	"github.com/simpleswe/simpleswe/internal/config"
 	parentcontroller "github.com/simpleswe/simpleswe/internal/controller"
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 )
@@ -31,12 +31,12 @@ func (cleanupNotifier) PostPullRequest(context.Context, string, string) error { 
 
 type cleanupPullRequests struct{}
 
-func (cleanupPullRequests) CreatePullRequest(context.Context, string, string, bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error) {
-	return bitbucket.PullRequest{}, errors.New("unexpected pull request creation")
+func (cleanupPullRequests) CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
+	return forge.PullRequest{}, errors.New("unexpected pull request creation")
 }
 
-func (cleanupPullRequests) FindPullRequest(context.Context, string, string, string, string) (bitbucket.PullRequest, bool, error) {
-	return bitbucket.PullRequest{}, false, nil
+func (cleanupPullRequests) FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error) {
+	return forge.PullRequest{}, false, nil
 }
 
 func TestRunWatchesJobsAndPodsRelistsFromResourceVersionAndStopsWithContext(t *testing.T) {
@@ -468,8 +468,10 @@ func TestSecretCleanupFinalCheckUsesDurableGenerationAndSecretUID(t *testing.T) 
 	actualController, err := parentcontroller.New(db, controllerClient, config.Config{
 		Controller: config.ControllerConfig{Namespace: namespace, Deadline: time.Minute},
 		Worker:     config.WorkerConfig{Command: "opencode", BranchPrefix: "simpleswe/"},
+		Bitbucket:  config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"},
 		Repositories: config.RepositoryConfigs{{
 			Name: "widget", CloneURL: taskRecord.Repository, DefaultBranch: "main", Worker: config.WorkerConfig{Image: "worker:test"},
+			Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
 		}},
 	}, cleanupNotifier{}, cleanupPullRequests{})
 	if err != nil {

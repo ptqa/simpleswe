@@ -29,6 +29,7 @@ type Config struct {
 	Worker       WorkerConfig      `yaml:"worker"`
 	Slack        SlackConfig       `yaml:"slack,omitempty"`
 	Bitbucket    BitbucketConfig   `yaml:"bitbucket,omitempty"`
+	GitHub       GitHubConfig      `yaml:"github,omitempty"`
 	Repositories RepositoryConfigs `yaml:"repositories"`
 }
 
@@ -46,6 +47,10 @@ type SlackConfig struct {
 }
 
 type BitbucketConfig struct {
+	BaseURL string `yaml:"base_url,omitempty"`
+}
+
+type GitHubConfig struct {
 	BaseURL string `yaml:"base_url,omitempty"`
 }
 
@@ -88,8 +93,11 @@ type RepositoryConfig struct {
 	OpenCode      OpenCodeConfig            `yaml:"opencode,omitempty"`
 	Validation    ValidationConfig          `yaml:"validation,omitempty"`
 	Bitbucket     RepositoryBitbucketConfig `yaml:"bitbucket,omitempty"`
+	GitHub        RepositoryGitHubConfig    `yaml:"github,omitempty"`
 
 	credentialsSet bool
+	bitbucketSet   bool
+	githubSet      bool
 }
 
 type GitConfig struct {
@@ -110,6 +118,12 @@ type ValidationConfig struct {
 
 type RepositoryBitbucketConfig struct {
 	Workspace         string `yaml:"workspace,omitempty"`
+	Repository        string `yaml:"repository,omitempty"`
+	CredentialsSecret string `yaml:"credentials_secret_name,omitempty"`
+}
+
+type RepositoryGitHubConfig struct {
+	Owner             string `yaml:"owner,omitempty"`
 	Repository        string `yaml:"repository,omitempty"`
 	CredentialsSecret string `yaml:"credentials_secret_name,omitempty"`
 }
@@ -285,6 +299,9 @@ func (c *Config) applyDefaults() {
 	if c.Bitbucket.BaseURL == "" {
 		c.Bitbucket.BaseURL = "https://api.bitbucket.org"
 	}
+	if c.GitHub.BaseURL == "" {
+		c.GitHub.BaseURL = "https://api.github.com"
+	}
 	for i := range c.Repositories {
 		repository := &c.Repositories[i]
 		if len(repository.OpenCode.Command) == 0 {
@@ -298,6 +315,16 @@ func (c *Config) applyDefaults() {
 				repository.CloneURL = "ssh://git@bitbucket.org/" + url.PathEscape(repository.Bitbucket.Workspace) + "/" + url.PathEscape(repository.Bitbucket.Repository) + ".git"
 			} else {
 				repository.CloneURL = "https://bitbucket.org/" + url.PathEscape(repository.Bitbucket.Workspace) + "/" + url.PathEscape(repository.Bitbucket.Repository) + ".git"
+			}
+		}
+		if repository.DefaultBranch == "" && repository.CloneURL == "" && repository.GitHub.Owner != "" && repository.GitHub.Repository != "" {
+			repository.DefaultBranch = "main"
+		}
+		if repository.CloneURL == "" && repository.GitHub.Owner != "" && repository.GitHub.Repository != "" {
+			if repository.Git.SSHSecret != "" {
+				repository.CloneURL = "ssh://git@github.com/" + url.PathEscape(repository.GitHub.Owner) + "/" + url.PathEscape(repository.GitHub.Repository) + ".git"
+			} else {
+				repository.CloneURL = "https://github.com/" + url.PathEscape(repository.GitHub.Owner) + "/" + url.PathEscape(repository.GitHub.Repository) + ".git"
 			}
 		}
 	}
@@ -331,6 +358,11 @@ func (c Config) validate() error {
 	if err := validateBitbucketBaseURL(c.Bitbucket.BaseURL); err != nil {
 		return err
 	}
+	if c.GitHub.BaseURL != "" {
+		if err := validateGitHubBaseURL(c.GitHub.BaseURL); err != nil {
+			return err
+		}
+	}
 
 	if err := validateResources(c.Worker.Resources, "worker.resources"); err != nil {
 		return err
@@ -338,8 +370,11 @@ func (c Config) validate() error {
 	if err := validateWorker(c.Worker, "worker"); err != nil {
 		return err
 	}
-	forgeCredentials := make(map[[2]string]string, len(c.Repositories))
+	forgeCredentials := make(map[[3]string]string, len(c.Repositories))
 	for i, repository := range c.Repositories {
+		if repository.bitbucketSet == repository.githubSet {
+			return fmt.Errorf("repositories[%d] must configure exactly one of bitbucket or github", i)
+		}
 		if strings.TrimSpace(repository.CloneURL) == "" {
 			return fmt.Errorf("repositories[%d].clone_url is required", i)
 		}
@@ -356,22 +391,33 @@ func (c Config) validate() error {
 		if strings.TrimSpace(repository.Worker.Image) == "" {
 			return fmt.Errorf("repositories[%d].worker.image is required", i)
 		}
-		workspace := strings.TrimSpace(repository.Bitbucket.Workspace)
-		repositoryName := strings.TrimSpace(repository.Bitbucket.Repository)
-		if workspace == "" || repositoryName == "" {
-			return fmt.Errorf("repositories[%d].bitbucket.workspace and repository are required", i)
+		var provider, owner, repositoryName, credentialsSecret string
+		if repository.bitbucketSet {
+			provider = "bitbucket"
+			owner = repository.Bitbucket.Workspace
+			repositoryName = repository.Bitbucket.Repository
+			credentialsSecret = repository.Bitbucket.CredentialsSecret
+		} else {
+			provider = "github"
+			owner = repository.GitHub.Owner
+			repositoryName = repository.GitHub.Repository
+			credentialsSecret = repository.GitHub.CredentialsSecret
 		}
-		if workspace != repository.Bitbucket.Workspace || repositoryName != repository.Bitbucket.Repository {
-			return fmt.Errorf("repositories[%d].bitbucket.workspace and repository must not have surrounding whitespace", i)
+		trimmedOwner, trimmedRepository := strings.TrimSpace(owner), strings.TrimSpace(repositoryName)
+		if trimmedOwner == "" || trimmedRepository == "" {
+			return fmt.Errorf("repositories[%d].%s owner/workspace and repository are required", i, provider)
 		}
-		if repository.Bitbucket.CredentialsSecret == "" {
-			return fmt.Errorf("repositories[%d].bitbucket.credentials_secret_name is required", i)
+		if trimmedOwner != owner || trimmedRepository != repositoryName {
+			return fmt.Errorf("repositories[%d].%s coordinates must not have surrounding whitespace", i, provider)
 		}
-		coordinate := [2]string{strings.ToLower(workspace), strings.ToLower(repositoryName)}
-		if previous, exists := forgeCredentials[coordinate]; exists && previous != repository.Bitbucket.CredentialsSecret {
-			return fmt.Errorf("repositories[%d].bitbucket conflicts with credentials for %s/%s", i, workspace, repositoryName)
+		if credentialsSecret == "" {
+			return fmt.Errorf("repositories[%d].%s.credentials_secret_name is required", i, provider)
 		}
-		forgeCredentials[coordinate] = repository.Bitbucket.CredentialsSecret
+		coordinate := [3]string{provider, strings.ToLower(owner), strings.ToLower(repositoryName)}
+		if previous, exists := forgeCredentials[coordinate]; exists && previous != credentialsSecret {
+			return fmt.Errorf("repositories[%d].%s conflicts with credentials for %s/%s", i, provider, owner, repositoryName)
+		}
+		forgeCredentials[coordinate] = credentialsSecret
 		if repository.Git.BranchPrefix != "" && strings.TrimSpace(repository.Git.BranchPrefix) == "" {
 			return fmt.Errorf("repositories[%d].git.branch_prefix must not be blank", i)
 		}
@@ -394,6 +440,7 @@ func (c Config) validate() error {
 			"git.ssh_secret":                    repository.Git.SSHSecret,
 			"opencode.config_secret":            repository.OpenCode.ConfigSecret,
 			"bitbucket.credentials_secret_name": repository.Bitbucket.CredentialsSecret,
+			"github.credentials_secret_name":    repository.GitHub.CredentialsSecret,
 		} {
 			if name != "" {
 				if err := validateSecretName(name, fmt.Sprintf("repositories[%d].%s", i, path)); err != nil {
@@ -508,11 +555,22 @@ func validateSecretSource(source SecretSource, path string) error {
 }
 
 func validateBitbucketBaseURL(value string) error {
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopbackHost(parsed.Hostname()))) {
+	if !validForgeBaseURL(value) {
 		return fmt.Errorf("bitbucket.base_url must be an HTTPS URL without credentials (HTTP is allowed only for loopback test servers)")
 	}
 	return nil
+}
+
+func validateGitHubBaseURL(value string) error {
+	if !validForgeBaseURL(value) {
+		return fmt.Errorf("github.base_url must be an HTTPS URL without credentials (HTTP is allowed only for loopback test servers)")
+	}
+	return nil
+}
+
+func validForgeBaseURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" && (parsed.Scheme == "https" || parsed.Scheme == "http" && loopbackHost(parsed.Hostname()))
 }
 
 func loopbackHost(host string) bool {
@@ -603,15 +661,16 @@ func (c *ControllerConfig) UnmarshalYAML(node *yaml.Node) error {
 
 func (r *RepositoryConfig) UnmarshalYAML(node *yaml.Node) error {
 	var raw struct {
-		Name          string                    `yaml:"name,omitempty"`
-		CloneURL      string                    `yaml:"clone_url"`
-		DefaultBranch string                    `yaml:"default_branch"`
-		Credentials   *Credentials              `yaml:"credentials,omitempty"`
-		Worker        WorkerConfig              `yaml:"worker"`
-		Git           GitConfig                 `yaml:"git,omitempty"`
-		OpenCode      OpenCodeConfig            `yaml:"opencode,omitempty"`
-		Validation    ValidationConfig          `yaml:"validation,omitempty"`
-		Bitbucket     RepositoryBitbucketConfig `yaml:"bitbucket,omitempty"`
+		Name          string                     `yaml:"name,omitempty"`
+		CloneURL      string                     `yaml:"clone_url"`
+		DefaultBranch string                     `yaml:"default_branch"`
+		Credentials   *Credentials               `yaml:"credentials,omitempty"`
+		Worker        WorkerConfig               `yaml:"worker"`
+		Git           GitConfig                  `yaml:"git,omitempty"`
+		OpenCode      OpenCodeConfig             `yaml:"opencode,omitempty"`
+		Validation    ValidationConfig           `yaml:"validation,omitempty"`
+		Bitbucket     *RepositoryBitbucketConfig `yaml:"bitbucket,omitempty"`
+		GitHub        *RepositoryGitHubConfig    `yaml:"github,omitempty"`
 	}
 	if err := decodeNodeStrict(node, &raw); err != nil {
 		return err
@@ -624,11 +683,18 @@ func (r *RepositoryConfig) UnmarshalYAML(node *yaml.Node) error {
 		Git:            raw.Git,
 		OpenCode:       raw.OpenCode,
 		Validation:     raw.Validation,
-		Bitbucket:      raw.Bitbucket,
 		credentialsSet: raw.Credentials != nil,
+		bitbucketSet:   raw.Bitbucket != nil,
+		githubSet:      raw.GitHub != nil,
 	}
 	if raw.Credentials != nil {
 		r.Credentials = *raw.Credentials
+	}
+	if raw.Bitbucket != nil {
+		r.Bitbucket = *raw.Bitbucket
+	}
+	if raw.GitHub != nil {
+		r.GitHub = *raw.GitHub
 	}
 	return nil
 }

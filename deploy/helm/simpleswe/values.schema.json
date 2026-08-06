@@ -45,7 +45,10 @@
   "definitions": {
     "repository": {
       "type": "object",
-      "required": ["bitbucket"],
+      "oneOf": [
+        { "required": ["bitbucket"], "not": { "required": ["github"] } },
+        { "required": ["github"], "not": { "required": ["bitbucket"] } }
+      ],
       "properties": {
         "bitbucket": {
           "type": "object",
@@ -54,7 +57,18 @@
             "workspace": { "type": "string", "minLength": 1 },
             "repository": { "type": "string", "minLength": 1 },
             "credentials_secret_name": { "$ref": "#/definitions/kubernetesName" }
-          }
+          },
+          "additionalProperties": false
+        },
+        "github": {
+          "type": "object",
+          "required": ["owner", "repository", "credentials_secret_name"],
+          "properties": {
+            "owner": { "type": "string", "minLength": 1 },
+            "repository": { "type": "string", "minLength": 1 },
+            "credentials_secret_name": { "$ref": "#/definitions/kubernetesName" }
+          },
+          "additionalProperties": false
         }
       }
     },

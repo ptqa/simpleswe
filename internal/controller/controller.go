@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/simpleswe/simpleswe/internal/config"
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
@@ -35,8 +36,8 @@ type Notifier interface {
 
 // PullRequestCreator is the forge surface owned by the pull-request saga.
 type PullRequestCreator interface {
-	CreatePullRequest(context.Context, string, string, bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error)
-	FindPullRequest(context.Context, string, string, string, string) (bitbucket.PullRequest, bool, error)
+	CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error)
+	FindPullRequest(context.Context, forge.Target, string, string) (forge.PullRequest, bool, error)
 }
 
 type Controller struct {
@@ -51,8 +52,9 @@ type Controller struct {
 }
 
 type attemptResourceSnapshot struct {
-	Job    batchv1.Job   `json:"job"`
-	Secret corev1.Secret `json:"secret"`
+	Job         batchv1.Job   `json:"job"`
+	Secret      corev1.Secret `json:"secret"`
+	ForgeTarget *forge.Target `json:"forge_target,omitempty"`
 }
 
 var errResourceCreationBlocked = errors.New("resource creation blocked by current task outcome")
@@ -78,6 +80,9 @@ func New(db *store.Store, client kubernetes.Interface, cfg config.Config, notifi
 	}
 	seen := make(map[string]struct{}, len(cfg.Repositories))
 	for _, repository := range cfg.Repositories {
+		if _, err := forgeTarget(cfg, repository); err != nil {
+			return nil, err
+		}
 		if strings.TrimSpace(repository.Name) == "" {
 			continue
 		}
@@ -548,7 +553,11 @@ func (c *Controller) prepareAttemptSnapshot(ctx context.Context, taskRecord stor
 	if err != nil {
 		return nil, nil, err
 	}
-	resources, err := json.Marshal(attemptResourceSnapshot{Job: *job, Secret: *secret})
+	target, err := forgeTarget(c.config, repository)
+	if err != nil {
+		return nil, nil, err
+	}
+	resources, err := json.Marshal(attemptResourceSnapshot{Job: *job, Secret: *secret, ForgeTarget: &target})
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal attempt resource snapshot: %w", err)
 	}
@@ -661,6 +670,8 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 			TolerationSeconds: toleration.TolerationSeconds,
 		})
 	}
+	cloneURL, _ := url.Parse(repository.CloneURL)
+	githubHTTPS := repository.GitHub.Owner != "" && strings.EqualFold(cloneURL.Scheme, "https")
 	if repository.Credentials.SecretName != "" {
 		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{
 			Name: repository.Credentials.SecretName, MountPath: "/run/secrets/repository",
@@ -668,6 +679,9 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 	}
 	if repository.Bitbucket.CredentialsSecret != "" && repository.Bitbucket.CredentialsSecret != repository.Credentials.SecretName {
 		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{Name: repository.Bitbucket.CredentialsSecret, MountPath: "/run/secrets/bitbucket"})
+	}
+	if githubHTTPS && repository.Credentials.SecretName == "" {
+		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{Name: repository.GitHub.CredentialsSecret, MountPath: "/run/secrets/github"})
 	}
 	for _, mount := range repository.Worker.Mounts {
 		if mount.Secret != nil {
@@ -700,7 +714,24 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 	if repository.OpenCode.ConfigSecret != "" {
 		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{Name: repository.OpenCode.ConfigSecret, MountPath: "/run/secrets/opencode"})
 	}
-	if repository.Credentials.SecretName != "" || repository.Bitbucket.CredentialsSecret != "" {
+	if githubHTTPS {
+		credentialPath := "/run/secrets/github"
+		if repository.Credentials.SecretName != "" {
+			// #nosec G101 -- this is a mounted directory path, not a credential.
+			credentialPath = "/run/secrets/repository"
+		}
+		credentialScope := "credential." + repository.CloneURL
+		jobConfig.Env = append(jobConfig.Env,
+			corev1.EnvVar{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
+			corev1.EnvVar{Name: "GIT_CONFIG_COUNT", Value: "3"},
+			corev1.EnvVar{Name: "GIT_CONFIG_KEY_0", Value: "credential.useHttpPath"},
+			corev1.EnvVar{Name: "GIT_CONFIG_VALUE_0", Value: "true"},
+			corev1.EnvVar{Name: "GIT_CONFIG_KEY_1", Value: credentialScope + ".username"},
+			corev1.EnvVar{Name: "GIT_CONFIG_VALUE_1", Value: "x-access-token"},
+			corev1.EnvVar{Name: "GIT_CONFIG_KEY_2", Value: credentialScope + ".helper"},
+			corev1.EnvVar{Name: "GIT_CONFIG_VALUE_2", Value: "!f() { if test \"$1\" = get; then printf 'password=%s\\n' \"$(cat " + credentialPath + "/token)\"; fi; }; f"},
+		)
+	} else if repository.Credentials.SecretName != "" || repository.Bitbucket.CredentialsSecret != "" {
 		credentialPath := "/run/secrets/bitbucket"
 		if repository.Credentials.SecretName != "" {
 			// #nosec G101 -- this is a mounted directory path, not a credential.
@@ -731,6 +762,30 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 		jobConfig.Env = append(jobConfig.Env, corev1.EnvVar{Name: "SIMPLESWE_SECRET_PATHS", Value: strings.Join(secretPaths, string(os.PathListSeparator))})
 	}
 	return jobConfig, nil
+}
+
+func forgeTarget(cfg config.Config, repository config.RepositoryConfig) (forge.Target, error) {
+	bitbucketConfigured := repository.Bitbucket.Workspace != "" || repository.Bitbucket.Repository != ""
+	githubConfigured := repository.GitHub.Owner != "" || repository.GitHub.Repository != ""
+	if bitbucketConfigured == githubConfigured {
+		return forge.Target{}, fmt.Errorf("repository %q must configure exactly one forge", repository.Name)
+	}
+	target := forge.Target{
+		Provider: forge.ProviderBitbucket, BaseURL: cfg.Bitbucket.BaseURL,
+		Owner: repository.Bitbucket.Workspace, Repository: repository.Bitbucket.Repository,
+		CredentialsSecret: repository.Bitbucket.CredentialsSecret,
+	}
+	if githubConfigured {
+		target = forge.Target{
+			Provider: forge.ProviderGitHub, BaseURL: cfg.GitHub.BaseURL,
+			Owner: repository.GitHub.Owner, Repository: repository.GitHub.Repository,
+			CredentialsSecret: repository.GitHub.CredentialsSecret,
+		}
+	}
+	if err := forge.ValidateTarget(target); err != nil {
+		return forge.Target{}, fmt.Errorf("validate forge target: %w", err)
+	}
+	return target, nil
 }
 
 func affinityFromMap(input map[string]any) (*corev1.Affinity, error) {
