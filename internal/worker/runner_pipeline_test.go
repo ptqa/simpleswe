@@ -157,6 +157,126 @@ func TestRunnerNoChangesReturnsActionableError(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsInvalidInputsAndManifests(t *testing.T) {
+	t.Run("nil context", func(t *testing.T) {
+		var ctx context.Context
+		if err := (Runner{}).Run(ctx); err == nil || err.Error() != "context is nil" {
+			t.Fatalf("nil context error: got %v", err)
+		}
+	})
+	t.Run("manifest path", func(t *testing.T) {
+		if err := (Runner{WorkspaceDir: t.TempDir()}).Run(context.Background()); err == nil || err.Error() != "manifest path is required" {
+			t.Fatalf("manifest path error: got %v", err)
+		}
+	})
+	t.Run("workspace directory", func(t *testing.T) {
+		if err := (Runner{ManifestPath: "task.json"}).Run(context.Background()); err == nil || err.Error() != "workspace directory is required" {
+			t.Fatalf("workspace error: got %v", err)
+		}
+	})
+	t.Run("canceled context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := (Runner{ManifestPath: "task.json", WorkspaceDir: filepath.Join(t.TempDir(), "workspace")}).Run(ctx)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled runner error: got %v", err)
+		}
+	})
+
+	valid := protocol.TaskManifest{
+		TaskID:            "task-1",
+		CloneURL:          "repo",
+		BaseBranch:        "main",
+		TaskBranch:        "task",
+		Prompt:            "prompt",
+		OpenCodeCommand:   []string{"opencode"},
+		ValidationCommand: []string{"validate"},
+	}
+	data, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatalf("marshal valid manifest: %v", err)
+	}
+	validJSON := string(data)
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{name: "malformed", content: "{", want: "decode task manifest"},
+		{name: "unknown field", content: `{"unknown":true}`, want: "decode task manifest"},
+		{name: "multiple values", content: validJSON + "\n{}", want: "multiple JSON values"},
+		{name: "trailing malformed value", content: validJSON + "\nnot-json", want: "decode task manifest"},
+		{name: "validation", content: `{"task_id":"task-1","clone_url":"repo","prompt":"prompt"}`, want: "validate task manifest"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "task.json")
+			writeFile(t, path, test.content)
+			err := (Runner{ManifestPath: path, WorkspaceDir: filepath.Join(dir, "workspace")}).Run(context.Background())
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("manifest error: got %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestValidateRunnerManifestAndWorkspaceChecks(t *testing.T) {
+	cases := []struct {
+		name     string
+		manifest protocol.TaskManifest
+		want     string
+	}{
+		{name: "base branch", manifest: protocol.TaskManifest{TaskBranch: "task", OpenCodeCommand: []string{"run"}}, want: "base_branch is required"},
+		{name: "task branch", manifest: protocol.TaskManifest{BaseBranch: "main", OpenCodeCommand: []string{"run"}}, want: "task_branch is required"},
+		{name: "OpenCode command", manifest: protocol.TaskManifest{BaseBranch: "main", TaskBranch: "task"}, want: "opencode_command is required"},
+		{name: "unsafe branch", manifest: protocol.TaskManifest{BaseBranch: "main", TaskBranch: "bad branch", OpenCodeCommand: []string{"run"}}, want: "task_branch is not a safe branch name"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateRunnerManifest(test.manifest); err == nil || err.Error() != test.want {
+				t.Fatalf("runner manifest error: got %v, want %q", err, test.want)
+			}
+		})
+	}
+	valid := protocol.TaskManifest{BaseBranch: "main", TaskBranch: "task", OpenCodeCommand: []string{"run"}}
+	if err := validateRunnerManifest(valid); err != nil {
+		t.Fatalf("valid runner manifest rejected: %v", err)
+	}
+
+	existing := filepath.Join(t.TempDir(), "workspace")
+	writeFile(t, existing, "already here")
+	if err := requireFreshWorkspace(existing); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("existing workspace error: got %v", err)
+	}
+}
+
+func TestRunnerCommandHelpersReportErrorsAndCancellation(t *testing.T) {
+	commandErr := errors.New("command failed")
+	runError := func([]string) (CommandResult, error) { return CommandResult{ExitCode: 2}, commandErr }
+	if _, err := repositoryChanged(context.Background(), runError); err == nil || !strings.Contains(err.Error(), "inspect repository changes") {
+		t.Fatalf("repository change error: got %v", err)
+	}
+	if _, err := commandText(context.Background(), runError, []string{"git", "status"}); err == nil || !strings.Contains(err.Error(), "git status") {
+		t.Fatalf("command text error: got %v", err)
+	}
+	if err := commandFailure(context.Background(), "operation", commandErr); !errors.Is(err, commandErr) || !strings.Contains(err.Error(), "operation") {
+		t.Fatalf("command failure: got %v", err)
+	}
+
+	if _, err := hasStagedChanges(context.Background(), runError); err == nil || !strings.Contains(err.Error(), "inspect staged changes") {
+		t.Fatalf("staged change error: got %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := hasStagedChanges(ctx, runError); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled staged change error: got %v", err)
+	}
+	if err := commandFailure(ctx, "operation", commandErr); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled command failure: got %v", err)
+	}
+}
+
 func TestRunnerValidationFailureRunsBoundedFixesAndRedactsOutput(t *testing.T) {
 	fixture := newGitFixture(t)
 	tmp := t.TempDir()

@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -307,4 +308,269 @@ func assertJSONError(t *testing.T, response *http.Response) {
 	if envelope.Error.Code == "" || envelope.Error.Message == "" {
 		t.Fatalf("JSON error = %#v, want non-empty code and message", envelope.Error)
 	}
+}
+
+type errorHandlerDependency struct {
+	err error
+}
+
+func (f errorHandlerDependency) Health(context.Context) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) CreateTask(context.Context, []byte) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) ListTasks(context.Context, url.Values) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) GetTask(context.Context, string) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) CancelTask(context.Context, string) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) RetryTask(context.Context, string) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) ListAttempts(context.Context, string, url.Values) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) ListEvents(context.Context, string, url.Values) ([]byte, error) {
+	return nil, f.err
+}
+
+func (f errorHandlerDependency) GetLogs(context.Context, string, bool, string, int) (string, <-chan string, error) {
+	return "", nil, f.err
+}
+
+func (f errorHandlerDependency) GetPullRequest(context.Context, string) ([]byte, error) {
+	return nil, f.err
+}
+
+func TestHandlerMapsDependencyErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "not found", err: ErrNotFound, wantStatus: http.StatusNotFound, wantCode: "not_found"},
+		{name: "conflict", err: ErrConflict, wantStatus: http.StatusConflict, wantCode: "conflict"},
+		{name: "invalid", err: ErrInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: "validation_error"},
+		{name: "unexpected", err: errors.New("database unavailable"), wantStatus: http.StatusInternalServerError, wantCode: "internal_error"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-1", nil)
+			NewHandler(errorHandlerDependency{err: tt.err}).ServeHTTP(recorder, request)
+			response := recorder.Result()
+			defer response.Body.Close()
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", response.StatusCode, tt.wantStatus)
+			}
+			var envelope struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if envelope.Error.Code != tt.wantCode {
+				t.Fatalf("error code = %q, want %q", envelope.Error.Code, tt.wantCode)
+			}
+		})
+	}
+}
+
+func TestHandlerReturnsHealthUnavailableWhenDependencyFails(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+	NewHandler(errorHandlerDependency{err: errors.New("unavailable")}).ServeHTTP(recorder, request)
+	response := recorder.Result()
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusServiceUnavailable)
+	}
+	assertJSONError(t, response)
+}
+
+func TestHandlerRejectsUnsupportedMethodsAndUnknownRoutes(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "cancel", method: http.MethodGet, path: "/v1/tasks/task-1/cancel"},
+		{name: "retry", method: http.MethodGet, path: "/v1/tasks/task-1/retry"},
+		{name: "attempts", method: http.MethodPost, path: "/v1/tasks/task-1/attempts"},
+		{name: "events", method: http.MethodPost, path: "/v1/tasks/task-1/events"},
+		{name: "logs", method: http.MethodPost, path: "/v1/tasks/task-1/logs"},
+		{name: "pull request", method: http.MethodPost, path: "/v1/tasks/task-1/pull-request"},
+		{name: "unknown", method: http.MethodGet, path: "/unknown"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(tt.method, tt.path, nil)
+			NewHandler(new(fakeHandlerDependency)).ServeHTTP(recorder, request)
+			response := recorder.Result()
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusMethodNotAllowed && response.StatusCode != http.StatusNotFound {
+				t.Fatalf("status = %d, want method not allowed or not found", response.StatusCode)
+			}
+			assertJSONError(t, response)
+		})
+	}
+}
+
+func TestHandlerRejectsInvalidQueriesAndCreateBodies(t *testing.T) {
+	validCreate := `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix the bug"}`
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "invalid limit", method: http.MethodGet, path: "/v1/tasks?limit=101"},
+		{name: "non-numeric limit", method: http.MethodGet, path: "/v1/tasks?limit=nope"},
+		{name: "empty cursor", method: http.MethodGet, path: "/v1/tasks?cursor="},
+		{name: "repeated cursor", method: http.MethodGet, path: "/v1/tasks?cursor=a&cursor=b"},
+		{name: "invalid state", method: http.MethodGet, path: "/v1/tasks?state=unknown"},
+		{name: "attempts query", method: http.MethodGet, path: "/v1/tasks/task-1/attempts?limit=0"},
+		{name: "invalid follow", method: http.MethodGet, path: "/v1/tasks/task-1/logs?follow=maybe"},
+		{name: "repeated attempt", method: http.MethodGet, path: "/v1/tasks/task-1/logs?attempt_id=a&attempt_id=b"},
+		{name: "invalid tail", method: http.MethodGet, path: "/v1/tasks/task-1/logs?tail_lines=-1"},
+		{name: "missing fields", method: http.MethodPost, path: "/v1/tasks", body: `{}`},
+		{name: "unknown field", method: http.MethodPost, path: "/v1/tasks", body: validCreate[:len(validCreate)-1] + `,"unknown":true}`},
+		{name: "multiple values", method: http.MethodPost, path: "/v1/tasks", body: validCreate + ` {}`},
+		{name: "inline credentials", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://user:pass@bitbucket.example/acme/widget","prompt":"fix"}`},
+		{name: "empty event ID", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":" "}`},
+		{name: "incomplete Slack origin", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_origin":{"workspace_id":"T1"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body io.Reader
+			if tt.body != "" {
+				body = strings.NewReader(tt.body)
+			}
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(tt.method, tt.path, body)
+			NewHandler(new(fakeHandlerDependency)).ServeHTTP(recorder, request)
+			response := recorder.Result()
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusBadRequest)
+			}
+			assertJSONError(t, response)
+		})
+	}
+}
+
+type failingReader struct{}
+
+func (failingReader) Read([]byte) (int, error) {
+	return 0, errors.New("read failed")
+}
+
+func TestDecodeCreateBodyReportsReadErrors(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/tasks", failingReader{})
+	if _, ok := decodeCreateBody(recorder, request); ok {
+		t.Fatal("decodeCreateBody() ok = true, want false")
+	}
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+}
+
+func TestTaskIDValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		ok   bool
+	}{
+		{name: "valid", id: "task_1.v2-okay", ok: true},
+		{name: "empty", id: ""},
+		{name: "too long", id: strings.Repeat("a", 129)},
+		{name: "invalid character", id: "task/1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/", nil)
+			request.SetPathValue("taskID", tt.id)
+			got, ok := taskID(recorder, request)
+			if ok != tt.ok || (ok && got != tt.id) {
+				t.Fatalf("taskID() = %q, %t, want %q, %t", got, ok, tt.id, tt.ok)
+			}
+		})
+	}
+}
+
+func TestSSEStopsOnContextAndHandlesWriterFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	serveSSE(recorder, request, "first\r\nsecond\r", make(chan string))
+	if got := recorder.Body.String(); !strings.Contains(got, "data: first\n\ndata: second\n\n") {
+		t.Fatalf("SSE body = %q, want normalized initial lines", got)
+	}
+
+	failing := &flushWriter{err: errors.New("write failed")}
+	serveSSE(failing, httptest.NewRequest(http.MethodGet, "/", nil), "line", nil)
+	if failing.status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", failing.status, http.StatusOK)
+	}
+
+	noFlush := &responseWriterWithoutFlush{}
+	serveSSE(noFlush, httptest.NewRequest(http.MethodGet, "/", nil), "line", nil)
+	if noFlush.status != http.StatusInternalServerError {
+		t.Fatalf("non-flusher status = %d, want %d", noFlush.status, http.StatusInternalServerError)
+	}
+}
+
+type flushWriter struct {
+	err    error
+	status int
+}
+
+func (w *flushWriter) Header() http.Header { return http.Header{} }
+
+func (w *flushWriter) WriteHeader(status int) { w.status = status }
+
+func (w *flushWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func (w *flushWriter) Flush() {}
+
+type responseWriterWithoutFlush struct {
+	status int
+}
+
+func (w *responseWriterWithoutFlush) Header() http.Header { return http.Header{} }
+
+func (w *responseWriterWithoutFlush) WriteHeader(status int) { w.status = status }
+
+func (w *responseWriterWithoutFlush) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestWriteDataRejectsInvalidJSON(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeData(recorder, http.StatusOK, []byte(`{"broken"`))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestWriteErrorIgnoresWriterErrors(t *testing.T) {
+	writer := &flushWriter{err: errors.New("write failed")}
+	writeError(writer, http.StatusBadRequest, "bad", "bad request")
 }

@@ -48,6 +48,54 @@ func TestRunCommandStreamsAllOutputButRetainsOnlyBoundedTail(t *testing.T) {
 	}
 }
 
+func TestRunCommandRejectsEmptyCanceledAndMissingCommands(t *testing.T) {
+	result, err := RunCommand(context.Background(), nil)
+	if err == nil || err.Error() != "command is empty" {
+		t.Fatalf("empty command error: got %v", err)
+	}
+	if result.ExitCode != -1 || len(result.Command) != 0 {
+		t.Fatalf("empty command result: %#v", result)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err = RunCommand(ctx, []string{"does-not-run"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled command error: got %v", err)
+	}
+	if result.ExitCode != -1 || len(result.Command) != 1 || result.Command[0] != "does-not-run" {
+		t.Fatalf("canceled command result: %#v", result)
+	}
+
+	result, err = RunCommand(context.Background(), []string{filepath.Join(t.TempDir(), "missing-command")})
+	if err == nil {
+		t.Fatal("missing command unexpectedly succeeded")
+	}
+	if result.ExitCode != -1 || len(result.Command) != 1 {
+		t.Fatalf("missing command result: %#v", result)
+	}
+}
+
+func TestTailBufferWriteByteAndTinyTruncation(t *testing.T) {
+	buffer := newTailBuffer(2)
+	if err := buffer.WriteByte('x'); err != nil {
+		t.Fatalf("write byte: %v", err)
+	}
+	if got := buffer.String(); got != "x" {
+		t.Fatalf("untruncated byte: got %q, want %q", got, "x")
+	}
+	if _, err := buffer.Write([]byte("yz")); err != nil {
+		t.Fatalf("write overflow: %v", err)
+	}
+	tiny := newTailBuffer(1)
+	if _, err := tiny.Write([]byte("yz")); err != nil {
+		t.Fatalf("write tiny overflow: %v", err)
+	}
+	if got, want := tiny.String(), OutputTruncatedMarker[:1]; got != want {
+		t.Fatalf("tiny truncated buffer: got %q, want %q", got, want)
+	}
+}
+
 func TestLoadSecretsIncludesNamedEnvironmentValuesAndMultilineParts(t *testing.T) {
 	t.Setenv("API_TOKEN", "header-line\nenvironment-secret-line\nxy")
 	secrets := loadSecrets([]string{"mounted-secret"}, []string{"API_TOKEN"})
@@ -115,6 +163,33 @@ func TestReadableStreamDoesNotRetainLongSecretAtChunkStart(t *testing.T) {
 	}
 }
 
+func TestReadableStreamAndStreamingCommandPropagateOutputErrors(t *testing.T) {
+	wantErr := errors.New("output unavailable")
+	stream := &readableStream{output: failingWriter{err: wantErr}, name: "stdout"}
+	if _, err := stream.Write([]byte("line\n")); !errors.Is(err, wantErr) {
+		t.Fatalf("stream write error: got %v, want %v", err, wantErr)
+	}
+	if _, err := stream.Write([]byte("again\n")); !errors.Is(err, wantErr) {
+		t.Fatalf("stream retained error: got %v, want %v", err, wantErr)
+	}
+	if err := stream.flush(); !errors.Is(err, wantErr) {
+		t.Fatalf("stream flush error: got %v, want %v", err, wantErr)
+	}
+
+	_, err := runStreamingCommand(context.Background(), "", []string{"sh", "-c", "printf line"}, failingWriter{err: wantErr}, nil, 128)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("streaming command output error: got %v, want %v", err, wantErr)
+	}
+}
+
+func TestEmitEventReportsOutputErrors(t *testing.T) {
+	wantErr := errors.New("event output unavailable")
+	err := emitEvent(failingWriter{err: wantErr}, nil, protocol.Event{Type: protocol.EventAgentStarted})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("event output error: got %v, want %v", err, wantErr)
+	}
+}
+
 func TestRunValidationLoopIsBoundedAndRetainsFailures(t *testing.T) {
 	manifest := protocol.TaskManifest{
 		TaskID:            "task-1",
@@ -176,6 +251,48 @@ func TestRunValidationLoopIsBoundedAndRetainsFailures(t *testing.T) {
 		if len(got.Command) != 1 || got.Command[0] != manifest.ValidationCommand[0] {
 			t.Errorf("run %d command: got %#v, want %#v", i, got.Command, manifest.ValidationCommand)
 		}
+	}
+}
+
+func TestRunValidationLoopHandlesInputRunnerErrorsAndCancellation(t *testing.T) {
+	manifest := protocol.TaskManifest{
+		TaskID:             "task-1",
+		Repository:         "repo",
+		Prompt:             "fix it",
+		ValidationCommands: [][]string{{"first"}, {"second"}},
+	}
+
+	if _, err := RunValidationLoop(context.Background(), protocol.TaskManifest{}, func(context.Context, []string) (CommandResult, error) {
+		return CommandResult{}, nil
+	}); err == nil {
+		t.Fatal("invalid manifest unexpectedly succeeded")
+	}
+	if _, err := RunValidationLoop(context.Background(), manifest, nil); err == nil {
+		t.Fatal("nil validation runner unexpectedly succeeded")
+	}
+
+	calls := 0
+	result, err := RunValidationLoop(context.Background(), manifest, func(_ context.Context, command []string) (CommandResult, error) {
+		calls++
+		if calls == 1 {
+			return CommandResult{ExitCode: 3}, nil
+		}
+		return CommandResult{ExitCode: 4}, errors.New("runner failed")
+	})
+	if err == nil || !strings.Contains(err.Error(), "runner failed") {
+		t.Fatalf("runner error: got %v", err)
+	}
+	if len(result.Runs) != 2 || len(result.Runs[0].Command) != 1 || result.Runs[0].Command[0] != "first" {
+		t.Fatalf("validation runs: %#v", result.Runs)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := RunValidationLoop(ctx, manifest, func(context.Context, []string) (CommandResult, error) {
+		t.Fatal("canceled validation invoked runner")
+		return CommandResult{}, nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled validation error: got %v", err)
 	}
 }
 
@@ -246,4 +363,12 @@ func waitForPID(t *testing.T, path string) int {
 	}
 	t.Fatalf("fake executable did not write PID file %s", path)
 	return 0
+}
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }

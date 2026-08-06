@@ -207,6 +207,182 @@ func TestCreatePullRequestContextCancellation(t *testing.T) {
 	}
 }
 
+func TestHTTPErrorWithoutMessage(t *testing.T) {
+	err := (&HTTPError{Status: "500 Internal Server Error"}).Error()
+	if err != "Bitbucket returned 500 Internal Server Error" {
+		t.Fatalf("HTTPError.Error() = %q", err)
+	}
+}
+
+func TestCreatePullRequestRejectsInvalidEndpointAndContext(t *testing.T) {
+	client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+	if _, err := client.CreatePullRequest(context.Background(), "", testRepository, CreatePullRequestRequest{}); err == nil {
+		t.Fatal("CreatePullRequest accepted an empty workspace")
+	}
+	var nilContext context.Context
+	if _, err := client.CreatePullRequest(nilContext, testWorkspace, testRepository, CreatePullRequestRequest{}); err == nil || !strings.Contains(err.Error(), "create Bitbucket request") {
+		t.Fatalf("CreatePullRequest(nil context) error = %v; want request creation error", err)
+	}
+}
+
+func TestCreatePullRequestHandlesTransportAndResponseErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		client func(t *testing.T) *Client
+		want   string
+	}{
+		{
+			name: "transport",
+			client: func(t *testing.T) *Client {
+				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+				client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return nil, errors.New("network down")
+				})}
+				return client
+			},
+			want: "Bitbucket request failed",
+		},
+		{
+			name: "read failure",
+			client: func(t *testing.T) *Client {
+				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: failingReadCloser{}})
+				return client
+			},
+			want: "read Bitbucket response",
+		},
+		{
+			name: "oversized body",
+			client: func(t *testing.T) *Client {
+				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxResponseBody+1)))})
+				return client
+			},
+			want: "response body exceeds",
+		},
+		{
+			name: "malformed JSON",
+			client: func(t *testing.T) *Client {
+				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader("not-json"))})
+				return client
+			},
+			want: "decode Bitbucket response",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := test.client(t).CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("CreatePullRequest error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestCreatePullRequestValidatesResponse(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "missing ID", body: `{"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}`, want: "missing pull request id"},
+		{name: "missing URL", body: `{"id":1}`, want: "missing pull request URL"},
+		{name: "invalid URL", body: `{"id":1,"links":{"html":{"href":"/pull-requests/1"}}}`, want: "invalid pull request URL"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, test.body) }))
+			defer server.Close()
+			_, err := newTestClient(t, server.URL, "", "").CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("CreatePullRequest error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFindPullRequestHandlesLookupErrorsAndNoMatch(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		code int
+		want string
+	}{
+		{name: "status", body: "denied", code: http.StatusForbidden, want: "denied"},
+		{name: "malformed JSON", body: "not-json", code: http.StatusOK, want: "decode Bitbucket lookup response"},
+		{name: "incomplete match", body: `{"values":[{"id":0,"description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK, want: "incomplete pull request"},
+		{name: "invalid URL", body: `{"values":[{"id":1,"description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"}},"links":{"html":{"href":"/pull-requests/1"}}}]}`, code: http.StatusOK, want: "invalid pull request URL"},
+		{name: "no match", body: `{"values":[{"id":1,"description":"other","source":{"branch":{"name":"other"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("pagelen") != "50" || r.URL.Query().Get("q") != `source.branch.name="feature/task"` {
+					t.Errorf("lookup query = %q; want pagelen=50 and source branch filter", r.URL.RawQuery)
+				}
+				w.WriteHeader(test.code)
+				io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			_, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "swe-123")
+			if test.want == "" {
+				if err != nil || found {
+					t.Fatalf("FindPullRequest = found %t, error %v; want no match", found, err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFindPullRequestHandlesTransportAndReadErrors(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body io.ReadCloser
+		want string
+	}{
+		{name: "transport", want: "Bitbucket lookup failed"},
+		{name: "read", body: failingReadCloser{}, want: "read Bitbucket lookup response"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t, "https://bitbucket.example", "", "")
+			if test.body != nil {
+				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: test.body})
+			} else {
+				client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return nil, errors.New("lookup unavailable")
+				})}
+			}
+			_, _, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "swe-123")
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestEndpointAndRedactionHandleNilAndEscapedValues(t *testing.T) {
+	var nilClient *Client
+	if got := nilClient.redact("message"); got != "message" {
+		t.Fatalf("nil Client.redact() = %q; want message", got)
+	}
+	client := newTestClient(t, "https://bitbucket.example/api/", "user", "pass")
+	endpoint, err := client.endpoint("team name", "repo/name")
+	if err != nil {
+		t.Fatalf("endpoint() error = %v", err)
+	}
+	if !strings.Contains(endpoint, "/api/2.0/repositories/team%20name/repo%2Fname/pullrequests") {
+		t.Fatalf("endpoint() = %q; want escaped path", endpoint)
+	}
+	if got := client.redact("user pass"); got != "[REDACTED] [REDACTED]" {
+		t.Fatalf("redact() = %q", got)
+	}
+}
+
 func TestNewClientRequiresHTTPSExceptLoopback(t *testing.T) {
 	for _, baseURL := range []string{"http://bitbucket.example", "ftp://bitbucket.example", "https://user:password@bitbucket.example", "https://bitbucket.example?password=secret"} {
 		if _, err := NewClient(baseURL, "", ""); err == nil {
@@ -235,4 +411,20 @@ type branchRef struct {
 
 type branch struct {
 	Name string `json:"name"`
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type failingReadCloser struct{}
+
+func (failingReadCloser) Read([]byte) (int, error) { return 0, errors.New("read failed") }
+
+func (failingReadCloser) Close() error { return nil }
+
+func responseClient(response *http.Response) *http.Client {
+	return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return response, nil })}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -276,6 +278,194 @@ func TestCancelForegroundDeletesOnlyTheActiveJobInItsNamespace(t *testing.T) {
 		t.Errorf("delete propagationPolicy = %v; want Foreground", opts.PropagationPolicy)
 	}
 
+}
+
+func TestBuildRejectsInvalidConfigManifestAndAttempt(t *testing.T) {
+	validConfig := func() Config {
+		return Config{Namespace: "simpleswe-workers", Image: "worker:latest", Deadline: time.Minute}
+	}
+	validManifest := func() TaskManifest {
+		return TaskManifest{TaskID: "task", Prompt: "prompt"}
+	}
+	validAttempt := Attempt{ID: "attempt", Number: 1}
+
+	for _, test := range []struct {
+		name   string
+		config Config
+		want   string
+	}{
+		{name: "invalid namespace", config: Config{Namespace: "INVALID_NAMESPACE", Image: "worker", Deadline: time.Minute}, want: "namespace is invalid"},
+		{name: "missing image", config: Config{Namespace: "workers", Deadline: time.Minute}, want: "image is required"},
+		{name: "image whitespace", config: Config{Namespace: "workers", Image: "worker image", Deadline: time.Minute}, want: "image contains whitespace"},
+		{name: "image control", config: Config{Namespace: "workers", Image: "worker\nimage", Deadline: time.Minute}, want: "image contains whitespace"},
+		{name: "short deadline", config: Config{Namespace: "workers", Image: "worker", Deadline: 500 * time.Millisecond}, want: "deadline must be at least one second"},
+		{name: "reserved environment", config: Config{Namespace: "workers", Image: "worker", Deadline: time.Minute, Env: []corev1.EnvVar{{Name: "HOME"}}}, want: "environment variable HOME is reserved"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := Build(test.config, validManifest(), validAttempt)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v; want %q", err, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name     string
+		manifest TaskManifest
+		want     string
+	}{
+		{name: "missing task ID", manifest: TaskManifest{Prompt: "prompt"}, want: "task ID is required"},
+		{name: "long task ID", manifest: TaskManifest{TaskID: strings.Repeat("a", 254), Prompt: "prompt"}, want: "task ID is invalid"},
+		{name: "control task ID", manifest: TaskManifest{TaskID: "task\n", Prompt: "prompt"}, want: "task ID is invalid"},
+		{name: "missing prompt", manifest: TaskManifest{TaskID: "task"}, want: "task prompt is required"},
+		{name: "control prompt", manifest: TaskManifest{TaskID: "task", Prompt: "prompt\n"}, want: "task prompt contains control"},
+		{name: "protocol validation", manifest: TaskManifest{TaskID: "task", Prompt: "prompt", ValidationCommand: []string{"go", "test"}}, want: "repository or clone_url is required"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := Build(validConfig(), test.manifest, validAttempt)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v; want %q", err, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name    string
+		attempt Attempt
+		want    string
+	}{
+		{name: "missing attempt ID", attempt: Attempt{Number: 1}, want: "attempt ID is required"},
+		{name: "long attempt ID", attempt: Attempt{ID: strings.Repeat("a", 254), Number: 1}, want: "attempt ID is invalid"},
+		{name: "control attempt ID", attempt: Attempt{ID: "attempt\n", Number: 1}, want: "attempt ID is invalid"},
+		{name: "non-positive attempt number", attempt: Attempt{ID: "attempt", Number: 0}, want: "attempt number must be positive"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := Build(validConfig(), validManifest(), test.attempt)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v; want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestBuildIncludesConfigMapAndEmptyDirMounts(t *testing.T) {
+	sizeLimit := k8sresource.MustParse("1Gi")
+	config := Config{
+		Namespace: "workers",
+		Image:     "worker:latest",
+		Deadline:  time.Minute,
+		CredentialSecrets: []SecretMount{
+			{Name: "git-secret", MountPath: "/run/secrets/git"},
+		},
+		ConfigMaps: []ConfigMapMount{
+			{Name: "worker-config", MountPath: "/etc/worker"},
+		},
+		EmptyDirs: []EmptyDirMount{
+			{Name: "cache", MountPath: "/var/cache/worker", Medium: corev1.StorageMediumMemory, SizeLimit: &sizeLimit},
+		},
+	}
+	job, _, err := Build(config, TaskManifest{TaskID: "task", Prompt: "prompt"}, Attempt{ID: "attempt", Number: 1})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	worker := job.Spec.Template.Spec.Containers[0]
+	if len(job.Spec.Template.Spec.Volumes) != 5 || len(worker.VolumeMounts) != 5 {
+		t.Fatalf("volumes/mounts = %d/%d; want 5/5", len(job.Spec.Template.Spec.Volumes), len(worker.VolumeMounts))
+	}
+	configMapMount, configMapVolume := findNamedVolumeMount(t, worker, job.Spec.Template.Spec.Volumes, "configmap-0")
+	if configMapMount.MountPath != "/etc/worker" || !configMapMount.ReadOnly || configMapVolume.ConfigMap == nil || configMapVolume.ConfigMap.Name != "worker-config" {
+		t.Errorf("ConfigMap mount/volume = %#v/%#v", configMapMount, configMapVolume)
+	}
+	emptyDirMount, emptyDirVolume := findNamedVolumeMount(t, worker, job.Spec.Template.Spec.Volumes, "emptydir-0")
+	if emptyDirMount.MountPath != "/var/cache/worker" || emptyDirMount.ReadOnly || emptyDirVolume.EmptyDir == nil || emptyDirVolume.EmptyDir.Medium != corev1.StorageMediumMemory || emptyDirVolume.EmptyDir.SizeLimit == nil || !emptyDirVolume.EmptyDir.SizeLimit.Equal(sizeLimit) {
+		t.Errorf("emptyDir mount/volume = %#v/%#v", emptyDirMount, emptyDirVolume)
+	}
+}
+
+func TestValidateMountsRejectsInvalidAndOverlappingPaths(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call func() error
+		want string
+	}{
+		{name: "invalid Secret name", call: func() error {
+			return validateMounts([]SecretMount{{Name: "BAD_NAME", MountPath: "/run/secrets/git"}}, nil, nil)
+		}, want: "credential Secret 0 name is invalid"},
+		{name: "invalid Secret path", call: func() error {
+			return validateMounts([]SecretMount{{Name: "git-secret", MountPath: "relative"}}, nil, nil)
+		}, want: "credential Secret \"git-secret\" mount path is invalid"},
+		{name: "overlapping Secret path", call: func() error {
+			return validateMounts([]SecretMount{{Name: "git-secret", MountPath: "/run/simpleswe/task.json/cache"}}, nil, nil)
+		}, want: "overlaps"},
+		{name: "invalid ConfigMap", call: func() error {
+			return validateMounts(nil, []ConfigMapMount{{Name: "BAD_NAME", MountPath: "/etc/config"}}, nil)
+		}, want: "ConfigMap mount 0 is invalid"},
+		{name: "overlapping ConfigMap path", call: func() error {
+			return validateMounts(nil, []ConfigMapMount{{Name: "worker-config", MountPath: "/tmp/workspace/cache"}}, nil)
+		}, want: "ConfigMap \"worker-config\" mount path overlaps"},
+		{name: "invalid emptyDir", call: func() error {
+			return validateMounts(nil, nil, []EmptyDirMount{{Name: "BAD_NAME", MountPath: "/var/cache"}})
+		}, want: "emptyDir mount 0 is invalid"},
+		{name: "overlapping emptyDir path", call: func() error {
+			return validateMounts(nil, nil, []EmptyDirMount{{Name: "cache", MountPath: "/tmp/workspace/cache"}})
+		}, want: "emptyDir \"cache\" mount path overlaps"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.call(); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateMounts() error = %v; want %q", err, test.want)
+			}
+		})
+	}
+	if err := validateMounts([]SecretMount{{Name: "git-secret", MountPath: "/run/secrets/git"}}, []ConfigMapMount{{Name: "worker-config", MountPath: "/etc/config"}}, []EmptyDirMount{{Name: "cache", MountPath: "/var/cache"}}); err != nil {
+		t.Fatalf("validateMounts(valid mounts) error = %v", err)
+	}
+}
+
+func TestCancelRejectsInvalidArgumentsAndReturnsDeleteError(t *testing.T) {
+	client := fake.NewSimpleClientset()
+	var nilContext context.Context
+	if err := Cancel(nilContext, client, "workers", "job"); err == nil || !strings.Contains(err.Error(), "context is nil") {
+		t.Fatalf("Cancel(nil context) error = %v", err)
+	}
+	if err := Cancel(context.Background(), nil, "workers", "job"); err == nil || !strings.Contains(err.Error(), "Kubernetes client is nil") {
+		t.Fatalf("Cancel(nil client) error = %v", err)
+	}
+	if err := Cancel(context.Background(), client, "", "job"); err == nil || !strings.Contains(err.Error(), "namespace and Job name are required") {
+		t.Fatalf("Cancel(empty namespace) error = %v", err)
+	}
+	if err := Cancel(context.Background(), client, "workers", ""); err == nil || !strings.Contains(err.Error(), "namespace and Job name are required") {
+		t.Fatalf("Cancel(empty job) error = %v", err)
+	}
+
+	client.PrependReactor("delete", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("delete failed")
+	})
+	if err := Cancel(context.Background(), client, "workers", "job"); err == nil || !strings.Contains(err.Error(), "delete failed") {
+		t.Fatalf("Cancel(delete failure) error = %v", err)
+	}
+}
+
+func TestNameAndPathHelpersCoverFallbacks(t *testing.T) {
+	if got := Name("", 1); got != "task-a1" {
+		t.Fatalf("Name(empty task ID) = %q; want task-a1", got)
+	}
+	if got := labelValue(""); got != "unknown" {
+		t.Fatalf("labelValue(empty) = %q; want unknown", got)
+	}
+	for _, test := range []struct {
+		first  string
+		second string
+		want   bool
+	}{
+		{first: "/", second: "/var", want: true},
+		{first: "/var/cache", second: "/var/cache", want: true},
+		{first: "/var", second: "/var/cache", want: true},
+		{first: "/var", second: "/etc", want: false},
+	} {
+		if got := pathsOverlap(test.first, test.second); got != test.want {
+			t.Errorf("pathsOverlap(%q, %q) = %t; want %t", test.first, test.second, got, test.want)
+		}
+	}
 }
 
 func resourceRequirements() corev1.ResourceRequirements {
