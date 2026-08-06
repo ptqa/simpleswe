@@ -66,11 +66,21 @@ func TestHandleKeyTransitions(t *testing.T) {
 	if got := app.model.SelectedTaskID(); got != "task-1" {
 		t.Fatalf("up selected %q, want task-1", got)
 	}
+	pressKey(t, app, key('G'))
+	if got := app.model.SelectedTaskID(); got != "task-2" {
+		t.Fatalf("G selected %q, want task-2", got)
+	}
+	pressKey(t, app, key('g'))
+	pressKey(t, app, key('j'))
+	pressKey(t, app, key('k'))
+	if got := app.model.SelectedTaskID(); got != "task-1" {
+		t.Fatalf("vim navigation selected %q, want task-1", got)
+	}
 
 	for _, test := range []struct {
 		key  rune
 		mode viewMode
-	}{{'l', viewLogs}, {'e', viewEvents}, {'j', viewJob}, {'p', viewPod}, {'\r', viewDetails}} {
+	}{{'l', viewLogs}, {'e', viewEvents}, {'d', viewJob}, {'p', viewPod}, {'\r', viewDetails}} {
 		pressKey(t, app, key(test.key))
 		if app.mode != test.mode || !app.narrowDetail {
 			t.Fatalf("key %q = mode %v, detail %v", test.key, app.mode, app.narrowDetail)
@@ -87,14 +97,14 @@ func TestHandleKeyTransitions(t *testing.T) {
 	if app.message != "no task selected" {
 		t.Fatalf("retry without task message = %q", app.message)
 	}
-	pressKey(t, app, key('x'))
+	pressKey(t, app, vaxis.Key{Keycode: 'd', Modifiers: vaxis.ModCtrl})
 	if app.confirmCancel || app.message != "no task selected" {
 		t.Fatalf("cancel without task = confirm %v, message %q", app.confirmCancel, app.message)
 	}
 	app.model.SetSelectedTask("task-1")
-	pressKey(t, app, key('x'))
+	pressKey(t, app, vaxis.Key{Keycode: 'd', Modifiers: vaxis.ModCtrl})
 	if !app.confirmCancel {
-		t.Fatal("x did not request confirmation")
+		t.Fatal("ctrl-d did not request confirmation")
 	}
 	pressKey(t, app, key('n'))
 	pressKey(t, app, key('?'))
@@ -104,6 +114,26 @@ func TestHandleKeyTransitions(t *testing.T) {
 	pressKey(t, app, key('q'))
 	if app.help {
 		t.Fatal("q did not close help")
+	}
+	pressKey(t, app, key('t'))
+	if !app.themePicker || app.themeCursor != int(app.theme) {
+		t.Fatalf("theme picker = open %v, cursor %d", app.themePicker, app.themeCursor)
+	}
+	pressKey(t, app, key('G'))
+	if app.colors().name != "Tokyo Night" {
+		t.Fatalf("theme preview = %q, want Tokyo Night", app.colors().name)
+	}
+	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyEnter})
+	if app.themePicker || app.colors().name != "Tokyo Night" {
+		t.Fatalf("applied theme = open %v, theme %q", app.themePicker, app.colors().name)
+	}
+	pressKey(t, app, key('t'))
+	pressKey(t, app, key('g'))
+	pressKey(t, app, key('j'))
+	pressKey(t, app, key('k'))
+	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyEsc})
+	if app.themePicker || app.colors().name != "Tokyo Night" {
+		t.Fatal("closing theme picker changed applied theme")
 	}
 
 	app.narrowDetail, app.mode = true, viewLogs

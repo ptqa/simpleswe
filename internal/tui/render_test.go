@@ -51,6 +51,15 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	app.draw()
 	assertOutputContains(t, renderedScreen(console, terminal), "CONFIRM CANCELLATION", "Cancel task task-1")
 	app.confirmCancel = false
+	console.resetOutput()
+	app.themePicker = true
+	app.draw()
+	assertOutputContains(t, renderedScreen(console, terminal), "THEMES", "Simpleswe Dark", "Tokyo Night")
+	app.themePicker = false
+	app.selectTheme(1)
+	console.resetOutput()
+	app.draw()
+	assertOutputContains(t, renderedScreen(console, terminal), "theme:Simpleswe Light")
 
 	vx.Resize(vaxis.Resize{Cols: 60, Rows: 20})
 	terminal.Resize(60, 20)
@@ -107,8 +116,8 @@ func TestDrawEmptyAndFallbackViews(t *testing.T) {
 	vx.Render()
 	assertOutputContains(t, renderedScreen(console, terminal), "pod-task", "pod message")
 
-	drawOverlay(root, 7, 3, "ignored", []string{"ignored"})
-	if got := drawField(root, root.Height, "ignored", "ignored", vaxis.Style{}); got != root.Height {
+	app.drawOverlay(root, 7, 3, "ignored", []string{"ignored"})
+	if got := app.drawField(root, root.Height, "ignored", "ignored", vaxis.Style{}); got != root.Height {
 		t.Fatalf("drawField outside window = %d", got)
 	}
 	app.drawTasks(vaxis.Window{Vx: vx})
@@ -117,13 +126,36 @@ func TestDrawEmptyAndFallbackViews(t *testing.T) {
 
 func TestRenderHelpers(t *testing.T) {
 	now := time.Now()
+	app := &application{}
+	palette := app.colors()
 	for _, test := range []struct {
 		state string
 		want  vaxis.Style
 	}{{"running", palette.ok}, {"FAILED", palette.bad}, {"pending", palette.warn}, {"mystery", palette.info}} {
-		if got := stateStyle(test.state); got != test.want {
+		if got := app.stateStyle(test.state); got != test.want {
 			t.Errorf("stateStyle(%q) = %#v, want %#v", test.state, got, test.want)
 		}
+	}
+	if len(themes) < 8 {
+		t.Fatalf("themes = %d, want at least 8", len(themes))
+	}
+	names := make(map[string]bool, len(themes))
+	for index, theme := range themes {
+		if theme.name == "" || theme.base.Foreground == vaxis.ColorDefault || theme.base.Background == vaxis.ColorDefault {
+			t.Errorf("theme %d is incomplete: %#v", index, theme)
+		}
+		if names[theme.name] {
+			t.Errorf("duplicate theme name %q", theme.name)
+		}
+		names[theme.name] = true
+	}
+	app.selectTheme(len(themes) - 1)
+	if app.colors().name != "Tokyo Night" || app.message != "theme: Tokyo Night" {
+		t.Fatalf("selected theme = %q, message %q", app.colors().name, app.message)
+	}
+	app.selectTheme(-1)
+	if app.colors().name != "Tokyo Night" {
+		t.Fatal("invalid theme selection changed theme")
 	}
 	base := vaxis.Style{Foreground: vaxis.ColorWhite, Background: vaxis.ColorNavy, Attribute: vaxis.AttrBold}
 	accent := vaxis.Style{Foreground: vaxis.ColorRed, Attribute: vaxis.AttrItalic}

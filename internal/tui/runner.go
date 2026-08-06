@@ -159,6 +159,10 @@ type application struct {
 	model   *Model
 
 	mode          viewMode
+	theme         themeName
+	themePicker   bool
+	themeCursor   int
+	themePrevious themeName
 	help          bool
 	confirmCancel bool
 	narrowDetail  bool

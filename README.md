@@ -260,17 +260,20 @@ TUI keys:
 
 | Key | Action |
 | --- | --- |
+| `j` / `k`, `↑` / `↓` | Move selection |
+| `g` / `G` | Jump to first or last task |
 | `enter` | Task and attempt details |
 | `l` | Live logs |
 | `e` | Event history |
-| `j` | Kubernetes Job details |
+| `d` | Kubernetes Job details |
 | `p` | Kubernetes Pod details |
 | `s` | Shell into the running worker with `kubectl exec` |
 | `r` | Retry task |
-| `x` | Cancel task |
+| `ctrl-d` | Cancel task |
 | `R` | Refresh |
+| `t` | Choose color theme |
 | `?` | Help |
-| `q` | Back or quit |
+| `h`, `q`, `esc` | Back or quit |
 
 ## Architecture
 

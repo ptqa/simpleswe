@@ -10,24 +10,11 @@ import (
 	"go.rockorager.dev/vaxis"
 )
 
-var palette = struct {
-	header, title, dim, selected, border vaxis.Style
-	ok, warn, bad, info                  vaxis.Style
-}{
-	header:   vaxis.Style{Foreground: vaxis.ColorWhite, Background: vaxis.ColorNavy, Attribute: vaxis.AttrBold},
-	title:    vaxis.Style{Foreground: vaxis.ColorAqua, Attribute: vaxis.AttrBold},
-	dim:      vaxis.Style{Foreground: vaxis.ColorSilver, Attribute: vaxis.AttrDim},
-	selected: vaxis.Style{Foreground: vaxis.ColorBlack, Background: vaxis.ColorTeal, Attribute: vaxis.AttrBold},
-	border:   vaxis.Style{Foreground: vaxis.ColorGray},
-	ok:       vaxis.Style{Foreground: vaxis.ColorLime},
-	warn:     vaxis.Style{Foreground: vaxis.ColorYellow},
-	bad:      vaxis.Style{Foreground: vaxis.ColorRed, Attribute: vaxis.AttrBold},
-	info:     vaxis.Style{Foreground: vaxis.ColorAqua},
-}
-
 func (a *application) draw() {
 	root := a.vx.Window()
 	root.Clear()
+	palette := a.colors()
+	fill(root, palette.base)
 	width, height := root.Size()
 	if width <= 0 || height <= 0 {
 		return
@@ -77,6 +64,9 @@ func (a *application) draw() {
 	if a.help {
 		a.drawHelp(root)
 	}
+	if a.themePicker {
+		a.drawThemeSwitcher(root)
+	}
 	if a.confirmCancel {
 		a.drawCancelConfirmation(root)
 	}
@@ -84,6 +74,7 @@ func (a *application) draw() {
 }
 
 func (a *application) drawHeader(win vaxis.Window) {
+	palette := a.colors()
 	width, _ := win.Size()
 	fill(win, palette.header)
 	address := firstNonempty(a.options.Address, "controller")
@@ -100,7 +91,7 @@ func (a *application) drawHeader(win vaxis.Window) {
 	case ConnectivityLost:
 		statusStyle, marker = palette.bad, "●"
 	}
-	left := fmt.Sprintf(" simpleswe  %s  ctx:%s  ns:%s", address, contextName, a.options.Namespace)
+	left := fmt.Sprintf(" simpleswe  %s  ctx:%s  ns:%s  theme:%s", address, contextName, a.options.Namespace, palette.name)
 	status := " " + marker + " " + string(state) + " "
 	if len(left)+len(status) < width {
 		left += strings.Repeat(" ", width-len(left)-len(status))
@@ -112,11 +103,12 @@ func (a *application) drawHeader(win vaxis.Window) {
 }
 
 func (a *application) drawFooter(win vaxis.Window) {
+	palette := a.colors()
 	fill(win, palette.header)
 	width, _ := win.Size()
-	keys := " ↑↓ move  enter details  l logs  e events  j job  p pod  s shell  r retry  x cancel  R refresh  ? help  q back/quit"
+	keys := " j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  ? help  q back"
 	if width < 82 {
-		keys = " ↑↓ move  enter details  ? help  q back/quit"
+		keys = " j/k move  enter details  t themes  ? help  q back"
 	}
 	statusMessage := a.message
 	if state := a.model.Connectivity(); state == ConnectivityLost || state == ConnectivityRestored {
@@ -130,6 +122,7 @@ func (a *application) drawFooter(win vaxis.Window) {
 }
 
 func (a *application) drawTasks(win vaxis.Window) {
+	palette := a.colors()
 	width, height := win.Size()
 	if width <= 0 || height <= 0 {
 		return
@@ -164,7 +157,7 @@ func (a *application) drawTasks(win vaxis.Window) {
 		}
 		age := compactAge(task.CreatedAt)
 		line := fmt.Sprintf(" %-10s %-28s %5s", state, label, age)
-		style := stateStyle(task.State)
+		style := a.stateStyle(task.State)
 		if index == selected {
 			style = palette.selected
 		}
@@ -188,9 +181,10 @@ func (a *application) drawView(win vaxis.Window) {
 }
 
 func (a *application) drawDetails(win vaxis.Window) {
+	palette := a.colors()
 	detail := a.model.Detail()
 	if detail.Task.ID == "" {
-		drawEmptySelection(win)
+		a.drawEmptySelection(win)
 		return
 	}
 	attempt := currentAttempt(detail)
@@ -199,26 +193,27 @@ func (a *application) drawDetails(win vaxis.Window) {
 		vaxis.Segment{Text: "  enter", Style: palette.dim},
 	)
 	row := 2
-	row = drawField(win, row, "Task", detail.Task.ID, vaxis.Style{})
-	row = drawField(win, row, "State", strings.ToUpper(detail.Task.State), stateStyle(detail.Task.State))
-	row = drawField(win, row, "Repository", detail.Task.Repository, vaxis.Style{})
-	row = drawField(win, row, "Created", formatTime(detail.Task.CreatedAt), vaxis.Style{})
-	row = drawField(win, row, "Updated", formatTime(detail.Task.UpdatedAt), vaxis.Style{})
+	row = a.drawField(win, row, "Task", detail.Task.ID, vaxis.Style{})
+	row = a.drawField(win, row, "State", strings.ToUpper(detail.Task.State), a.stateStyle(detail.Task.State))
+	row = a.drawField(win, row, "Repository", detail.Task.Repository, vaxis.Style{})
+	row = a.drawField(win, row, "Created", formatTime(detail.Task.CreatedAt), vaxis.Style{})
+	row = a.drawField(win, row, "Updated", formatTime(detail.Task.UpdatedAt), vaxis.Style{})
 	row++
 	if attempt.ID == "" {
-		row = drawField(win, row, "Attempt", "not scheduled", palette.dim)
+		row = a.drawField(win, row, "Attempt", "not scheduled", palette.dim)
 	} else {
-		row = drawField(win, row, "Attempt", fmt.Sprintf("#%d  %s", attempt.Number, attempt.ID), vaxis.Style{})
-		row = drawField(win, row, "Attempt state", strings.ToUpper(attempt.State), stateStyle(attempt.State))
-		row = drawField(win, row, "Job", firstNonempty(attempt.KubernetesJob.ResourceIdentity.Name, "—"), vaxis.Style{})
-		row = drawField(win, row, "Job state", firstNonempty(strings.ToUpper(attempt.KubernetesJob.State), "—"), stateStyle(attempt.KubernetesJob.State))
-		row = drawField(win, row, "Pod", firstNonempty(attempt.KubernetesPod.ResourceIdentity.Name, "—"), vaxis.Style{})
+		row = a.drawField(win, row, "Attempt", fmt.Sprintf("#%d  %s", attempt.Number, attempt.ID), vaxis.Style{})
+		row = a.drawField(win, row, "Attempt state", strings.ToUpper(attempt.State), a.stateStyle(attempt.State))
+		row = a.drawField(win, row, "Job", firstNonempty(attempt.KubernetesJob.ResourceIdentity.Name, "—"), vaxis.Style{})
+		row = a.drawField(win, row, "Job state", firstNonempty(strings.ToUpper(attempt.KubernetesJob.State), "—"), a.stateStyle(attempt.KubernetesJob.State))
+		row = a.drawField(win, row, "Pod", firstNonempty(attempt.KubernetesPod.ResourceIdentity.Name, "—"), vaxis.Style{})
 	}
 	row++
-	drawField(win, row, "Prompt", firstNonempty(detail.Task.Prompt, "—"), vaxis.Style{})
+	a.drawField(win, row, "Prompt", firstNonempty(detail.Task.Prompt, "—"), vaxis.Style{})
 }
 
 func (a *application) drawEvents(win vaxis.Window) {
+	palette := a.colors()
 	detail := a.model.Detail()
 	win.PrintTruncate(0,
 		vaxis.Segment{Text: fmt.Sprintf(" EVENTS %d", len(detail.Events)), Style: palette.title},
@@ -240,12 +235,13 @@ func (a *application) drawEvents(win vaxis.Window) {
 			transition = event.FromState + " → " + event.ToState
 		}
 		line := fmt.Sprintf(" %s  %-22s  %s", event.OccurredAt.Local().Format("15:04:05"), transition, firstNonempty(event.Reason, event.Trigger))
-		win.PrintTruncate(row, vaxis.Segment{Text: line, Style: stateStyle(event.ToState)})
+		win.PrintTruncate(row, vaxis.Segment{Text: line, Style: a.stateStyle(event.ToState)})
 		row++
 	}
 }
 
 func (a *application) drawJob(win vaxis.Window) {
+	palette := a.colors()
 	detail := a.model.Detail()
 	attempt := currentAttempt(detail)
 	job := attempt.KubernetesJob
@@ -254,13 +250,14 @@ func (a *application) drawJob(win vaxis.Window) {
 	}
 	win.PrintTruncate(0, vaxis.Segment{Text: " JOB", Style: palette.title})
 	row := 2
-	row = drawField(win, row, "Name", firstNonempty(job.ResourceIdentity.Name, "—"), vaxis.Style{})
-	row = drawField(win, row, "Namespace", firstNonempty(job.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
-	row = drawField(win, row, "State", firstNonempty(strings.ToUpper(job.State), "—"), stateStyle(job.State))
-	drawField(win, row, "Reason", firstNonempty(job.Reason, job.Message, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Name", firstNonempty(job.ResourceIdentity.Name, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Namespace", firstNonempty(job.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
+	row = a.drawField(win, row, "State", firstNonempty(strings.ToUpper(job.State), "—"), a.stateStyle(job.State))
+	a.drawField(win, row, "Reason", firstNonempty(job.Reason, job.Message, "—"), vaxis.Style{})
 }
 
 func (a *application) drawPod(win vaxis.Window) {
+	palette := a.colors()
 	detail := a.model.Detail()
 	attempt := currentAttempt(detail)
 	pod := attempt.KubernetesPod
@@ -269,25 +266,27 @@ func (a *application) drawPod(win vaxis.Window) {
 	}
 	win.PrintTruncate(0, vaxis.Segment{Text: " POD", Style: palette.title})
 	row := 2
-	row = drawField(win, row, "Name", firstNonempty(pod.ResourceIdentity.Name, "—"), vaxis.Style{})
-	row = drawField(win, row, "Namespace", firstNonempty(pod.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
-	row = drawField(win, row, "State", firstNonempty(strings.ToUpper(pod.State), "—"), stateStyle(pod.State))
-	drawField(win, row, "Reason", firstNonempty(pod.Reason, pod.Message, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Name", firstNonempty(pod.ResourceIdentity.Name, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Namespace", firstNonempty(pod.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
+	row = a.drawField(win, row, "State", firstNonempty(strings.ToUpper(pod.State), "—"), a.stateStyle(pod.State))
+	a.drawField(win, row, "Reason", firstNonempty(pod.Reason, pod.Message, "—"), vaxis.Style{})
 }
 
 func (a *application) drawLogSummary(win vaxis.Window) {
+	palette := a.colors()
 	detail := a.model.Detail()
 	attempt := currentAttempt(detail)
 	win.PrintTruncate(0, vaxis.Segment{Text: " LOG STREAM", Style: palette.title})
 	row := 2
-	row = drawField(win, row, "Task", firstNonempty(detail.Task.ID, "—"), vaxis.Style{})
-	row = drawField(win, row, "Attempt", firstNonempty(attempt.ID, "—"), vaxis.Style{})
-	row = drawField(win, row, "Pod", firstNonempty(attempt.KubernetesPod.ResourceIdentity.Name, detail.Task.KubernetesPod.ResourceIdentity.Name, "—"), vaxis.Style{})
-	row = drawField(win, row, "Buffered", fmt.Sprintf("%d / %d lines", len(a.model.Logs()), a.options.LogCapacity), vaxis.Style{})
-	drawField(win, row, "Follow", map[bool]string{true: "connected", false: "reconnecting"}[a.logStop != nil], map[bool]vaxis.Style{true: palette.ok, false: palette.warn}[a.logStop != nil])
+	row = a.drawField(win, row, "Task", firstNonempty(detail.Task.ID, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Attempt", firstNonempty(attempt.ID, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Pod", firstNonempty(attempt.KubernetesPod.ResourceIdentity.Name, detail.Task.KubernetesPod.ResourceIdentity.Name, "—"), vaxis.Style{})
+	row = a.drawField(win, row, "Buffered", fmt.Sprintf("%d / %d lines", len(a.model.Logs()), a.options.LogCapacity), vaxis.Style{})
+	a.drawField(win, row, "Follow", map[bool]string{true: "connected", false: "reconnecting"}[a.logStop != nil], map[bool]vaxis.Style{true: palette.ok, false: palette.warn}[a.logStop != nil])
 }
 
 func (a *application) drawLogs(win vaxis.Window) {
+	palette := a.colors()
 	width, height := win.Size()
 	if width <= 0 || height <= 0 {
 		return
@@ -313,24 +312,25 @@ func (a *application) drawLogs(win vaxis.Window) {
 		if row >= height {
 			break
 		}
-		win.PrintTruncate(row, vaxis.Segment{Text: " " + line, Style: vaxis.Style{}})
+		win.PrintTruncate(row, vaxis.Segment{Text: " " + line, Style: palette.base})
 	}
 }
 
 func (a *application) drawHelp(root vaxis.Window) {
 	lines := []string{
 		"KEYS",
-		"↑ / ↓   select task",
+		"j / k   select task     g / G  first / last",
 		"enter   task and attempt details",
 		"l       logs          e  events",
-		"j       Job details   p  Pod details",
+		"d       Job details   p  Pod details",
 		"s       shell         r  retry",
-		"x       cancel        R  refresh",
+		"ctrl-d  cancel        R  refresh",
+		"t       choose theme  h  back",
 		"?       close help    q  back / quit",
 		"",
 		"Cancellation always asks for confirmation.",
 	}
-	drawOverlay(root, min(62, root.Width-4), min(len(lines)+4, root.Height-2), " SIMPLESWE HELP ", lines)
+	a.drawOverlay(root, min(62, root.Width-4), min(len(lines)+4, root.Height-2), " SIMPLESWE HELP ", lines)
 }
 
 func (a *application) drawCancelConfirmation(root vaxis.Window) {
@@ -341,16 +341,54 @@ func (a *application) drawCancelConfirmation(root vaxis.Window) {
 		"",
 		"y / enter  confirm     n / esc  keep running",
 	}
-	drawOverlay(root, min(68, root.Width-4), min(8, root.Height-2), " CONFIRM CANCELLATION ", lines)
+	a.drawOverlay(root, min(68, root.Width-4), min(8, root.Height-2), " CONFIRM CANCELLATION ", lines)
 }
 
-func drawOverlay(root vaxis.Window, width, height int, title string, lines []string) {
+func (a *application) drawThemeSwitcher(root vaxis.Window) {
+	palette := a.colors()
+	width := min(46, root.Width-4)
+	height := min(len(themes)+5, root.Height-2)
+	if width < 24 || height < 6 {
+		return
+	}
+	win := root.New((root.Width-width)/2, (root.Height-height)/2, width, height)
+	a.drawOverlayFrame(win, " THEMES ")
+	visible := height - 4
+	start := max(0, a.themeCursor-visible+1)
+	for row, index := 2, start; row < height-2 && index < len(themes); row, index = row+1, index+1 {
+		marker := "  "
+		if themeName(index) == a.theme {
+			marker = "● "
+		}
+		style := palette.overlay
+		if index == a.themeCursor {
+			style = palette.selected
+		}
+		win.New(2, row, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: marker + themes[index].name, Style: style})
+	}
+	win.New(2, height-2, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: "j/k preview  enter apply  esc cancel", Style: palette.overlay})
+}
+
+func (a *application) drawOverlay(root vaxis.Window, width, height int, title string, lines []string) {
 	if width < 8 || height < 4 {
 		return
 	}
 	col, row := (root.Width-width)/2, (root.Height-height)/2
 	win := root.New(col, row, width, height)
-	style := vaxis.Style{Foreground: vaxis.ColorWhite, Background: vaxis.ColorNavy}
+	a.drawOverlayFrame(win, title)
+	style := a.colors().overlay
+	for i, line := range lines {
+		if i+2 >= height-1 {
+			break
+		}
+		win.New(2, i+2, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: line, Style: style})
+	}
+}
+
+func (a *application) drawOverlayFrame(win vaxis.Window, title string) {
+	palette := a.colors()
+	style := palette.overlay
+	width, height := win.Size()
 	fill(win, style)
 	for x := 0; x < width; x++ {
 		win.SetCell(x, 0, vaxis.Cell{Character: vaxis.Character{Grapheme: "─", Width: 1}, Style: style})
@@ -361,28 +399,24 @@ func drawOverlay(root vaxis.Window, width, height int, title string, lines []str
 		win.SetCell(width-1, y, vaxis.Cell{Character: vaxis.Character{Grapheme: "│", Width: 1}, Style: style})
 	}
 	win.PrintTruncate(0, vaxis.Segment{Text: title, Style: mergeStyle(style, palette.title)})
-	for i, line := range lines {
-		if i+2 >= height-1 {
-			break
-		}
-		win.New(2, i+2, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: line, Style: style})
-	}
 }
 
-func drawEmptySelection(win vaxis.Window) {
+func (a *application) drawEmptySelection(win vaxis.Window) {
+	palette := a.colors()
 	win.PrintTruncate(0, vaxis.Segment{Text: " TASK / ATTEMPT", Style: palette.title})
 	if win.Height > 2 {
-		win.PrintTruncate(2, vaxis.Segment{Text: " Select a task with ↑ / ↓", Style: palette.dim})
+		win.PrintTruncate(2, vaxis.Segment{Text: " Select a task with j / k", Style: palette.dim})
 	}
 }
 
-func drawField(win vaxis.Window, row int, label, value string, valueStyle vaxis.Style) int {
+func (a *application) drawField(win vaxis.Window, row int, label, value string, valueStyle vaxis.Style) int {
 	if row >= win.Height {
 		return row
 	}
+	palette := a.colors()
 	win.PrintTruncate(row,
 		vaxis.Segment{Text: fmt.Sprintf(" %-13s", label), Style: palette.dim},
-		vaxis.Segment{Text: value, Style: valueStyle},
+		vaxis.Segment{Text: value, Style: mergeStyle(palette.base, valueStyle)},
 	)
 	return row + 1
 }
@@ -399,7 +433,8 @@ func mergeStyle(base, accent vaxis.Style) vaxis.Style {
 	return base
 }
 
-func stateStyle(state string) vaxis.Style {
+func (a *application) stateStyle(state string) vaxis.Style {
+	palette := a.colors()
 	switch strings.ToLower(state) {
 	case "succeeded", "success", "completed", "complete", "running", "active", "ready":
 		return palette.ok

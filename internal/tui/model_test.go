@@ -51,18 +51,24 @@ func TestModelTracksExplicitConnectivityLostAndRestoredStates(t *testing.T) {
 
 func TestModelMapsActionKeys(t *testing.T) {
 	tests := map[rune]Action{
-		'\r': ActionDetails,
-		'\n': ActionDetails,
-		'l':  ActionLogs,
-		'e':  ActionEvents,
-		'j':  ActionJob,
-		'p':  ActionPod,
-		's':  ActionShell,
-		'r':  ActionRetry,
-		'x':  ActionCancel,
-		'R':  ActionRefresh,
-		'?':  ActionHelp,
-		'q':  ActionBackOrQuit,
+		'\r':   ActionDetails,
+		'\n':   ActionDetails,
+		'l':    ActionLogs,
+		'e':    ActionEvents,
+		'j':    ActionNext,
+		'k':    ActionPrevious,
+		'g':    ActionFirst,
+		'G':    ActionLast,
+		'd':    ActionJob,
+		'p':    ActionPod,
+		's':    ActionShell,
+		'r':    ActionRetry,
+		'\x04': ActionCancel,
+		'R':    ActionRefresh,
+		't':    ActionTheme,
+		'?':    ActionHelp,
+		'h':    ActionBackOrQuit,
+		'q':    ActionBackOrQuit,
 	}
 	model := NewModel(3)
 	for key, want := range tests {

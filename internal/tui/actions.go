@@ -30,6 +30,29 @@ func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
 }
 
 func (a *application) handleKey(key vaxis.Key) (bool, error) {
+	if a.themePicker {
+		switch {
+		case key.MatchString("j"), key.Matches(vaxis.KeyDown):
+			a.themeCursor = min(len(themes)-1, a.themeCursor+1)
+			a.theme = themeName(a.themeCursor)
+		case key.MatchString("k"), key.Matches(vaxis.KeyUp):
+			a.themeCursor = max(0, a.themeCursor-1)
+			a.theme = themeName(a.themeCursor)
+		case key.MatchString("g"):
+			a.themeCursor = 0
+			a.theme = themeName(a.themeCursor)
+		case key.MatchString("G"):
+			a.themeCursor = len(themes) - 1
+			a.theme = themeName(a.themeCursor)
+		case key.Matches(vaxis.KeyEnter):
+			a.selectTheme(a.themeCursor)
+			a.themePicker = false
+		case key.MatchString("t"), key.MatchString("h"), key.MatchString("q"), key.Matches(vaxis.KeyEsc):
+			a.theme = a.themePrevious
+			a.themePicker = false
+		}
+		return false, nil
+	}
 	if a.help {
 		if key.MatchString("?") || key.MatchString("q") || key.Matches(vaxis.KeyEsc) {
 			a.help = false
@@ -51,10 +74,14 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	switch {
 	case key.MatchString("Ctrl+c"):
 		return true, nil
-	case key.Matches(vaxis.KeyUp):
+	case key.MatchString("k"), key.Matches(vaxis.KeyUp):
 		a.moveSelection(-1)
-	case key.Matches(vaxis.KeyDown):
+	case key.MatchString("j"), key.Matches(vaxis.KeyDown):
 		a.moveSelection(1)
+	case key.MatchString("g"):
+		a.moveSelection(-len(a.model.Tasks()))
+	case key.MatchString("G"):
+		a.moveSelection(len(a.model.Tasks()))
 	case key.Matches(vaxis.KeyEnter):
 		a.mode = viewDetails
 		a.narrowDetail = true
@@ -64,7 +91,7 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	case key.MatchString("e"):
 		a.mode = viewEvents
 		a.narrowDetail = true
-	case key.MatchString("j"):
+	case key.MatchString("d"):
 		a.mode = viewJob
 		a.narrowDetail = true
 	case key.MatchString("p"):
@@ -74,7 +101,7 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 		return false, a.shell()
 	case key.MatchString("r"):
 		a.performAction("retry")
-	case key.MatchString("x"):
+	case key.MatchString("Ctrl+d"):
 		if a.model.SelectedTaskID() == "" {
 			a.message = "no task selected"
 		} else {
@@ -83,9 +110,13 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	case key.MatchString("R"):
 		a.message = "refreshing"
 		a.refresh()
+	case key.MatchString("t"):
+		a.themeCursor = int(a.theme)
+		a.themePrevious = a.theme
+		a.themePicker = true
 	case key.MatchString("?"):
 		a.help = true
-	case key.MatchString("q"), key.Matches(vaxis.KeyEsc):
+	case key.MatchString("h"), key.MatchString("q"), key.Matches(vaxis.KeyEsc):
 		switch {
 		case a.narrowDetail:
 			a.narrowDetail = false

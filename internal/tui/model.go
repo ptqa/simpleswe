@@ -47,6 +47,11 @@ const (
 	ActionRetry      Action = "retry"
 	ActionCancel     Action = "cancel"
 	ActionRefresh    Action = "refresh"
+	ActionTheme      Action = "theme"
+	ActionNext       Action = "next"
+	ActionPrevious   Action = "previous"
+	ActionFirst      Action = "first"
+	ActionLast       Action = "last"
 	ActionHelp       Action = "help"
 	ActionBackOrQuit Action = "back-or-quit"
 )
@@ -154,6 +159,14 @@ func (m *Model) ActionForKey(key rune) Action {
 	case 'e':
 		return ActionEvents
 	case 'j':
+		return ActionNext
+	case 'k':
+		return ActionPrevious
+	case 'g':
+		return ActionFirst
+	case 'G':
+		return ActionLast
+	case 'd':
 		return ActionJob
 	case 'p':
 		return ActionPod
@@ -161,13 +174,15 @@ func (m *Model) ActionForKey(key rune) Action {
 		return ActionShell
 	case 'r':
 		return ActionRetry
-	case 'x':
+	case '\x04':
 		return ActionCancel
 	case 'R':
 		return ActionRefresh
+	case 't':
+		return ActionTheme
 	case '?':
 		return ActionHelp
-	case 'q':
+	case 'h', 'q':
 		return ActionBackOrQuit
 	default:
 		return ActionNone
