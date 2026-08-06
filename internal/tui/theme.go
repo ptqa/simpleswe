@@ -58,9 +58,14 @@ var themes = []colorPalette{
 		ok: 0x657b83, warn: 0x8b5d00, bad: 0xdc322f, info: 0x076678, overlay: 0xeee8d5,
 	}),
 	newPalette("Neon Pop", paletteColors{
-		background: 0x120b24, foreground: 0xf7f0ff, header: 0x2a1552, title: 0x00f5ff, dim: 0xc0a9d9,
-		selected: 0xff2bd6, selectedForeground: 0x120b24, border: 0x8b5cf6,
-		ok: 0x39ff88, warn: 0xffe14f, bad: 0xff4d6d, info: 0x44a8ff, overlay: 0x21103d,
+		background: 0x17132b, foreground: 0xe7e1f2, header: 0x302548, title: 0x67d9df, dim: 0xa99fbd,
+		selected: 0xd875b9, selectedForeground: 0x17132b, border: 0x7866b3,
+		ok: 0x65c98a, warn: 0xd8bd58, bad: 0xd8747d, info: 0x679bd1, overlay: 0x261d3e,
+	}),
+	newPalette("Neon Pop Cyan", paletteColors{
+		background: 0x0b1e26, foreground: 0xe6f7fa, header: 0x123744, title: 0x5ff5ff, dim: 0xa1c6cc,
+		selected: 0x2bd9df, selectedForeground: 0x082027, border: 0x3da6b5,
+		ok: 0x67d89a, warn: 0xe5c967, bad: 0xe87887, info: 0x51c9ed, overlay: 0x102c35,
 	}),
 	newPalette("Tokyo Night", paletteColors{
 		background: 0x1a1b26, foreground: 0xc0caf5, header: 0x24283b, title: 0x7dcfff, dim: 0x9aa5ce,
