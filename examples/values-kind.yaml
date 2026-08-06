@@ -44,7 +44,7 @@ config:
               name: opencode-provider
               key: OPENAI_API_KEY
       opencode:
-        command: [opencode, run]
+        command: [opencode, run, --model, openai/gpt-5.6-luna]
       validation:
         commands:
           - [git, diff, --check]
