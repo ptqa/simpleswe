@@ -1,0 +1,121 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  default: standard
+  # These policy/style checks either demand pervasive wrapping/refactoring or
+  # conflict with established optional-value and lifecycle APIs.
+  disable:
+    - gocognit
+    - modernize
+    - nilnil
+    - unparam
+    - wrapcheck
+  enable:
+    - asciicheck
+    - bodyclose
+    - canonicalheader
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gochecknoinits
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - musttag
+    - nilerr
+    - noctx
+    - nosprintfhostport
+    - prealloc
+    - predeclared
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - testifylint
+    - thelper
+    - unconvert
+    - unused
+    - usestdlibvars
+    - wastedassign
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: true
+    staticcheck:
+      checks:
+        - all
+        - -QF1001
+        - -ST1000
+        - -ST1003
+        - -ST1005
+        - -ST1020
+        - -ST1021
+        - -ST1022
+    revive:
+      # errcheck owns error handling; var-naming would rename lifecycle APIs.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: deep-exit
+        - name: dot-imports
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: if-return
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+  exclusions:
+    rules:
+      # Test fixtures intentionally ignore teardown/write errors and use
+      # bounded helpers where production context/security rules do not apply.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - forcetypeassert
+          - gosec
+          - noctx
+          - prealloc
+          - revive
+          - thelper
+      # The TUI stores and propagates the run context through application state;
+      # contextcheck cannot follow that lifecycle across the event loop.
+      - path: internal/tui/
+        linters:
+          - contextcheck
+      # Kubernetes watch cancellation is a normal, explicitly handled shutdown.
+      - path: internal/controller/runtime/runtime\.go
+        text: "error is not nil.*but it returns nil"
+        linters:
+          - nilerr
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  new-from-rev: HEAD
+  max-issues-per-linter: 0
+  max-same-issues: 0

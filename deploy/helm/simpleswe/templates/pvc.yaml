@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "simpleswe.fullname" . }}-data
+  namespace: {{ include "simpleswe.namespace" . }}
+  labels:
+    {{- include "simpleswe.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.storage.accessModes | nindent 4 }}
+  {{- with .Values.storage.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.size | quote }}

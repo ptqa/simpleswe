@@ -1,0 +1,3 @@
+lint:
+  timeout: 10
+  lookup-timeout: 1000

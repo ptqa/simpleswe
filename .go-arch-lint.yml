@@ -1,0 +1,101 @@
+version: 3
+workdir: .
+
+allow:
+  depOnAnyVendor: true
+  deepScan: false
+
+exclude:
+  - cmd
+  - tests
+
+excludeFiles:
+  - "^.*_test\\.go$"
+
+components:
+  task: { in: internal/task }
+  store: { in: internal/store }
+  config: { in: internal/config }
+  api: { in: internal/api }
+  client: { in: internal/client }
+  controller: { in: internal/controller }
+  controllerRuntime: { in: internal/controller/runtime }
+  kubernetesJobs: { in: internal/kubernetes/jobs }
+  worker: { in: internal/worker }
+  workerProtocol: { in: internal/worker/protocol }
+  redaction: { in: internal/redaction }
+  slack: { in: internal/slack }
+  slackSocketmode: { in: internal/slack/socketmode }
+  slackCommands: { in: internal/slack/commands }
+  forgeBitbucket: { in: internal/forge/bitbucket }
+  tui: { in: internal/tui }
+  app: { in: internal/app }
+  run: { in: internal/run }
+
+deps:
+  store:
+    mayDependOn:
+      - task
+      - workerProtocol
+
+  controller:
+    mayDependOn:
+      - config
+      - forgeBitbucket
+      - kubernetesJobs
+      - store
+      - task
+      - workerProtocol
+
+  controllerRuntime:
+    mayDependOn:
+      - api
+      - store
+      - task
+      - workerProtocol
+
+  kubernetesJobs:
+    mayDependOn:
+      - workerProtocol
+
+  worker:
+    mayDependOn:
+      - redaction
+      - workerProtocol
+
+  slack:
+    mayDependOn:
+      - slackCommands
+      - store
+      - workerProtocol
+
+  slackSocketmode:
+    mayDependOn:
+      - slack
+      - store
+      - workerProtocol
+
+  tui:
+    mayDependOn:
+      - client
+
+  app:
+    mayDependOn:
+      - client
+
+  run:
+    mayDependOn:
+      - api
+      - app
+      - client
+      - config
+      - controller
+      - controllerRuntime
+      - forgeBitbucket
+      - slack
+      - slackSocketmode
+      - store
+      - task
+      - tui
+      - worker
+      - workerProtocol

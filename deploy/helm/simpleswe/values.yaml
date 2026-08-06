@@ -1,0 +1,83 @@
+namespace:
+  create: false
+  name: ""
+
+image:
+  repository: ghcr.io/simpleswe/simpleswe
+  # Empty uses the pinned Chart appVersion. A digest takes precedence.
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  name: ""
+
+storage:
+  storageClass: ""
+  size: 10Gi
+  accessModes:
+    - ReadWriteOnce
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+secrets:
+  slack:
+    name: simpleswe-slack
+    keys:
+      botToken: bot-token
+      appToken: app-token
+
+pdb:
+  enabled: false
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # The controller API has no authentication. Empty denies all pod ingress;
+  # kubectl port-forward remains available because it is node-originated.
+  # Entries are native NetworkPolicyPeer objects and may combine namespace and
+  # pod selectors to trust only specific callers.
+  trustedIngress: []
+  # Standard NetworkPolicy cannot select DNS names. These CIDRs permit only
+  # HTTPS and must cover the Kubernetes API, Slack, Bitbucket, and public
+  # repository/AI endpoints. The broad practical default can be replaced with
+  # maintained provider CIDRs where stable ranges are available.
+  httpsCIDRs:
+    - 0.0.0.0/0
+  # Extra native NetworkPolicy egress rules for worker repository access, such
+  # as private Git CIDRs or TCP/22 for SSH. Public HTTPS is covered above.
+  repositoryEgress: []
+
+# This object is emitted as strict internal/config.Config YAML. Secret data is
+# supplied only by the pre-existing Secrets named above or in repositories.
+config:
+  controller:
+    listen_address: ":8080"
+    namespace: ""
+    deadline: 30m
+    max_fix_attempts: 3
+  worker:
+    image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+    command: opencode
+    branch_prefix: simpleswe/
+    deadline: 30m
+  slack:
+    bot_token:
+      file: /run/secrets/slack/bot-token
+    app_token:
+      file: /run/secrets/slack/app-token
+  bitbucket:
+    base_url: https://api.bitbucket.org
+  repositories: {}

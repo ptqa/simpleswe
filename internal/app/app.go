@@ -1,0 +1,367 @@
+package app
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/simpleswe/simpleswe/internal/client"
+)
+
+const (
+	workerManifestPath = "/run/simpleswe/task.json"
+	defaultNamespace   = "simpleswe"
+
+	rootUsage       = "usage: simpleswe <controller|worker|tui|task>"
+	controllerUsage = "usage: simpleswe controller --config PATH --database PATH"
+	workerUsage     = "usage: simpleswe worker [--manifest PATH]"
+	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
+	taskUsage       = "usage: simpleswe task <list|show|cancel|retry|logs>"
+	taskListUsage   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
+	taskShowUsage   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
+	taskCancelUsage = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
+	taskRetryUsage  = "usage: simpleswe task retry [--context NAME] [--namespace NAME] [--address URL] ID"
+	taskLogsUsage   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] ID"
+)
+
+// Dependencies is the composition seam used by the binary entrypoint. The
+// fields keep command dispatch independent from Kubernetes, external commands,
+// the terminal, and the network.
+type Dependencies struct {
+	RunController func(context.Context, string, string, io.Writer, io.Writer) error
+	NewWorkspace  func() (string, func() error, error)
+	RunWorker     func(context.Context, string, string, io.Writer, io.Writer) error
+	RunTUI        func(context.Context, string, string, string, io.Reader, io.Writer, io.Writer) error
+	PortForward   func(context.Context, string, string) (string, func() error, error)
+
+	ListTasks  func(context.Context, string) (client.TaskList, error)
+	ShowTask   func(context.Context, string, string) (client.Task, error)
+	CancelTask func(context.Context, string, string) (client.Task, error)
+	RetryTask  func(context.Context, string, string) (client.Task, error)
+	StreamLogs func(context.Context, string, string, io.Writer) error
+}
+
+// Run dispatches one simpleswe command. It does not derive a child context so
+// cancellation and values reach the selected dependency unchanged.
+func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps Dependencies) error {
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	if len(args) == 0 {
+		return errors.New(rootUsage)
+	}
+
+	switch args[0] {
+	case "controller":
+		return runController(ctx, args[1:], stdout, stderr, deps)
+	case "worker":
+		return runWorker(ctx, args[1:], stdout, stderr, deps)
+	case "tui":
+		return runTUI(ctx, args[1:], stdin, stdout, stderr, deps)
+	case "task":
+		return runTask(ctx, args[1:], stdout, stderr, deps)
+	default:
+		return fmt.Errorf("unknown command %q; %s", args[0], rootUsage)
+	}
+}
+
+func runController(ctx context.Context, args []string, stdout, stderr io.Writer, deps Dependencies) error {
+	configPath, databasePath, ok := parseControllerArgs(args)
+	if !ok {
+		return errors.New(controllerUsage)
+	}
+	if deps.RunController == nil {
+		return errors.New("controller runtime is not configured")
+	}
+	return deps.RunController(ctx, configPath, databasePath, stdout, stderr)
+}
+
+func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
+	manifestPath, ok := parseWorkerArgs(args)
+	if !ok {
+		return errors.New(workerUsage)
+	}
+
+	workspace, closeWorkspace, err := newWorkspace(deps)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, closeWorkspace()) }()
+	if deps.RunWorker == nil {
+		return errors.New("worker runtime is not configured")
+	}
+	return deps.RunWorker(ctx, manifestPath, workspace, stdout, stderr)
+}
+
+func runTUI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
+	flags, ok := parseRuntimeArgs(args, false)
+	if !ok {
+		return errors.New(tuiUsage)
+	}
+	if deps.RunTUI == nil {
+		return errors.New("TUI runtime is not configured")
+	}
+	address, closeForward, err := resolveAddress(ctx, flags, deps)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, closeForward()) }()
+	return deps.RunTUI(ctx, address, flags.kubeContext, flags.namespace, stdin, stdout, stderr)
+}
+
+func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
+	if len(args) == 0 {
+		return errors.New(taskUsage)
+	}
+	command := args[0]
+	usage, ok := taskCommandUsage(command)
+	if !ok {
+		return fmt.Errorf("unknown task command %q; %s", command, taskUsage)
+	}
+	flags, ok := parseRuntimeArgs(args[1:], command != "list")
+	if !ok {
+		return errors.New(usage)
+	}
+
+	address, closeForward, err := resolveAddress(ctx, flags, deps)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, closeForward()) }()
+
+	switch command {
+	case "list":
+		if deps.ListTasks == nil {
+			return errors.New("task list runtime is not configured")
+		}
+		result, err := deps.ListTasks(ctx, address)
+		if err != nil {
+			return err
+		}
+		return encodeJSON(stdout, result)
+	case "show":
+		return runTaskJSON(ctx, address, flags.id, stdout, deps.ShowTask, "task show runtime is not configured")
+	case "cancel":
+		return runTaskJSON(ctx, address, flags.id, stdout, deps.CancelTask, "task cancel runtime is not configured")
+	case "retry":
+		return runTaskJSON(ctx, address, flags.id, stdout, deps.RetryTask, "task retry runtime is not configured")
+	case "logs":
+		if deps.StreamLogs == nil {
+			return errors.New("task logs runtime is not configured")
+		}
+		return deps.StreamLogs(ctx, address, flags.id, stdout)
+	default:
+		return errors.New(usage)
+	}
+}
+
+func runTaskJSON(
+	ctx context.Context,
+	address, id string,
+	stdout io.Writer,
+	run func(context.Context, string, string) (client.Task, error),
+	missing string,
+) error {
+	if run == nil {
+		return errors.New(missing)
+	}
+	result, err := run(ctx, address, id)
+	if err != nil {
+		return err
+	}
+	return encodeJSON(stdout, result)
+}
+
+type runtimeFlags struct {
+	kubeContext string
+	namespace   string
+	address     string
+	id          string
+}
+
+func parseRuntimeArgs(args []string, requireID bool) (runtimeFlags, bool) {
+	flags := runtimeFlags{namespace: defaultNamespace}
+	contextSet := false
+	namespaceSet := false
+	addressSet := false
+	positional := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if positional {
+			return runtimeFlags{}, false
+		}
+		if strings.HasPrefix(arg, "-") {
+			switch arg {
+			case "--context":
+				value, next, ok := nextValue(args, i)
+				if !ok || contextSet {
+					return runtimeFlags{}, false
+				}
+				flags.kubeContext, i = value, next
+				contextSet = true
+			case "--namespace":
+				value, next, ok := nextValue(args, i)
+				if !ok || namespaceSet {
+					return runtimeFlags{}, false
+				}
+				flags.namespace, i = value, next
+				namespaceSet = true
+			case "--address":
+				value, next, ok := nextValue(args, i)
+				if !ok || addressSet {
+					return runtimeFlags{}, false
+				}
+				flags.address, i = value, next
+				addressSet = true
+			default:
+				return runtimeFlags{}, false
+			}
+			continue
+		}
+
+		if !requireID || positional || arg == "" {
+			return runtimeFlags{}, false
+		}
+		flags.id = arg
+		positional = true
+	}
+	if requireID != positional || flags.namespace == "" {
+		return runtimeFlags{}, false
+	}
+	return flags, true
+}
+
+func parseControllerArgs(args []string) (configPath, databasePath string, ok bool) {
+	for i := 0; i < len(args); i++ {
+		value, next, valid := namedValue(args, i, "--config")
+		if valid {
+			if configPath != "" {
+				return "", "", false
+			}
+			configPath, i = value, next
+			continue
+		}
+		value, next, valid = namedValue(args, i, "--database")
+		if valid {
+			if databasePath != "" {
+				return "", "", false
+			}
+			databasePath, i = value, next
+			continue
+		}
+		return "", "", false
+	}
+	return configPath, databasePath, configPath != "" && databasePath != ""
+}
+
+func parseWorkerArgs(args []string) (string, bool) {
+	manifestPath := workerManifestPath
+	manifestSet := false
+	for i := 0; i < len(args); i++ {
+		value, next, valid := namedValue(args, i, "--manifest")
+		if !valid || manifestSet {
+			return "", false
+		}
+		manifestPath, i = value, next
+		manifestSet = true
+	}
+	return manifestPath, true
+}
+
+func namedValue(args []string, index int, name string) (string, int, bool) {
+	if index >= len(args) || args[index] != name || index+1 >= len(args) || args[index+1] == "" || strings.HasPrefix(args[index+1], "-") {
+		return "", index, false
+	}
+	return args[index+1], index + 1, true
+}
+
+func nextValue(args []string, index int) (string, int, bool) {
+	if index+1 >= len(args) || args[index+1] == "" || strings.HasPrefix(args[index+1], "-") {
+		return "", index, false
+	}
+	return args[index+1], index + 1, true
+}
+
+func taskCommandUsage(command string) (string, bool) {
+	switch command {
+	case "list":
+		return taskListUsage, true
+	case "show":
+		return taskShowUsage, true
+	case "cancel":
+		return taskCancelUsage, true
+	case "retry":
+		return taskRetryUsage, true
+	case "logs":
+		return taskLogsUsage, true
+	default:
+		return "", false
+	}
+}
+
+func resolveAddress(ctx context.Context, flags runtimeFlags, deps Dependencies) (string, func() error, error) {
+	if flags.address != "" {
+		return flags.address, func() error { return nil }, nil
+	}
+	if deps.PortForward == nil {
+		return "", nil, errors.New("port-forward runtime is not configured")
+	}
+	address, closeForward, err := deps.PortForward(ctx, flags.kubeContext, flags.namespace)
+	if err != nil {
+		return "", nil, err
+	}
+	if address == "" {
+		if closeForward != nil {
+			_ = closeForward()
+		}
+		return "", nil, errors.New("port-forward returned an empty address")
+	}
+	if closeForward == nil {
+		closeForward = func() error { return nil }
+	}
+	return address, closeForward, nil
+}
+
+func newWorkspace(deps Dependencies) (string, func() error, error) {
+	if deps.NewWorkspace != nil {
+		workspace, closeWorkspace, err := deps.NewWorkspace()
+		if err != nil {
+			return "", nil, err
+		}
+		if workspace == "" {
+			return "", nil, errors.New("workspace path is empty")
+		}
+		if closeWorkspace == nil {
+			closeWorkspace = func() error { return os.RemoveAll(workspace) }
+		}
+		return workspace, closeWorkspace, nil
+	}
+	workspace, err := os.MkdirTemp("", "simpleswe-worker-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create worker workspace: %w", err)
+	}
+	return workspace, func() error { return os.RemoveAll(workspace) }, nil
+}
+
+func encodeJSON(output io.Writer, value any) error {
+	if err := json.NewEncoder(output).Encode(value); err != nil {
+		return fmt.Errorf("encode command output: %w", err)
+	}
+	return nil
+}

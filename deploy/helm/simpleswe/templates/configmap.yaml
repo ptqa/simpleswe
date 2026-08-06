@@ -1,0 +1,12 @@
+{{- $config := deepCopy .Values.config -}}
+{{- $_ := set $config.controller "namespace" (include "simpleswe.namespace" .) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "simpleswe.fullname" . }}-config
+  namespace: {{ include "simpleswe.namespace" . }}
+  labels:
+    {{- include "simpleswe.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml $config | nindent 4 }}

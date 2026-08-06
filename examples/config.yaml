@@ -1,0 +1,29 @@
+controller:
+  listen_address: ":8080"
+  namespace: simpleswe
+  deadline: 30m
+  max_fix_attempts: 3
+worker:
+  image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+  command: opencode
+  branch_prefix: simpleswe/
+  deadline: 30m
+slack:
+  bot_token:
+    file: /run/secrets/slack/bot-token
+  app_token:
+    file: /run/secrets/slack/app-token
+bitbucket:
+  base_url: https://api.bitbucket.org
+repositories:
+  widget:
+    clone_url: https://bitbucket.org/acme/widget.git
+    default_branch: main
+    worker:
+      image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+    git:
+      ssh_secret: widget-git-ssh
+    bitbucket:
+      workspace: acme
+      repository: widget
+      credentials_secret_name: bitbucket-widget

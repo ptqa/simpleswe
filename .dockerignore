@@ -1,0 +1,14 @@
+.git
+.gitignore
+.dockerignore
+simpleswe
+tmp
+*.db
+*.sqlite
+*.sqlite3
+*.env
+.env
+.env.*
+*.key
+*.pem
+node_modules

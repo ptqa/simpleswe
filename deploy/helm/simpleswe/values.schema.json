@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string", "not": { "const": "latest" } },
+        "digest": { "type": "string", "pattern": "^(|sha256:[a-f0-9]{64})$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "config": {
+      "type": "object",
+      "properties": {
+        "repositories": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/definitions/repository" }
+        }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "required": ["enabled", "trustedIngress", "httpsCIDRs", "repositoryEgress"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "trustedIngress": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyPeer" }
+        },
+        "httpsCIDRs": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "repositoryEgress": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "repository": {
+      "type": "object",
+      "required": ["bitbucket"],
+      "properties": {
+        "bitbucket": {
+          "type": "object",
+          "required": ["workspace", "repository", "credentials_secret_name"],
+          "properties": {
+            "workspace": { "type": "string", "minLength": 1 },
+            "repository": { "type": "string", "minLength": 1 },
+            "credentials_secret_name": { "$ref": "#/definitions/kubernetesName" }
+          }
+        }
+      }
+    },
+    "kubernetesName": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    },
+    "networkPolicyPeer": {
+      "type": "object",
+      "minProperties": 1,
+      "properties": {
+        "ipBlock": { "type": "object" },
+        "namespaceSelector": { "type": "object" },
+        "podSelector": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

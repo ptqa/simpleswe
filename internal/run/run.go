@@ -1,0 +1,456 @@
+package run
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	slackapi "github.com/slack-go/slack"
+	slacksocket "github.com/slack-go/slack/socketmode"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
+	"github.com/simpleswe/simpleswe/internal/api"
+	"github.com/simpleswe/simpleswe/internal/app"
+	"github.com/simpleswe/simpleswe/internal/client"
+	"github.com/simpleswe/simpleswe/internal/config"
+	"github.com/simpleswe/simpleswe/internal/controller"
+	controllerruntime "github.com/simpleswe/simpleswe/internal/controller/runtime"
+	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	internalslack "github.com/simpleswe/simpleswe/internal/slack"
+	internalSocketMode "github.com/simpleswe/simpleswe/internal/slack/socketmode"
+	"github.com/simpleswe/simpleswe/internal/store"
+	"github.com/simpleswe/simpleswe/internal/tui"
+	"github.com/simpleswe/simpleswe/internal/worker"
+	"github.com/simpleswe/simpleswe/internal/worker/protocol"
+)
+
+const (
+	controllerService = "simpleswe"
+	controllerPort    = 8080
+	localPort         = 18080
+)
+
+// Dependencies returns the deployable implementations used by cmd/simpleswe.
+func Dependencies() app.Dependencies {
+	return app.Dependencies{
+		RunController: RunController,
+		NewWorkspace:  newWorkspace,
+		RunWorker:     RunWorker,
+		RunTUI:        runTUI,
+		PortForward:   portForward,
+		ListTasks: func(ctx context.Context, address string) (client.TaskList, error) {
+			return client.New(address, nil).ListTasks(ctx, client.ListOptions{})
+		},
+		ShowTask: func(ctx context.Context, address, id string) (client.Task, error) {
+			return client.New(address, nil).ShowTask(ctx, id)
+		},
+		CancelTask: func(ctx context.Context, address, id string) (client.Task, error) {
+			return client.New(address, nil).CancelTask(ctx, id)
+		},
+		RetryTask: func(ctx context.Context, address, id string) (client.Task, error) {
+			return client.New(address, nil).RetryTask(ctx, id)
+		},
+		StreamLogs: func(ctx context.Context, address, id string, output io.Writer) error {
+			return client.New(address, nil).StreamLogs(ctx, id, client.LogOptions{Follow: true, TailLines: 200}, func(line string) error {
+				_, err := fmt.Fprintln(output, line)
+				return err
+			})
+		},
+	}
+}
+
+func RunWorker(ctx context.Context, manifestPath, workspace string, stdout, _ io.Writer) error {
+	roots := []string{"/run/secrets"}
+	if configured := os.Getenv("SIMPLESWE_SECRET_PATHS"); configured != "" {
+		roots = append(roots, filepath.SplitList(configured)...)
+	}
+	var secrets []string
+	seen := make(map[string]struct{})
+	for _, root := range roots {
+		values, err := mountedSecrets(root)
+		if err != nil {
+			return err
+		}
+		for _, value := range values {
+			if _, ok := seen[value]; !ok {
+				secrets = append(secrets, value)
+				seen[value] = struct{}{}
+			}
+		}
+	}
+	return (worker.Runner{ManifestPath: manifestPath, WorkspaceDir: workspace, Output: stdout, Secrets: secrets}).Run(ctx)
+}
+
+func newWorkspace() (string, func() error, error) {
+	parent, err := os.MkdirTemp("", "simpleswe-worker-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create worker workspace parent: %w", err)
+	}
+	return filepath.Join(parent, "workspace"), func() error { return os.RemoveAll(parent) }, nil
+}
+
+func runTUI(ctx context.Context, address, kubeContext, namespace string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return tui.NewRunner(client.New(address, nil), tui.Options{
+		Address: address, KubeContext: kubeContext, Namespace: namespace,
+		Stdin: stdin, Stdout: stdout, Stderr: stderr,
+	}).Run(ctx)
+}
+
+func portForward(ctx context.Context, kubeContext, namespace string) (string, func() error, error) {
+	forward, err := client.StartPortForward(ctx, client.PortForwardOptions{
+		KubeContext: kubeContext, Namespace: namespace, Service: controllerService,
+		LocalPort: localPort, RemotePort: controllerPort,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := forward.WaitReady(readyCtx); err != nil {
+		_ = forward.Close()
+		return "", nil, err
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", localPort), forward.Close, nil
+}
+
+func RunController(ctx context.Context, configPath, databasePath string, stdout, stderr io.Writer) (runErr error) {
+	// #nosec G304 -- configPath is the operator-supplied controller config path.
+	cfgFile, err := os.Open(configPath)
+	if err != nil {
+		return fmt.Errorf("open config: %w", err)
+	}
+	cfg, err := config.Load(cfgFile)
+	closeErr := cfgFile.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close config: %w", closeErr)
+	}
+
+	db, err := store.Open(ctx, databasePath)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, db.Close()) }()
+
+	restConfig, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("load in-cluster Kubernetes config: %w", err)
+	}
+	kube, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return fmt.Errorf("create Kubernetes client: %w", err)
+	}
+
+	botToken, err := readSecret(cfg.Slack.BotToken, "SIMPLESWE_SLACK_BOT_TOKEN", "SIMPLESWE_SLACK_BOT_TOKEN_FILE", "/run/secrets/slack/bot-token", "Slack bot token")
+	if err != nil {
+		return err
+	}
+	appToken, err := readSecret(cfg.Slack.AppToken, "SIMPLESWE_SLACK_APP_TOKEN", "SIMPLESWE_SLACK_APP_TOKEN_FILE", "/run/secrets/slack/app-token", "Slack app token")
+	if err != nil {
+		return err
+	}
+	forge, err := newBitbucketRouter(cfg, "/run/secrets/bitbucket")
+	if err != nil {
+		return err
+	}
+
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	slackClient := slackapi.New(botToken, slackapi.OptionAppLevelToken(appToken))
+	sdkClient := slacksocket.New(slackClient)
+	sdkSocket := internalSocketMode.NewSDKSocket(sdkClient)
+	messenger := internalSocketMode.NewMessenger(internalSocketMode.SDKChatAPI{Client: slackClient})
+	notifier := &pullRequestNotifier{store: db, messenger: messenger}
+	control, err := controller.New(db, kube, cfg, notifier, forge)
+	if err != nil {
+		return err
+	}
+	backend := controllerruntime.NewBackend(db, control)
+	runtime, err := controllerruntime.NewRuntime(kube, db, control, backend, controllerruntime.Options{
+		Namespace: cfg.Controller.Namespace, SecretRetention: time.Hour, Logger: logger,
+		NotifyPendingPullRequests: control.NotifyPendingPullRequests,
+	})
+	if err != nil {
+		return err
+	}
+	slackHandler := internalslack.NewHandler(lifecycleAdapter{controller: control}, messenger)
+	transport := internalSocketMode.NewTransport(sdkSocket, db, slackHandler, logger)
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metricsHandler{store: db})
+	mux.Handle("/", api.NewHandler(backend))
+	server := &http.Server{
+		Addr: cfg.Controller.ListenAddress, Handler: mux,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
+	}
+	logger.InfoContext(ctx, "controller starting", "address", cfg.Controller.ListenAddress, "namespace", cfg.Controller.Namespace)
+	return runControllerComponents(ctx, server, runtime.Run, sdkSocket.Run, transport.Run)
+}
+
+type lifecycleAdapter struct{ controller *controller.Controller }
+
+func (a lifecycleAdapter) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
+	return a.controller.CreateTask(ctx, params)
+}
+func (a lifecycleAdapter) CreateTaskWithOrigin(ctx context.Context, params store.CreateTaskParams, origin protocol.SlackOrigin) (store.Task, error) {
+	return a.controller.CreateTaskWithOrigin(ctx, params, origin)
+}
+func (a lifecycleAdapter) GetTask(ctx context.Context, id string) (store.Task, error) {
+	return a.controller.GetTask(ctx, id)
+}
+func (a lifecycleAdapter) ListAttempts(ctx context.Context, id string) ([]store.Attempt, error) {
+	return a.controller.ListAttempts(ctx, id)
+}
+func (a lifecycleAdapter) RequestCancellation(ctx context.Context, id string) error {
+	current, err := a.controller.GetTask(ctx, id)
+	if err != nil {
+		return err
+	}
+	if cancellationAlreadyApplied(current) {
+		return nil
+	}
+	return a.controller.Cancel(ctx, id)
+}
+
+func cancellationAlreadyApplied(current store.Task) bool {
+	return current.CancellationRequested || current.State == "cancelled"
+}
+
+func (a lifecycleAdapter) RetryTaskWithKey(ctx context.Context, id, key string) (store.Attempt, error) {
+	return a.controller.RetryWithKey(ctx, id, key)
+}
+
+type pullRequestNotifier struct {
+	store     *store.Store
+	messenger internalslack.Messenger
+}
+
+func (n *pullRequestNotifier) PostPullRequest(ctx context.Context, taskID, url string) error {
+	task, err := n.store.GetTask(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	if task.SlackOrigin.ChannelID == "" {
+		return nil
+	}
+	return n.messenger.PostMessage(ctx, task.SlackOrigin, "Pull request: "+url)
+}
+
+func runControllerComponents(ctx context.Context, server *http.Server, components ...func(context.Context) error) error {
+	componentCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan error, len(components)+1)
+	var wg sync.WaitGroup
+	start := func(name string, run func(context.Context) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := run(componentCtx)
+			if componentCtx.Err() != nil && (err == nil || errors.Is(err, context.Canceled)) {
+				err = nil
+			}
+			if err == nil && componentCtx.Err() == nil {
+				err = fmt.Errorf("%s stopped unexpectedly", name)
+			}
+			results <- err
+		}()
+	}
+	start("HTTP server", func(context.Context) error {
+		err := server.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	})
+	for i, component := range components {
+		start(fmt.Sprintf("controller component %d", i+1), component)
+	}
+
+	var first error
+	select {
+	case <-ctx.Done():
+	case first = <-results:
+	}
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	shutdownErr := server.Shutdown(shutdownCtx)
+	shutdownCancel()
+	wg.Wait()
+	close(results)
+	for err := range results {
+		if first == nil && err != nil {
+			first = err
+		}
+	}
+	if ctx.Err() != nil && first == nil {
+		return nil
+	}
+	return errors.Join(first, shutdownErr)
+}
+
+func readSecret(source config.SecretSource, valueEnv, fileEnv, defaultFile, description string) (string, error) {
+	file := source.File
+	env := source.Env
+	if file == "" && env == "" {
+		if named := os.Getenv(fileEnv); named != "" {
+			file = named
+		} else if _, err := os.Stat(defaultFile); err == nil {
+			file = defaultFile
+		} else {
+			env = valueEnv
+		}
+	}
+	var value string
+	if file != "" {
+		// #nosec G304,G703 -- file is an explicit trusted config or environment setting.
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return "", fmt.Errorf("read %s file: %w", description, err)
+		}
+		if len(data) > 1<<20 {
+			return "", fmt.Errorf("%s file is too large", description)
+		}
+		value = strings.TrimSpace(string(data))
+	} else {
+		value = strings.TrimSpace(os.Getenv(env))
+	}
+	if value == "" {
+		return "", fmt.Errorf("%s is not configured", description)
+	}
+	return value, nil
+}
+
+type bitbucketRepository struct {
+	workspace  string
+	repository string
+}
+
+type bitbucketRouter map[bitbucketRepository]*bitbucket.Client
+
+func newBitbucketRouter(cfg config.Config, credentialRoot string) (bitbucketRouter, error) {
+	router := make(bitbucketRouter, len(cfg.Repositories))
+	credentials := make(map[bitbucketRepository]string, len(cfg.Repositories))
+	for _, repository := range cfg.Repositories {
+		key := bitbucketRoute(repository.Bitbucket.Workspace, repository.Bitbucket.Repository)
+		secretName := repository.Bitbucket.CredentialsSecret
+		if key.workspace == "" || key.repository == "" || secretName == "" {
+			return nil, errors.New("Bitbucket workspace, repository, and credentials Secret name are required")
+		}
+		if filepath.Base(secretName) != secretName || secretName == "." || strings.Contains(secretName, `\`) {
+			return nil, fmt.Errorf("unsafe Bitbucket credentials Secret name %q", secretName)
+		}
+		if previous, exists := credentials[key]; exists {
+			if previous != secretName {
+				return nil, fmt.Errorf("conflicting Bitbucket credentials configured for %s/%s", repository.Bitbucket.Workspace, repository.Bitbucket.Repository)
+			}
+			continue
+		}
+		username, err := readBitbucketCredential(credentialRoot, secretName, "username")
+		if err != nil {
+			return nil, err
+		}
+		appPassword, err := readBitbucketCredential(credentialRoot, secretName, "app-password")
+		if err != nil {
+			return nil, err
+		}
+		client, err := bitbucket.NewClient(cfg.Bitbucket.BaseURL, username, appPassword)
+		if err != nil {
+			return nil, err
+		}
+		router[key] = client
+		credentials[key] = secretName
+	}
+	return router, nil
+}
+
+func (r bitbucketRouter) CreatePullRequest(ctx context.Context, workspace, repository string, input bitbucket.CreatePullRequestRequest) (bitbucket.PullRequest, error) {
+	client, err := r.client(workspace, repository)
+	if err != nil {
+		return bitbucket.PullRequest{}, err
+	}
+	return client.CreatePullRequest(ctx, workspace, repository, input)
+}
+
+func (r bitbucketRouter) FindPullRequest(ctx context.Context, workspace, repository, sourceBranch, taskMarker string) (bitbucket.PullRequest, bool, error) {
+	client, err := r.client(workspace, repository)
+	if err != nil {
+		return bitbucket.PullRequest{}, false, err
+	}
+	return client.FindPullRequest(ctx, workspace, repository, sourceBranch, taskMarker)
+}
+
+func (r bitbucketRouter) client(workspace, repository string) (*bitbucket.Client, error) {
+	client := r[bitbucketRoute(workspace, repository)]
+	if client == nil {
+		return nil, fmt.Errorf("no Bitbucket client configured for %s/%s", workspace, repository)
+	}
+	return client, nil
+}
+
+func bitbucketRoute(workspace, repository string) bitbucketRepository {
+	return bitbucketRepository{workspace: strings.ToLower(workspace), repository: strings.ToLower(repository)}
+}
+
+func readBitbucketCredential(root, secretName, key string) (string, error) {
+	path := filepath.Join(root, secretName, key)
+	// #nosec G304 -- secretName is validated as one path component by newBitbucketRouter.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read Bitbucket credential %s/%s: %w", secretName, key, err)
+	}
+	if len(data) > 1<<20 {
+		return "", fmt.Errorf("Bitbucket credential %s/%s is too large", secretName, key)
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return "", fmt.Errorf("Bitbucket credential %s/%s is empty", secretName, key)
+	}
+	return value, nil
+}
+
+func mountedSecrets(root string) (_ []string, resultErr error) {
+	rootFS, err := os.OpenRoot(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("open mounted secret root: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, rootFS.Close()) }()
+	var values []string
+	err = fs.WalkDir(rootFS.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		data, err := rootFS.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if len(data) > 1<<20 {
+			return fmt.Errorf("mounted secret file is too large: %s", path)
+		}
+		value := strings.TrimSpace(string(data))
+		if value != "" {
+			values = append(values, value)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read mounted secrets: %w", err)
+	}
+	return values, nil
+}

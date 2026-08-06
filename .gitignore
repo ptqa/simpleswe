@@ -1,0 +1,10 @@
+/simpleswe
+/tmp/
+*.db
+*.sqlite
+*.sqlite3
+*.env
+.env
+.env.*
+*.key
+*.pem

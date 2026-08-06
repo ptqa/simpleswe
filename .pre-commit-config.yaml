@@ -1,0 +1,40 @@
+repos:
+  - repo: local
+    hooks:
+      - id: golangci-lint
+        name: golangci-lint
+        entry: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+        language: system
+        pass_filenames: false
+        types:
+          - go
+
+      - id: go-arch-lint
+        name: go architecture boundaries
+        entry: go run github.com/fe3dback/go-arch-lint@v1.15.0 check --project-path .
+        language: system
+        files: ^((cmd|internal)/.*\.go|\.go-arch-lint\.yml)$
+        pass_filenames: false
+
+      - id: go-unit-tests
+        name: go unit tests
+        entry: go test -race -cover ./...
+        language: system
+        pass_filenames: false
+        types:
+          - go
+
+      - id: govulncheck
+        name: govulncheck
+        entry: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+        language: system
+        pass_filenames: false
+        types:
+          - go
+
+      - id: vacuum-openapi
+        name: vacuum openapi lint
+        entry: go run github.com/daveshanley/vacuum@v0.29.2 lint --no-banner --no-style --no-update-check --ruleset vacuum.ruleset.yaml --fail-severity warn api/openapi.yaml
+        language: system
+        files: ^api/openapi\.yaml$
+        pass_filenames: false

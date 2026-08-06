@@ -1,0 +1,71 @@
+namespace:
+  create: true
+  name: simpleswe
+
+image:
+  repository: ghcr.io/simpleswe/simpleswe
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull
+
+storage:
+  storageClass: gp3
+  size: 20Gi
+
+nodeSelector:
+  kubernetes.io/os: linux
+  kubernetes.io/arch: amd64
+
+secrets:
+  slack:
+    name: simpleswe-slack
+
+config:
+  controller:
+    listen_address: ":8080"
+    namespace: simpleswe
+    deadline: 30m
+    max_fix_attempts: 3
+  worker:
+    image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+    command: opencode
+    branch_prefix: simpleswe/
+    deadline: 30m
+  slack:
+    bot_token:
+      file: /run/secrets/slack/bot-token
+    app_token:
+      file: /run/secrets/slack/app-token
+  bitbucket:
+    base_url: https://api.bitbucket.org
+  repositories:
+    widget:
+      clone_url: https://bitbucket.org/acme/widget.git
+      default_branch: main
+      worker:
+        image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+        node_selector:
+          kubernetes.io/os: linux
+          kubernetes.io/arch: amd64
+      git:
+        ssh_secret: widget-git-ssh
+      bitbucket:
+        workspace: acme
+        repository: widget
+        credentials_secret_name: bitbucket-widget
+    gadget:
+      clone_url: https://bitbucket.org/acme/gadget.git
+      default_branch: main
+      worker:
+        image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+        node_selector:
+          kubernetes.io/os: linux
+          kubernetes.io/arch: amd64
+      git:
+        ssh_secret: gadget-git-ssh
+      bitbucket:
+        workspace: acme
+        repository: gadget
+        credentials_secret_name: bitbucket-gadget

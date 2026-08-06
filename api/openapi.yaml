@@ -1,0 +1,869 @@
+openapi: 3.1.0
+info:
+  title: SimpleSWE API
+  version: 0.1.0
+  description: |
+    API for submitting and observing software-engineering tasks.
+
+    The service is exposed as a ClusterIP and is reached through port-forward
+    only. No authentication scheme is defined yet; network access is the
+    current access boundary and must not be treated as a substitute for
+    authentication when this service is exposed beyond the cluster.
+servers:
+  - url: /
+    description: Service-relative URL; use through a ClusterIP or port-forward.
+security: []
+tags:
+  - name: health
+  - name: tasks
+paths:
+  /v1/health:
+    get:
+      tags: [health]
+      operationId: get_health
+      summary: Get service health
+      responses:
+        '200':
+          description: Service health.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /v1/tasks:
+    get:
+      tags: [tasks]
+      operationId: list_tasks
+      summary: List tasks
+      parameters:
+        - $ref: '#/components/parameters/State'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Tasks ordered from newest to oldest.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      tags: [tasks]
+      operationId: create_task
+      summary: Create a task
+      description: Queue a software-engineering task for asynchronous execution.
+      requestBody:
+        required: true
+        description: Task repository and instruction to submit for execution.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Task accepted and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /v1/tasks/{taskID}:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    get:
+      tags: [tasks]
+      operationId: get_task
+      summary: Get a task
+      responses:
+        '200':
+          description: Task state and results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tasks/{taskID}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    post:
+      tags: [tasks]
+      operationId: cancel_task
+      summary: Request task cancellation
+      responses:
+        '202':
+          description: Cancellation accepted; cancellation_requested is true until the task reaches cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/tasks/{taskID}/retry:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    post:
+      tags: [tasks]
+      operationId: retry_task
+      summary: Retry a task
+      responses:
+        '202':
+          description: A new immutable attempt was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /v1/tasks/{taskID}/attempts:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    get:
+      tags: [tasks]
+      operationId: list_task_attempts
+      summary: List immutable task attempts
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Immutable execution attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttemptListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tasks/{taskID}/events:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    get:
+      tags: [tasks]
+      operationId: list_task_events
+      summary: List task transition events
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Append-only task state transition events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventListResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tasks/{taskID}/logs:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    get:
+      tags: [tasks]
+      operationId: get_task_logs
+      summary: Read task logs
+      description: Set follow=true to receive Server-Sent Events until the stream closes.
+      parameters:
+        - name: follow
+          in: query
+          required: false
+          description: When true, return a live Server-Sent Events stream.
+          schema:
+            type: boolean
+            default: false
+        - name: attempt_id
+          in: query
+          required: false
+          description: Restrict logs to one attempt; defaults to the current attempt.
+          schema:
+            type: string
+            minLength: 1
+        - name: tail_lines
+          in: query
+          required: false
+          description: Number of existing lines to return before following.
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+            default: 200
+      responses:
+        '200':
+          description: Plain text logs, or Server-Sent Events when follow=true.
+          content:
+            text/plain:
+              schema:
+                type: string
+            text/event-stream:
+              schema:
+                type: string
+                description: UTF-8 Server-Sent Events stream.
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/tasks/{taskID}/pull-request:
+    parameters:
+      - $ref: '#/components/parameters/TaskID'
+    get:
+      tags: [tasks]
+      operationId: get_task_pull_request
+      summary: Get the task pull-request result
+      responses:
+        '200':
+          description: Pull-request result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PullRequestResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    TaskID:
+      name: taskID
+      in: path
+      required: true
+      description: Stable task identifier.
+      schema:
+        type: string
+        minLength: 1
+    State:
+      name: state
+      in: query
+      required: false
+      description: Filter by task state.
+      schema:
+        type: array
+        items:
+          $ref: '#/components/schemas/TaskState'
+      style: form
+      explode: true
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum number of items to return, from 1 to 100.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor returned by the service.
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    BadRequest:
+      description: Request is malformed or contains invalid parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: Requested transition is not valid for the current task state.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: The requested task or result does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ServiceUnavailable:
+      description: Service is unavailable or degraded.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnprocessableEntity:
+      description: Request is syntactically valid but fails validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    CreateTaskRequest:
+      type: object
+      description: Repository and instruction submitted as a new task.
+      additionalProperties: false
+      required: [repository, prompt]
+      example:
+        repository: https://github.com/simpleswe/example-service
+        prompt: Add retry handling to the task worker
+      properties:
+        repository:
+          type: string
+          minLength: 1
+          description: Repository URL or provider reference without embedded credentials.
+        prompt:
+          type: string
+          minLength: 1
+          description: User instruction for the software-engineering task.
+        slack_origin:
+          $ref: '#/components/schemas/SlackOrigin'
+        slack_event_id:
+          type: string
+          minLength: 1
+          description: Provider event identifier used for idempotency and tracing.
+
+    ErrorResponse:
+      type: object
+      description: Error envelope returned when a request cannot be completed.
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+
+    Error:
+      type: object
+      description: Stable error code, safe message, and optional structured details.
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          minLength: 1
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          minLength: 1
+          description: Human-readable error message safe to return to callers.
+        details:
+          type: object
+          description: Non-secret structured details for this error.
+          additionalProperties: true
+
+    HealthResponse:
+      type: object
+      description: Response containing the current service health.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Health'
+
+    Health:
+      type: object
+      description: Service status and health of its dependencies.
+      additionalProperties: false
+      required: [status, service, checked_at, dependencies]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+          enum: [simpleswe]
+        checked_at:
+          type: string
+          format: date-time
+        dependencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/HealthDependency'
+
+    HealthDependency:
+      type: object
+      description: Health status reported for one service dependency.
+      additionalProperties: false
+      required: [name, status]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        status:
+          type: string
+          enum: [ok, degraded, unavailable]
+        message:
+          type: string
+
+    TaskResponse:
+      type: object
+      description: Response containing one task and its current results.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/Task'
+
+    TaskListResponse:
+      type: object
+      description: Paginated response containing tasks ordered newest first.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [tasks, next_cursor]
+          properties:
+            tasks:
+              type: array
+              items:
+                $ref: '#/components/schemas/Task'
+            next_cursor:
+              type: string
+              description: Empty when there are no more results.
+
+    Task:
+      type: object
+      description: Task request, lifecycle state, execution records, and results.
+      additionalProperties: false
+      required:
+        - task_id
+        - repository
+        - prompt
+        - state
+        - created_at
+        - updated_at
+        - cancellation_requested
+        - validation_runs
+        - git_result
+        - pull_request
+      properties:
+        task_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        repository:
+          type: string
+          minLength: 1
+          description: Repository reference without embedded credentials.
+          readOnly: true
+        prompt:
+          type: string
+          minLength: 1
+          readOnly: true
+        state:
+          $ref: '#/components/schemas/TaskState'
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+        current_attempt_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        cancellation_requested:
+          type: boolean
+          description: True after cancellation is accepted and before the task reaches cancelled.
+          readOnly: true
+        slack_origin:
+          $ref: '#/components/schemas/SlackOrigin'
+          readOnly: true
+        slack_event_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        kubernetes_job:
+          $ref: '#/components/schemas/KubernetesJobState'
+          readOnly: true
+        kubernetes_pod:
+          $ref: '#/components/schemas/KubernetesPodState'
+          readOnly: true
+        validation_runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationRun'
+          readOnly: true
+        git_result:
+          $ref: '#/components/schemas/GitResult'
+          readOnly: true
+        pull_request:
+          $ref: '#/components/schemas/PullRequestResult'
+          readOnly: true
+
+    TaskState:
+      type: string
+      description: Lifecycle state of a task.
+      enum:
+        - received
+        - queued
+        - creating_job
+        - job_pending
+        - running
+        - agent_running
+        - validating
+        - committing
+        - pushing
+        - creating_pr
+        - pr_open
+        - waiting_ci
+        - waiting_review
+        - ready
+        - failed
+        - cancelled
+
+    SlackOrigin:
+      type: object
+      description: Slack event metadata that originated the task, when available.
+      additionalProperties: false
+      required: [workspace_id, channel_id, message_ts]
+      properties:
+        workspace_id:
+          type: string
+          minLength: 1
+          description: Slack workspace identifier, not a credential.
+        channel_id:
+          type: string
+          minLength: 1
+        message_ts:
+          type: string
+          minLength: 1
+        thread_ts:
+          type: string
+          minLength: 1
+        user_id:
+          type: string
+          minLength: 1
+
+    ResourceIdentity:
+      type: object
+      description: Identity of a Kubernetes resource associated with an attempt.
+      additionalProperties: false
+      required: [kind, name]
+      properties:
+        api_version:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          minLength: 1
+        namespace:
+          type: string
+          minLength: 1
+        name:
+          type: string
+          minLength: 1
+        uid:
+          type: string
+          minLength: 1
+
+    KubernetesJobState:
+      type: object
+      description: Observed state of the Kubernetes Job for an attempt.
+      additionalProperties: false
+      required: [state, resource_identity]
+      properties:
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, unknown]
+        resource_identity:
+          $ref: '#/components/schemas/ResourceIdentity'
+        reason:
+          type: string
+        message:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    KubernetesPodState:
+      type: object
+      description: Observed state of the Kubernetes Pod for an attempt.
+      additionalProperties: false
+      required: [state, resource_identity]
+      properties:
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, unknown]
+        resource_identity:
+          $ref: '#/components/schemas/ResourceIdentity'
+        reason:
+          type: string
+        message:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    Attempt:
+      type: object
+      additionalProperties: false
+      description: Immutable execution record; retry creates a new attempt rather than updating this one.
+      required:
+        - attempt_id
+        - task_id
+        - number
+        - immutable
+        - state
+        - created_at
+        - validation_runs
+        - git_result
+        - pull_request
+      properties:
+        attempt_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        task_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        number:
+          type: integer
+          minimum: 1
+          readOnly: true
+        immutable:
+          type: boolean
+          enum: [true]
+          readOnly: true
+        state:
+          $ref: '#/components/schemas/TaskState'
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        started_at:
+          type: string
+          format: date-time
+          readOnly: true
+        completed_at:
+          type: string
+          format: date-time
+          readOnly: true
+        kubernetes_job:
+          $ref: '#/components/schemas/KubernetesJobState'
+          readOnly: true
+        kubernetes_pod:
+          $ref: '#/components/schemas/KubernetesPodState'
+          readOnly: true
+        validation_runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationRun'
+          readOnly: true
+        git_result:
+          $ref: '#/components/schemas/GitResult'
+          readOnly: true
+        pull_request:
+          $ref: '#/components/schemas/PullRequestResult'
+          readOnly: true
+
+    AttemptListResponse:
+      type: object
+      description: Paginated response containing immutable task attempts.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [attempts, next_cursor]
+          properties:
+            attempts:
+              type: array
+              items:
+                $ref: '#/components/schemas/Attempt'
+            next_cursor:
+              type: string
+              description: Empty when there are no more results.
+
+    TransitionEvent:
+      type: object
+      additionalProperties: false
+      description: Append-only record of one task state transition.
+      required:
+        - event_id
+        - task_id
+        - occurred_at
+        - to_state
+        - reason
+        - trigger
+        - metadata
+      properties:
+        event_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        task_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        attempt_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        occurred_at:
+          type: string
+          format: date-time
+          readOnly: true
+        from_state:
+          $ref: '#/components/schemas/TaskState'
+          readOnly: true
+        to_state:
+          $ref: '#/components/schemas/TaskState'
+          readOnly: true
+        reason:
+          type: string
+          minLength: 1
+          readOnly: true
+        trigger:
+          type: string
+          enum: [api, controller, scheduler, kubernetes, webhook, system]
+          readOnly: true
+        resource_identity:
+          $ref: '#/components/schemas/ResourceIdentity'
+        metadata:
+          type: object
+          description: Non-secret transition metadata.
+          additionalProperties: true
+          readOnly: true
+        error:
+          $ref: '#/components/schemas/Error'
+          readOnly: true
+
+    EventListResponse:
+      type: object
+      description: Paginated response containing task state transition events.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [events, next_cursor]
+          properties:
+            events:
+              type: array
+              items:
+                $ref: '#/components/schemas/TransitionEvent'
+            next_cursor:
+              type: string
+              description: Empty when there are no more results.
+
+    ValidationRun:
+      type: object
+      description: Status and result of one validation check.
+      additionalProperties: false
+      required: [run_id, name, state, created_at]
+      properties:
+        run_id:
+          type: string
+          minLength: 1
+          readOnly: true
+        name:
+          type: string
+          minLength: 1
+          readOnly: true
+        state:
+          type: string
+          enum: [running, succeeded, failed]
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        started_at:
+          type: string
+          format: date-time
+          readOnly: true
+        completed_at:
+          type: string
+          format: date-time
+          readOnly: true
+        summary:
+          type: string
+          readOnly: true
+        error:
+          $ref: '#/components/schemas/Error'
+          readOnly: true
+
+    GitResult:
+      type: object
+      description: Git branch and commit outcome for an attempt.
+      additionalProperties: false
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [not_run, running, succeeded, failed]
+          readOnly: true
+        branch:
+          type: string
+          minLength: 1
+          readOnly: true
+        commit_sha:
+          type: string
+          minLength: 1
+          readOnly: true
+        error:
+          $ref: '#/components/schemas/Error'
+          readOnly: true
+
+    PullRequestResult:
+      type: object
+      description: Pull request creation outcome for an attempt.
+      additionalProperties: false
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [not_created, creating, created, failed]
+          readOnly: true
+        number:
+          type: integer
+          minimum: 1
+          readOnly: true
+        url:
+          type: string
+          format: uri
+          readOnly: true
+        title:
+          type: string
+          readOnly: true
+        head_branch:
+          type: string
+          minLength: 1
+          readOnly: true
+        base_branch:
+          type: string
+          minLength: 1
+          readOnly: true
+        error:
+          $ref: '#/components/schemas/Error'
+          readOnly: true
+
+    PullRequestResponse:
+      type: object
+      description: Response containing the pull request result for a task.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: '#/components/schemas/PullRequestResult'

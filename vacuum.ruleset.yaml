@@ -1,0 +1,35 @@
+extends: [[vacuum:oas, recommended]]
+
+rules:
+  # The public JSON contract intentionally uses snake_case property names.
+  camel-case-properties: false
+
+  # Examples are curated on representative request shapes instead of required
+  # on every response and nested schema.
+  oas3-missing-example: false
+
+  simpleswe-no-placeholder-examples:
+    description: Examples must contain realistic values, not placeholders.
+    message: Example values must not be the placeholder string "example".
+    severity: error
+    recommended: true
+    formats: [oas3]
+    given: "$..example"
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: "^example$"
+    howToFix: Replace placeholder examples with schema-valid realistic values.
+
+  simpleswe-no-nested-placeholder-examples:
+    description: Nested examples must contain realistic values, not placeholders.
+    message: Nested example values must not be the placeholder string "example".
+    severity: error
+    recommended: true
+    formats: [oas3]
+    given: "$..example..*"
+    then:
+      function: pattern
+      functionOptions:
+        notMatch: "^example$"
+    howToFix: Replace nested placeholder examples with schema-valid realistic values.

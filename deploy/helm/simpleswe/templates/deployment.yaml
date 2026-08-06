@@ -1,0 +1,135 @@
+{{- $bitbucketSecrets := dict -}}
+{{- range $_, $repository := .Values.config.repositories -}}
+{{- with $repository.bitbucket.credentials_secret_name -}}
+{{- $_ := set $bitbucketSecrets . true -}}
+{{- end -}}
+{{- end -}}
+{{- $bitbucketSecretNames := keys $bitbucketSecrets | sortAlpha -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "simpleswe.fullname" . }}
+  namespace: {{ include "simpleswe.namespace" . }}
+  labels:
+    {{- include "simpleswe.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "simpleswe.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "simpleswe.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum | quote }}
+    spec:
+      serviceAccountName: {{ include "simpleswe.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: controller
+          image: {{ include "simpleswe.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - controller
+            - --config
+            - /etc/simpleswe/config.yaml
+            - --database
+            - /var/lib/simpleswe/tasks.db
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /v1/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/simpleswe
+            - name: config
+              mountPath: /etc/simpleswe
+              readOnly: true
+            - name: slack-credentials
+              mountPath: /run/secrets/slack
+              readOnly: true
+          {{- range $index, $secretName := $bitbucketSecretNames }}
+            - name: bitbucket-credentials-{{ $index }}
+              mountPath: {{ printf "/run/secrets/bitbucket/%s" $secretName | quote }}
+              readOnly: true
+          {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "simpleswe.fullname" . }}-data
+        - name: config
+          configMap:
+            name: {{ include "simpleswe.fullname" . }}-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: slack-credentials
+          secret:
+            secretName: {{ .Values.secrets.slack.name | quote }}
+            items:
+              - key: {{ .Values.secrets.slack.keys.botToken | quote }}
+                path: bot-token
+              - key: {{ .Values.secrets.slack.keys.appToken | quote }}
+                path: app-token
+      {{- range $index, $secretName := $bitbucketSecretNames }}
+        - name: bitbucket-credentials-{{ $index }}
+          secret:
+            secretName: {{ $secretName | quote }}
+            items:
+              - key: username
+                path: username
+              - key: app-password
+                path: app-password
+      {{- end }}
