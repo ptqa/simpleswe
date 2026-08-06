@@ -24,6 +24,13 @@ repos:
         types:
           - go
 
+      - id: backend-diff-coverage
+        name: backend diff coverage
+        entry: python3 scripts/backend-diff-coverage.py --threshold 80
+        language: system
+        files: ^(cmd|internal)/.*\.go$
+        pass_filenames: false
+
       - id: govulncheck
         name: govulncheck
         entry: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...

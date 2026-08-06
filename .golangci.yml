@@ -6,14 +6,6 @@ run:
 
 linters:
   default: standard
-  # These policy/style checks either demand pervasive wrapping/refactoring or
-  # conflict with established optional-value and lifecycle APIs.
-  disable:
-    - gocognit
-    - modernize
-    - nilnil
-    - unparam
-    - wrapcheck
   enable:
     - asciicheck
     - bodyclose
@@ -29,13 +21,16 @@ linters:
     - fatcontext
     - forcetypeassert
     - gochecknoinits
+    - gocognit
     - gocritic
     - gosec
     - govet
     - ineffassign
     - misspell
+    - modernize
     - musttag
     - nilerr
+    - nilnil
     - noctx
     - nosprintfhostport
     - prealloc
@@ -47,9 +42,11 @@ linters:
     - testifylint
     - thelper
     - unconvert
+    - unparam
     - unused
     - usestdlibvars
     - wastedassign
+    - wrapcheck
   settings:
     exhaustive:
       default-signifies-exhaustive: true
