@@ -15,6 +15,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 )
 
 const clientTaskJSON = `{"task_id":"task-1","repository":"https://bitbucket.example/acme/widget","prompt":"fix the bug","state":"queued","created_at":"2026-08-06T00:00:00Z","updated_at":"2026-08-06T00:00:00Z","current_attempt_id":"attempt-1","cancellation_requested":false,"kubernetes_job":{"state":"running","resource_identity":{"kind":"Job","name":"job-1"}},"kubernetes_pod":{"state":"running","resource_identity":{"kind":"Pod","name":"pod-1"}},"validation_runs":[],"git_result":{"state":"not_run"},"pull_request":{"state":"not_created"}}`
@@ -243,33 +250,6 @@ func TestClientStreamsSSEIncrementally(t *testing.T) {
 	}
 }
 
-func TestPortForwardCommandUsesArgumentsWithoutShellInterpolation(t *testing.T) {
-	cmd := PortForwardCommand(context.Background(), PortForwardOptions{
-		KubeContext: "dev context; echo should-not-run",
-		Namespace:   "simpleswe",
-		Service:     "controller",
-		LocalPort:   18080,
-		RemotePort:  8080,
-	})
-	if cmd == nil {
-		t.Fatal("PortForwardCommand() returned nil")
-	}
-	want := []string{
-		"kubectl",
-		"--context", "dev context; echo should-not-run",
-		"--namespace", "simpleswe",
-		"port-forward",
-		"service/controller",
-		"18080:8080",
-	}
-	if !reflect.DeepEqual(cmd.Args, want) {
-		t.Fatalf("PortForwardCommand() args = %#v, want %#v", cmd.Args, want)
-	}
-	if cmd.Path == "sh" || cmd.Path == "/bin/sh" {
-		t.Fatalf("PortForwardCommand() uses a shell: %q", cmd.Path)
-	}
-}
-
 func TestClientRejectsInvalidInputsAndUsesDefaultHTTPClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"task_id":"task-1"}}`)
@@ -447,19 +427,260 @@ func TestAPIErrorStringHandlesNilAndStructuredErrors(t *testing.T) {
 	}
 }
 
-func TestPortForwardLifecycle(t *testing.T) {
-	installFakeKubectl(t, "ready")
-	forward, err := StartPortForward(context.Background(), PortForwardOptions{Namespace: "simpleswe", Service: "controller", LocalPort: 18080, RemotePort: 8080})
-	if err != nil {
-		t.Fatalf("StartPortForward() error = %v", err)
+func TestPortForwardConfigHonorsSelectedKubeContext(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	config := `apiVersion: v1
+kind: Config
+current-context: default
+clusters:
+- name: default
+  cluster:
+    server: https://default.example
+- name: selected
+  cluster:
+    server: https://selected.example
+contexts:
+- name: default
+  context:
+    cluster: default
+    namespace: context-namespace
+- name: selected
+  context:
+    cluster: selected
+    namespace: wrong-namespace
+users: []
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
 	}
+	t.Setenv("KUBECONFIG", configPath)
+
+	got, err := loadPortForwardConfig(PortForwardOptions{KubeContext: "selected"})
+	if err != nil {
+		t.Fatalf("loadPortForwardConfig() error = %v", err)
+	}
+	if got.Host != "https://selected.example" {
+		t.Fatalf("selected kubeconfig host = %q, want selected context", got.Host)
+	}
+}
+
+func TestPortForwardConfigSupportsOIDCAuthProvider(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config")
+	config := `apiVersion: v1
+kind: Config
+current-context: default
+clusters:
+- name: default
+  cluster:
+    server: https://default.example
+- name: selected
+  cluster:
+    server: https://selected.example
+contexts:
+- name: default
+  context:
+    cluster: default
+    user: oidc
+- name: selected
+  context:
+    cluster: selected
+    namespace: kubeconfig-namespace
+    user: oidc
+users:
+- name: oidc
+  user:
+    auth-provider:
+      name: oidc
+      config:
+        client-id: simpleswe
+        idp-issuer-url: https://issuer.example
+`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatalf("write kubeconfig: %v", err)
+	}
+	t.Setenv("KUBECONFIG", configPath)
+
+	got, err := loadPortForwardConfig(PortForwardOptions{KubeContext: "selected", Namespace: "explicit-namespace"})
+	if err != nil {
+		if strings.Contains(err.Error(), `no Auth Provider found for name "oidc"`) {
+			t.Fatalf("OIDC auth provider was not registered: %v", err)
+		}
+		t.Fatalf("loadPortForwardConfig() error = %v", err)
+	}
+	if got.Host != "https://selected.example" {
+		t.Fatalf("selected kubeconfig host = %q, want selected context", got.Host)
+	}
+	if _, err := rest.TransportFor(got); err != nil {
+		if strings.Contains(err.Error(), `no Auth Provider found for name "oidc"`) {
+			t.Fatalf("OIDC auth provider was not registered while building transport: %v", err)
+		}
+		t.Fatalf("rest.TransportFor() error = %v", err)
+	}
+}
+
+func TestResolvePortForwardTargetUsesExplicitNamespaceAndService(t *testing.T) {
+	service := testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{
+		Name: "http", Port: 80, TargetPort: intstr.FromInt(8080),
+	})
+	otherNamespace := testReadyPortForwardPod("other", "controller", map[string]string{"app": "controller"}, 8080, "http")
+	selected := testReadyPortForwardPod("team-a", "z-controller", map[string]string{"app": "controller"}, 8080, "http")
+	first := testReadyPortForwardPod("team-a", "a-controller", map[string]string{"app": "controller"}, 8080, "http")
+	pending := testReadyPortForwardPod("team-a", "pending", map[string]string{"app": "controller"}, 8080, "http")
+	pending.Status.Phase = corev1.PodPending
+	notReady := testReadyPortForwardPod("team-a", "not-ready", map[string]string{"app": "controller"}, 8080, "http")
+	notReady.Status.Conditions[0].Status = corev1.ConditionFalse
+	terminating := testReadyPortForwardPod("team-a", "terminating", map[string]string{"app": "controller"}, 8080, "http")
+	terminating.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+	unrelated := testReadyPortForwardPod("team-a", "unrelated", map[string]string{"app": "other"}, 8080, "http")
+	kube := fake.NewSimpleClientset(service, otherNamespace, selected, first, pending, notReady, terminating, unrelated)
+
+	got, err := resolvePortForwardTarget(context.Background(), kube, PortForwardOptions{
+		Namespace: "team-a", Service: "controller", RemotePort: 80,
+	})
+	if err != nil {
+		t.Fatalf("resolvePortForwardTarget() error = %v", err)
+	}
+	if got.PodName != "a-controller" || got.Port != 8080 {
+		t.Fatalf("resolved target = %#v, want deterministic ready pod a-controller:8080", got)
+	}
+}
+
+func TestResolvePortForwardTargetMatchesKubectlServicePortSemantics(t *testing.T) {
+	tests := []struct {
+		name          string
+		targetPort    intstr.IntOrString
+		clusterIP     string
+		containerPort int32
+		containerName string
+		initPort      int32
+		initName      string
+		wantPort      int
+	}{
+		{name: "integer target", targetPort: intstr.FromInt(8080), wantPort: 8080},
+		{name: "zero target uses service port", targetPort: intstr.FromInt(0), wantPort: 80},
+		{name: "headless service uses service port", targetPort: intstr.FromInt(8080), clusterIP: corev1.ClusterIPNone, wantPort: 80},
+		{name: "named regular container port", targetPort: intstr.FromString("metrics"), containerPort: 9090, containerName: "metrics", wantPort: 9090},
+		{name: "named init container port", targetPort: intstr.FromString("setup"), initPort: 9091, initName: "setup", wantPort: 9091},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{
+				Name: "http", Port: 80, TargetPort: tt.targetPort,
+			})
+			service.Spec.ClusterIP = tt.clusterIP
+			pod := testReadyPortForwardPod("team-a", "controller-pod", map[string]string{"app": "controller"}, tt.containerPort, tt.containerName)
+			if tt.initPort != 0 {
+				pod.Spec.InitContainers = []corev1.Container{{Name: "setup", Ports: []corev1.ContainerPort{{Name: tt.initName, ContainerPort: tt.initPort}}}}
+			}
+			got, err := resolvePortForwardTarget(context.Background(), fake.NewSimpleClientset(service, pod), PortForwardOptions{
+				Namespace: "team-a", Service: "controller", RemotePort: 80,
+			})
+			if err != nil {
+				t.Fatalf("resolvePortForwardTarget() error = %v", err)
+			}
+			if got.PodName != pod.Name || got.Port != tt.wantPort {
+				t.Fatalf("resolved target = %#v, want %s:%d", got, pod.Name, tt.wantPort)
+			}
+		})
+	}
+}
+
+func TestResolvePortForwardTargetReportsActionableErrors(t *testing.T) {
+	ready := testReadyPortForwardPod("team-a", "controller-pod", map[string]string{"app": "controller"}, 8080, "http")
+	tests := []struct {
+		name         string
+		objects      []runtime.Object
+		remotePort   int
+		wantMessages []string
+	}{
+		{
+			name:         "missing service",
+			objects:      []runtime.Object{ready},
+			remotePort:   80,
+			wantMessages: []string{"service", "controller", "team-a"},
+		},
+		{
+			name:         "empty selector",
+			objects:      []runtime.Object{testPortForwardService("team-a", "controller", nil, corev1.ServicePort{Port: 80, TargetPort: intstr.FromInt(8080)})},
+			remotePort:   80,
+			wantMessages: []string{"selector", "controller"},
+		},
+		{
+			name: "missing service port",
+			objects: []runtime.Object{
+				testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{Port: 81, TargetPort: intstr.FromInt(8080)}),
+				ready,
+			},
+			remotePort:   80,
+			wantMessages: []string{"port", "80", "controller"},
+		},
+		{
+			name: "non-TCP service port",
+			objects: []runtime.Object{
+				testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{Port: 80, Protocol: corev1.ProtocolUDP}),
+				ready,
+			},
+			remotePort:   80,
+			wantMessages: []string{"unsupported", "UDP", "controller"},
+		},
+		{
+			name: "unresolved named target",
+			objects: []runtime.Object{
+				testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{Port: 80, TargetPort: intstr.FromString("metrics")}),
+				ready,
+			},
+			remotePort:   80,
+			wantMessages: []string{"target", "metrics", "controller"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := resolvePortForwardTarget(context.Background(), fake.NewSimpleClientset(tt.objects...), PortForwardOptions{
+				Namespace: "team-a", Service: "controller", RemotePort: tt.remotePort,
+			})
+			if err == nil {
+				t.Fatal("resolvePortForwardTarget() error = nil, want actionable error")
+			}
+			for _, want := range tt.wantMessages {
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+					t.Errorf("error = %q, want it to contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+func TestResolvePortForwardTargetTimesOutWaitingForReadyPod(t *testing.T) {
+	service := testPortForwardService("team-a", "controller", map[string]string{"app": "controller"}, corev1.ServicePort{
+		Port: 80, TargetPort: intstr.FromInt(8080),
+	})
+	pending := testReadyPortForwardPod("team-a", "pending", map[string]string{"app": "controller"}, 8080, "http")
+	pending.Status.Phase = corev1.PodPending
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := resolvePortForwardTarget(ctx, fake.NewSimpleClientset(service, pending), PortForwardOptions{
+		KubeContext: "production", Namespace: "team-a", Service: "controller", RemotePort: 80,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("resolvePortForwardTarget() error = %v, want context deadline exceeded", err)
+	}
+	for _, want := range []string{"production", "team-a/controller", "waiting for a running, ready pod"} {
+		if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(want)) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
+	}
+}
+
+func TestPortForwardLifecycleUsesActualBoundPortAndIsIdempotent(t *testing.T) {
+	fakeForwarder := newFakePortForwarder(49152, nil)
+	forward := newPortForward(context.Background(), fakeForwarder, fakeForwarder.ready)
+	close(fakeForwarder.ready)
 	if err := forward.WaitReady(context.Background()); err != nil {
 		t.Fatalf("WaitReady() error = %v, want nil", err)
 	}
-	select {
-	case <-forward.Ready():
-	default:
-		t.Fatal("Ready() channel is not closed")
+	if got := forward.LocalPort(); got != 49152 {
+		t.Fatalf("LocalPort() = %d, want actual bound port 49152", got)
 	}
 	if err := forward.Close(); err != nil {
 		t.Fatalf("Close() error = %v, want nil", err)
@@ -467,77 +688,85 @@ func TestPortForwardLifecycle(t *testing.T) {
 	if err := forward.Close(); err != nil {
 		t.Fatalf("second Close() error = %v, want nil", err)
 	}
-	if err := forward.Wait(); err == nil {
-		t.Fatal("Wait() error = nil, want killed process error")
+	if err := forward.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v, want nil", err)
+	}
+	select {
+	case <-fakeForwarder.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("Close() did not stop forwarding")
 	}
 }
 
-func TestPortForwardReportsEarlyExitAndContextErrors(t *testing.T) {
-	installFakeKubectl(t, "exit")
-	forward, err := StartPortForward(context.Background(), PortForwardOptions{})
-	if err != nil {
-		t.Fatalf("StartPortForward() error = %v", err)
-	}
-	if err := forward.WaitReady(context.Background()); err == nil {
-		t.Fatal("WaitReady() error = nil, want early process error")
-	}
-	if err := forward.Wait(); err == nil {
-		t.Fatal("Wait() error = nil, want process error")
-	}
-	if err := forward.Close(); err == nil {
-		t.Fatal("Close() error = nil after early process exit")
-	}
-
+func TestPortForwardContextCancellationStopsForwarding(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
+	fakeForwarder := newFakePortForwarder(49153, nil)
+	forward := newPortForward(ctx, fakeForwarder, fakeForwarder.ready)
+	close(fakeForwarder.ready)
 	cancel()
-	if _, err := StartPortForward(ctx, PortForwardOptions{}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("StartPortForward() canceled error = %v, want context.Canceled", err)
+	select {
+	case <-fakeForwarder.stopped:
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not stop forwarding")
 	}
-	var nilContext context.Context
-	if _, err := StartPortForward(nilContext, PortForwardOptions{}); err == nil || !strings.Contains(err.Error(), "context is nil") {
-		t.Fatalf("StartPortForward() nil context error = %v, want nil context", err)
-	}
-}
-
-func TestPortForwardReportsStartFailureAndWaitReadyCancellation(t *testing.T) {
-	path := t.TempDir()
-	t.Setenv("PATH", path)
-	if _, err := StartPortForward(context.Background(), PortForwardOptions{}); err == nil || !strings.Contains(err.Error(), "start kubectl port-forward") {
-		t.Fatalf("StartPortForward() start error = %v, want start error", err)
-	}
-
-	forward := &PortForward{ready: make(chan struct{})}
-	var nilContext context.Context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := forward.WaitReady(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("WaitReady() canceled error = %v, want context.Canceled", err)
-	}
-	if err := forward.WaitReady(nilContext); err == nil || !strings.Contains(err.Error(), "context is nil") {
-		t.Fatalf("WaitReady() nil context error = %v, want nil context", err)
+	if err := forward.Wait(); err != nil {
+		t.Fatalf("Wait() after context cancellation = %v, want nil", err)
 	}
 }
 
-func installFakeKubectl(t *testing.T, mode string) {
-	t.Helper()
-	directory := t.TempDir()
-	script := fmt.Sprintf("#!/bin/sh\nexec %q -test.run=TestPortForwardHelper\n", os.Args[0])
-	path := filepath.Join(directory, "kubectl")
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake kubectl: %v", err)
+func TestPortForwardReportsEarlyForwardingFailure(t *testing.T) {
+	wantErr := errors.New("dial pod controller-pod: connection refused")
+	fakeForwarder := newFakePortForwarder(0, wantErr)
+	forward := newPortForward(context.Background(), fakeForwarder, fakeForwarder.ready)
+	if err := forward.WaitReady(context.Background()); !errors.Is(err, wantErr) {
+		t.Fatalf("WaitReady() error = %v, want %v", err, wantErr)
 	}
-	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("SIMPLESWE_FAKE_KUBECTL_MODE", mode)
+	if err := forward.Wait(); !errors.Is(err, wantErr) {
+		t.Fatalf("Wait() error = %v, want %v", err, wantErr)
+	}
 }
 
-func TestPortForwardHelper(_ *testing.T) {
-	switch os.Getenv("SIMPLESWE_FAKE_KUBECTL_MODE") {
-	case "ready":
-		fmt.Fprintln(os.Stdout, "not forwarding yet")
-		fmt.Fprintln(os.Stdout, "Forwarding from 127.0.0.1:18080 -> 8080")
-		select {}
-	case "exit":
-		fmt.Fprintln(os.Stdout, "kubectl failed")
-		os.Exit(2)
+func testPortForwardService(namespace, name string, selector map[string]string, port corev1.ServicePort) *corev1.Service {
+	return &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}, Spec: corev1.ServiceSpec{
+		Selector: selector, Ports: []corev1.ServicePort{port},
+	}}
+}
+
+func testReadyPortForwardPod(namespace, name string, labels map[string]string, port int32, portName string) *corev1.Pod {
+	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: labels}, Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "controller", Ports: []corev1.ContainerPort{{Name: portName, ContainerPort: port}}}},
+	}, Status: corev1.PodStatus{
+		Phase:      corev1.PodRunning,
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}}
+}
+
+type fakePortForwarder struct {
+	ready      chan struct{}
+	stop       chan struct{}
+	stopped    chan struct{}
+	closeOnce  sync.Once
+	localPort  int
+	forwardErr error
+}
+
+func newFakePortForwarder(localPort int, forwardErr error) *fakePortForwarder {
+	return &fakePortForwarder{ready: make(chan struct{}), stop: make(chan struct{}), stopped: make(chan struct{}), localPort: localPort, forwardErr: forwardErr}
+}
+
+func (f *fakePortForwarder) ForwardPorts() error {
+	defer close(f.stopped)
+	if f.forwardErr != nil {
+		return f.forwardErr
 	}
+	<-f.stop
+	return nil
+}
+
+func (f *fakePortForwarder) LocalPort() (int, error) {
+	return f.localPort, nil
+}
+
+func (f *fakePortForwarder) Close() {
+	f.closeOnce.Do(func() { close(f.stop) })
 }

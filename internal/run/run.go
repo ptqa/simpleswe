@@ -39,7 +39,6 @@ import (
 const (
 	controllerService = "simpleswe"
 	controllerPort    = 8080
-	localPort         = 18080
 )
 
 // Dependencies returns the deployable implementations used by cmd/simpleswe.
@@ -112,20 +111,21 @@ func runTUI(ctx context.Context, address, kubeContext, namespace string, stdin i
 }
 
 func portForward(ctx context.Context, kubeContext, namespace string) (string, func() error, error) {
-	forward, err := client.StartPortForward(ctx, client.PortForwardOptions{
-		KubeContext: kubeContext, Namespace: namespace, Service: controllerService,
-		LocalPort: localPort, RemotePort: controllerPort,
-	})
+	forward, err := client.StartPortForward(ctx, automaticPortForwardOptions(kubeContext, namespace))
 	if err != nil {
 		return "", nil, err
 	}
-	readyCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	if err := forward.WaitReady(readyCtx); err != nil {
-		_ = forward.Close()
-		return "", nil, err
+	return fmt.Sprintf("http://127.0.0.1:%d", forward.LocalPort()), forward.Close, nil
+}
+
+func automaticPortForwardOptions(kubeContext, namespace string) client.PortForwardOptions {
+	return client.PortForwardOptions{
+		KubeContext:    kubeContext,
+		Namespace:      namespace,
+		Service:        controllerService,
+		RemotePort:     controllerPort,
+		StartupTimeout: 15 * time.Second,
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d", localPort), forward.Close, nil
 }
 
 func RunController(ctx context.Context, configPath, databasePath string, stdout, stderr io.Writer) (runErr error) {

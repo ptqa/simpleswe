@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestMountedSecretsCannotEscapeConfiguredRoot(t *testing.T) {
@@ -26,5 +27,12 @@ func TestMountedSecretsCannotEscapeConfiguredRoot(t *testing.T) {
 	}
 	if want := []string{"inside-secret"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("mountedSecrets() = %q, want %q", got, want)
+	}
+}
+
+func TestAutomaticPortForwardOptionsUseStartupBudget(t *testing.T) {
+	got := automaticPortForwardOptions("production", "team-a")
+	if got.StartupTimeout != 15*time.Second {
+		t.Fatalf("automatic startup timeout = %s, want 15s", got.StartupTimeout)
 	}
 }
