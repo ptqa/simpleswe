@@ -35,13 +35,14 @@ config:
     base_url: https://api.bitbucket.org
   repositories:
     simpleswe:
+      default_branch: master
       worker:
         image: simpleswe-worker:kind
         env:
-          - name: ANTHROPIC_API_KEY
+          - name: OPENAI_API_KEY
             secret:
               name: opencode-provider
-              key: ANTHROPIC_API_KEY
+              key: OPENAI_API_KEY
       opencode:
         command: [opencode, run]
       validation:
