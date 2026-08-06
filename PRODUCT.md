@@ -4,7 +4,7 @@ This file is authoritative. Do not modify it unless the user explicitly asks to 
 
 ## Product
 
-simpleswe runs OpenCode in Kubernetes from a Slack trigger and returns a Bitbucket pull request.
+simpleswe runs OpenCode in Kubernetes from a Slack trigger and returns a Github/Bitbucket pull request.
 
 ```text
 Slack
@@ -13,7 +13,7 @@ Slack
   → OpenCode
   → validation
   → Git push
-  → Bitbucket PR
+  → PR
   → Slack thread
 ```
 
