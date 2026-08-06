@@ -6,6 +6,8 @@ This file is authoritative. Do not modify it unless the user explicitly asks to 
 
 simpleswe runs OpenCode in Kubernetes from a task created through Slack, the CLI, or the terminal UI and returns a GitHub/Bitbucket pull request.
 
+simpleswe then owns this pull request and addreses all quality gates failures and review comments.
+
 ```text
 Slack / CLI / TUI
   → simpleswe controller
