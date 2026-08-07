@@ -108,6 +108,9 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 	if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != int64(deadline/time.Second) {
 		t.Errorf("activeDeadlineSeconds = %v; want %d", job.Spec.ActiveDeadlineSeconds, int64(deadline/time.Second))
 	}
+	if job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != int32((24*time.Hour)/time.Second) {
+		t.Errorf("ttlSecondsAfterFinished = %v; want %d", job.Spec.TTLSecondsAfterFinished, int32((24*time.Hour)/time.Second))
+	}
 	pod := job.Spec.Template.Spec
 	if pod.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("restartPolicy = %q; want %q", pod.RestartPolicy, corev1.RestartPolicyNever)

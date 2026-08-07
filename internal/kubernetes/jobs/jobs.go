@@ -31,6 +31,7 @@ const (
 	workspaceVolumeName    = "workspace"
 	workspaceMountPath     = "/workspace"
 	secretEnvNamesVariable = protocol.SecretEnvNamesVariable
+	finishedJobTTL         = 24 * time.Hour
 )
 
 // Config contains the Kubernetes settings needed to create a worker Job.
@@ -161,6 +162,7 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 
 	backoffLimit := int32(0)
 	activeDeadline := int64(config.Deadline / time.Second)
+	ttlSecondsAfterFinished := int32(finishedJobTTL / time.Second)
 	terminationGracePeriod := int64(30)
 	automountServiceAccountToken := false
 	allowPrivilegeEscalation := false
@@ -216,8 +218,9 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 			Labels:    copyStringMap(labels),
 		},
 		Spec: batchv1.JobSpec{
-			BackoffLimit:          &backoffLimit,
-			ActiveDeadlineSeconds: &activeDeadline,
+			BackoffLimit:            &backoffLimit,
+			ActiveDeadlineSeconds:   &activeDeadline,
+			TTLSecondsAfterFinished: &ttlSecondsAfterFinished,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: copyStringMap(labels)},
 				Spec:       podSpec,
