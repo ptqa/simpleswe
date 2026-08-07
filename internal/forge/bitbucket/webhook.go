@@ -36,7 +36,7 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Provider:          forge.ProviderBitbucket,
 			Kind:              "review_comment",
 			Owner:             payload.Repository.Workspace.Slug,
-			Repository:        payload.Repository.Slug,
+			Repository:        firstNonblank(payload.Repository.Slug, payload.Repository.Name),
 			PullRequestNumber: payload.PullRequest.ID,
 			CommitSHA:         payload.PullRequest.Source.Commit.Hash,
 			Branch:            payload.PullRequest.Source.Branch.Name,
@@ -62,7 +62,7 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Provider:   forge.ProviderBitbucket,
 			Kind:       "quality_gate_failed",
 			Owner:      payload.Repository.Workspace.Slug,
-			Repository: payload.Repository.Slug,
+			Repository: firstNonblank(payload.Repository.Slug, payload.Repository.Name),
 			CommitSHA:  payload.Pipeline.Target.Commit.Hash,
 			Branch:     payload.Pipeline.Target.RefName,
 			Title:      pipelineTitle(payload.Pipeline.BuildNumber, payload.Pipeline.UUID),
@@ -91,7 +91,7 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Provider:   forge.ProviderBitbucket,
 			Kind:       "quality_gate_failed",
 			Owner:      payload.Repository.Workspace.Slug,
-			Repository: payload.Repository.Slug,
+			Repository: firstNonblank(payload.Repository.Slug, payload.Repository.Name),
 			CommitSHA:  commitSHA,
 			Branch:     payload.CommitStatus.RefName,
 			Title:      firstNonblank(payload.CommitStatus.Name, payload.CommitStatus.Key, "Commit status"),
@@ -208,6 +208,7 @@ func validateWebhookURL(value string) error {
 }
 
 type bitbucketRepository struct {
+	Name      string `json:"name"`
 	Slug      string `json:"slug"`
 	Workspace struct {
 		Slug string `json:"slug"`

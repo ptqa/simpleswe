@@ -37,6 +37,19 @@ func TestParseWebhook(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:        "pull request comment repository name fallback",
+			requestUUID: "request-comment-name",
+			eventKey:    "pullrequest:comment_created",
+			body:        `{"comment":{"id":502,"content":{"raw":"Please fix this"},"user":{"uuid":"{reviewer}","nickname":"reviewer"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/43/_/diff#comment-502"}}},"pullrequest":{"id":43,"title":"Fix test","reviewers":[{"uuid":"{reviewer}"}]},"repository":{"name":"service","workspace":{"slug":"acme"}}}`,
+			want: forge.Event{
+				DeliveryID: "bitbucket:request-comment-name", Provider: forge.ProviderBitbucket, Kind: "review_comment",
+				Owner: "acme", Repository: "service", PullRequestNumber: 43, CommentID: 502,
+				CommentKind: "comment", Title: "Fix test", Body: "Please fix this", Author: "reviewer",
+				URL: "https://bitbucket.org/acme/service/pull-requests/43/_/diff#comment-502",
+			},
+			wantOK: true,
+		},
+		{
 			name:        "failed pipeline",
 			requestUUID: "request-pipeline",
 			eventKey:    "pipeline:build:completed",
@@ -127,10 +140,10 @@ func TestParseWebhook(t *testing.T) {
 			body:     `{"commit_status":{"state":"QUEUED"}}`,
 		},
 		{
-			name:        "failed external commit status requires repository slug",
+			name:        "failed external commit status requires repository identity",
 			requestUUID: "request-status-no-slug",
 			eventKey:    "repo:commit_status_updated",
-			body:        `{"actor":{"display_name":"External CI"},"repository":{"name":"Service Display Name","workspace":{"slug":"acme"}},"commit_status":{"name":"unit tests","description":"failed","state":"FAILED","links":{"commit":{"href":"https://api.bitbucket.org/2.0/repositories/acme/service/commit/abc123"}}}}`,
+			body:        `{"actor":{"display_name":"External CI"},"repository":{"workspace":{"slug":"acme"}},"commit_status":{"name":"unit tests","description":"failed","state":"FAILED","links":{"commit":{"href":"https://api.bitbucket.org/2.0/repositories/acme/service/commit/abc123"}}}}`,
 			wantErr:     true,
 		},
 		{
