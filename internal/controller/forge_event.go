@@ -551,7 +551,7 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 		PullRequestNumber: pullRequest.Number,
 		Body:              marker + " A fix was pushed in durable commit " + git.CommitSHA + "; quality gates are rerunning.",
 	}
-	if event.Kind == "review_comment" {
+	if event.Kind == "review_comment" && event.CommentID > 0 {
 		reply.CommentID = event.CommentID
 		reply.CommentKind = event.CommentKind
 	}

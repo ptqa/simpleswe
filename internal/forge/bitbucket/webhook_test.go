@@ -50,6 +50,26 @@ func TestParseWebhook(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:        "pull request changes requested",
+			requestUUID: "request-changes",
+			eventKey:    "pullrequest:changes_request_created",
+			body:        bitbucketChangesRequestPayload,
+			want: forge.Event{
+				DeliveryID: "bitbucket:request-changes", Provider: forge.ProviderBitbucket, Kind: "review_comment",
+				Owner: "acme", Repository: "service", PullRequestNumber: 42, CommitSHA: "abc123", Branch: "feature/fix",
+				CommentKind: "changes_request", Title: "Fix flaky test", Body: "Changes requested", Author: "reviewer",
+				URL: "https://bitbucket.org/acme/service/pull-requests/42",
+			},
+			wantOK: true,
+		},
+		{
+			name:        "pull request changes requested requires defining object",
+			requestUUID: "request-changes-incomplete",
+			eventKey:    "pullrequest:changes_request_created",
+			body:        `{"actor":{"nickname":"reviewer"},"repository":{"slug":"service","workspace":{"slug":"acme"}},"pullrequest":{"id":42,"title":"Fix flaky test","links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42"}},"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}}}`,
+			wantErr:     true,
+		},
+		{
 			name:        "failed pipeline",
 			requestUUID: "request-pipeline",
 			eventKey:    "pipeline:build:completed",
@@ -209,3 +229,5 @@ func TestParseWebhookIgnoresGeneratedReplyMarkerFromAssignedReviewer(t *testing.
 		t.Fatalf("ParseWebhook() actionable=%t, err=%v; want ignored", actionable, err)
 	}
 }
+
+const bitbucketChangesRequestPayload = `{"actor":{"nickname":"reviewer","display_name":"Reviewer Display Name"},"repository":{"name":"Service Display Name","slug":"service","workspace":{"slug":"acme"}},"pullrequest":{"id":42,"title":"Fix flaky test","links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42"}},"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}},"changes_request":{"date":"2015-04-06T16:34:59.195330+00:00","user":{"nickname":"reviewer","display_name":"Reviewer Display Name"}}}`

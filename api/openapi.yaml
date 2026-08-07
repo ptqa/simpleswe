@@ -385,7 +385,7 @@ components:
       name: X-Event-Key
       in: header
       required: true
-      description: Bitbucket event key.
+      description: Bitbucket event key. Actionable keys are `pullrequest:comment_created`, `pullrequest:changes_request_created`, `pipeline:build:completed`, `repo:commit_status_created`, and `repo:commit_status_updated`; other event keys are accepted.
       schema:
         type: string
         minLength: 1
