@@ -399,20 +399,19 @@ func (s *Store) StartForgeEventAttempt(ctx context.Context, eventID string, plan
 	var logsExhausted, cancellationRequested int
 	var pullRequest PullRequest
 	var number sql.NullInt64
-	var notifiedAt sql.NullString
 	err = tx.QueryRowContext(ctx, `
 		SELECT tasks.state, tasks.current_attempt_id, tasks.cancellation_requested,
 		       task_attempts.logs_exhausted, pull_requests.attempt_id,
 		       pull_requests.state, pull_requests.number, pull_requests.url,
 		       pull_requests.title, pull_requests.head_branch, pull_requests.base_branch,
-		       pull_requests.error, pull_requests.notified_at
+		       pull_requests.error
 		FROM tasks
 		JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
 		JOIN pull_requests ON pull_requests.attempt_id = task_attempts.id
 		WHERE tasks.id = ?`, taskID).Scan(
 		&currentState, &currentAttemptID, &cancellationRequested, &logsExhausted,
 		&pullRequest.AttemptID, &pullRequest.State, &number, &pullRequest.URL,
-		&pullRequest.Title, &headBranch, &pullRequest.BaseBranch, &pullRequest.Error, &notifiedAt,
+		&pullRequest.Title, &headBranch, &pullRequest.BaseBranch, &pullRequest.Error,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Attempt{}, false, fmt.Errorf("%w: task %s with current pull request", ErrNotFound, taskID)
@@ -466,10 +465,10 @@ func (s *Store) StartForgeEventAttempt(ctx context.Context, eventID string, plan
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO pull_requests
-			(attempt_id, state, number, url, title, head_branch, base_branch, error, notified_at)
-		VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?)`,
+			(attempt_id, state, number, url, title, head_branch, base_branch, error)
+		VALUES (?, 'open', ?, ?, ?, ?, ?, ?)`,
 		plan.Attempt.ID, pullRequest.Number, pullRequest.URL, pullRequest.Title, headBranch,
-		pullRequest.BaseBranch, pullRequest.Error, nullableString(notifiedAt.String)); err != nil {
+		pullRequest.BaseBranch, pullRequest.Error); err != nil {
 		return Attempt{}, false, fmt.Errorf("copy forge follow-up pull request: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `

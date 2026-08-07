@@ -46,11 +46,9 @@ type ListOptions struct {
 }
 
 type CreateTaskRequest struct {
-	Repository     string        `json:"repository"`
-	Prompt         string        `json:"prompt"`
-	IdempotencyKey string        `json:"idempotency_key,omitempty"`
-	SlackOrigin    *SlackDetails `json:"slack_origin,omitempty"`
-	SlackEventID   string        `json:"slack_event_id,omitempty"`
+	Repository     string `json:"repository"`
+	Prompt         string `json:"prompt"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 type TaskList struct {
@@ -82,8 +80,6 @@ type Task struct {
 	PullRequest           PullRequest     `json:"pull_request"`
 	KubernetesJob         KubernetesJob   `json:"kubernetes_job"`
 	KubernetesPod         KubernetesPod   `json:"kubernetes_pod"`
-	SlackEventID          string          `json:"slack_event_id"`
-	SlackOrigin           SlackDetails    `json:"slack_origin"`
 }
 
 type Attempt struct {
@@ -176,14 +172,6 @@ type KubernetesPod struct {
 	CompletedAt      *time.Time       `json:"completed_at"`
 }
 
-type SlackDetails struct {
-	WorkspaceID string `json:"workspace_id"`
-	ChannelID   string `json:"channel_id"`
-	MessageTS   string `json:"message_ts"`
-	ThreadTS    string `json:"thread_ts"`
-	UserID      string `json:"user_id"`
-}
-
 type LogOptions struct {
 	Follow    bool
 	AttemptID string
@@ -200,6 +188,44 @@ func (c *Client) ShowTask(ctx context.Context, taskID string) (Task, error) {
 	var result Task
 	err := c.getJSON(ctx, "/v1/tasks/"+url.PathEscape(taskID), nil, &result)
 	return result, err
+}
+
+// WaitTask observes a task until its pull request is available or the task is terminal.
+func (c *Client) WaitTask(ctx context.Context, taskID string) (Task, error) {
+	for {
+		result, err := c.ShowTask(ctx, taskID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return Task{}, fmt.Errorf("wait for task: %w", ctx.Err())
+			}
+			if !transientWaitError(err) {
+				return Task{}, err
+			}
+		}
+		if err == nil && (result.PullRequest.URL != "" || result.State == "failed" || result.State == "cancelled" || result.State == "ready") {
+			return result, nil
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return Task{}, fmt.Errorf("wait for task: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func transientWaitError(err error) bool {
+	var apiError *APIError
+	if errors.As(err, &apiError) {
+		return apiError.Status >= http.StatusInternalServerError
+	}
+	var responseError *httpResponseError
+	if errors.As(err, &responseError) {
+		return responseError.status >= http.StatusInternalServerError
+	}
+	var transportError *url.Error
+	return errors.As(err, &transportError)
 }
 
 func (c *Client) CreateTask(ctx context.Context, request CreateTaskRequest) (Task, error) {
@@ -376,19 +402,27 @@ func decodeData(body io.Reader, target any) error {
 func decodeHTTPError(response *http.Response) error {
 	contents, readErr := readBounded(response.Body)
 	if readErr != nil {
-		return fmt.Errorf("read controller error: %w", readErr)
+		return &httpResponseError{status: response.StatusCode, err: fmt.Errorf("read controller error: %w", readErr)}
 	}
 	var envelope struct {
 		Error Error `json:"error"`
 	}
 	if err := decodeStrict(contents, &envelope); err != nil {
-		return fmt.Errorf("controller returned %s: decode error: %w", response.Status, err)
+		return &httpResponseError{status: response.StatusCode, err: fmt.Errorf("controller returned %s: decode error: %w", response.Status, err)}
 	}
 	if envelope.Error.Code == "" || envelope.Error.Message == "" {
-		return fmt.Errorf("controller returned %s: error code and message are required", response.Status)
+		return &httpResponseError{status: response.StatusCode, err: fmt.Errorf("controller returned %s: error code and message are required", response.Status)}
 	}
 	return &APIError{Status: response.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message, Details: envelope.Error.Details}
 }
+
+type httpResponseError struct {
+	status int
+	err    error
+}
+
+func (e *httpResponseError) Error() string { return e.err.Error() }
+func (e *httpResponseError) Unwrap() error { return e.err }
 
 func readBounded(body io.Reader) ([]byte, error) {
 	contents, err := io.ReadAll(io.LimitReader(body, maxJSONBody+1))

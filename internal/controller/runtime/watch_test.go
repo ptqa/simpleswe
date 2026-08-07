@@ -25,10 +25,6 @@ import (
 	"github.com/simpleswe/simpleswe/internal/task"
 )
 
-type cleanupNotifier struct{}
-
-func (cleanupNotifier) PostPullRequest(context.Context, string, string) error { return nil }
-
 type cleanupPullRequests struct{}
 
 func (cleanupPullRequests) CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
@@ -482,7 +478,7 @@ func TestSecretCleanupFinalCheckUsesDurableGenerationAndSecretUID(t *testing.T) 
 			Name: "widget", CloneURL: taskRecord.Repository, DefaultBranch: "main", Worker: config.WorkerConfig{Image: "worker:test"},
 			Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
 		}},
-	}, cleanupNotifier{}, cleanupPullRequests{})
+	}, cleanupPullRequests{})
 	if err != nil {
 		t.Fatalf("new actual controller: %v", err)
 	}
@@ -546,24 +542,13 @@ func (c *transientRecoveryController) Reconcile(context.Context) error {
 	return nil
 }
 
-func TestRunRetriesTransientJobPullRequestAndNotificationWithoutWatchActivity(t *testing.T) {
+func TestRunRetriesTransientJobAndPullRequestWithoutWatchActivity(t *testing.T) {
 	const namespace = "simpleswe-workers"
 	db, _, _, _ := backendStore(t)
 	controller := &transientRecoveryController{fakeController: newFakeController(db)}
 	client := fake.NewSimpleClientset()
-	var notificationMu sync.Mutex
-	notifications := 0
 	r, err := NewRuntime(client, db, controller, NewBackend(db, controller), Options{
 		Namespace: namespace, PodLogs: &fakePodLogs{content: map[string][]string{}}, RecoveryInterval: 10 * time.Millisecond,
-		NotifyPendingPullRequests: func(context.Context) error {
-			notificationMu.Lock()
-			defer notificationMu.Unlock()
-			notifications++
-			if notifications == 1 {
-				return errors.New("transient notification failure")
-			}
-			return nil
-		},
 	})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
@@ -575,10 +560,7 @@ func TestRunRetriesTransientJobPullRequestAndNotificationWithoutWatchActivity(t 
 		controller.mu.Lock()
 		reconciles := controller.attempts
 		controller.mu.Unlock()
-		notificationMu.Lock()
-		notifies := notifications
-		notificationMu.Unlock()
-		return reconciles >= 3 && notifies >= 2
+		return reconciles >= 3
 	}, "autonomous recovery retries without watch events")
 	cancel()
 	select {

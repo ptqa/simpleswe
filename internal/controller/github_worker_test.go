@@ -32,7 +32,7 @@ func TestGitHubHTTPSWorkerMountsTokenSecretAndNeverEmbedsToken(t *testing.T) {
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("seed GitHub Secret: %v", err)
 	}
-	control, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+	control, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("recreate controller: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestGitHubHTTPSWorkerUsesOnlySeparateWorkerCredentials(t *testing.T) {
 	repository.Bitbucket = config.RepositoryBitbucketConfig{}
 	repository.GitHub = config.RepositoryGitHubConfig{Owner: "Acme", Repository: "Widget", CredentialsSecret: "github-controller"}
 	repository.Credentials.SecretName = "github-worker"
-	control, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+	control, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("recreate controller: %v", err)
 	}

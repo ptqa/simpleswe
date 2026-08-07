@@ -20,10 +20,11 @@ const (
 	controllerUsage = "usage: simpleswe controller --config PATH --database PATH"
 	workerUsage     = "usage: simpleswe worker [--manifest PATH]"
 	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
-	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs>"
-	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] REPOSITORY PROMPT"
+	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
+	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] REPOSITORY PROMPT"
 	taskListUsage   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	taskShowUsage   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
+	taskWaitUsage   = "usage: simpleswe task wait [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskCancelUsage = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskRetryUsage  = "usage: simpleswe task retry [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskLogsUsage   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] ID"
@@ -42,6 +43,7 @@ type Dependencies struct {
 	CreateTask func(context.Context, string, client.CreateTaskRequest) (client.Task, error)
 	ListTasks  func(context.Context, string) (client.TaskList, error)
 	ShowTask   func(context.Context, string, string) (client.Task, error)
+	WaitTask   func(context.Context, string, string) (client.Task, error)
 	CancelTask func(context.Context, string, string) (client.Task, error)
 	RetryTask  func(context.Context, string, string) (client.Task, error)
 	StreamLogs func(context.Context, string, string, io.Writer) error
@@ -112,7 +114,7 @@ func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer, dep
 }
 
 func runTUI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
-	flags, _, ok := parseRuntimeArgs(args, 0)
+	flags, _, ok := parseRuntimeArgs(args, 0, false)
 	if !ok {
 		return errors.New(tuiUsage)
 	}
@@ -136,7 +138,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	if !ok {
 		return fmt.Errorf("unknown task command %q; %s", command, taskUsage)
 	}
-	flags, positional, ok := parseRuntimeArgs(args[1:], positionalCount)
+	flags, positional, ok := parseRuntimeArgs(args[1:], positionalCount, command == "create")
 	if !ok {
 		return errors.New(usage)
 	}
@@ -156,8 +158,9 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 			return errors.New("task create runtime is not configured")
 		}
 		result, err := deps.CreateTask(ctx, address, client.CreateTaskRequest{
-			Repository: positional[0],
-			Prompt:     positional[1],
+			Repository:     positional[0],
+			Prompt:         positional[1],
+			IdempotencyKey: flags.idempotencyKey,
 		})
 		if err != nil {
 			return err
@@ -174,6 +177,8 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		return encodeJSON(stdout, result)
 	case "show":
 		return runTaskJSON(ctx, address, positional[0], stdout, deps.ShowTask, "task show runtime is not configured")
+	case "wait":
+		return runTaskJSON(ctx, address, positional[0], stdout, deps.WaitTask, "task wait runtime is not configured")
 	case "cancel":
 		return runTaskJSON(ctx, address, positional[0], stdout, deps.CancelTask, "task cancel runtime is not configured")
 	case "retry":
@@ -206,16 +211,22 @@ func runTaskJSON(
 }
 
 type runtimeFlags struct {
-	kubeContext string
-	namespace   string
-	address     string
+	kubeContext    string
+	namespace      string
+	address        string
+	idempotencyKey string
 }
 
-func parseRuntimeArgs(args []string, positionalCount int) (runtimeFlags, []string, bool) {
+type runtimeFlagState struct {
+	contextSet        bool
+	namespaceSet      bool
+	addressSet        bool
+	idempotencyKeySet bool
+}
+
+func parseRuntimeArgs(args []string, positionalCount int, allowIdempotencyKey bool) (runtimeFlags, []string, bool) {
 	flags := runtimeFlags{namespace: defaultNamespace}
-	contextSet := false
-	namespaceSet := false
-	addressSet := false
+	var state runtimeFlagState
 	var positional []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -227,31 +238,11 @@ func parseRuntimeArgs(args []string, positionalCount int) (runtimeFlags, []strin
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
-			switch arg {
-			case "--context":
-				value, next, ok := nextValue(args, i)
-				if !ok || contextSet {
-					return runtimeFlags{}, nil, false
-				}
-				flags.kubeContext, i = value, next
-				contextSet = true
-			case "--namespace":
-				value, next, ok := nextValue(args, i)
-				if !ok || namespaceSet {
-					return runtimeFlags{}, nil, false
-				}
-				flags.namespace, i = value, next
-				namespaceSet = true
-			case "--address":
-				value, next, ok := nextValue(args, i)
-				if !ok || addressSet {
-					return runtimeFlags{}, nil, false
-				}
-				flags.address, i = value, next
-				addressSet = true
-			default:
+			next, ok := state.parse(args, i, &flags, allowIdempotencyKey)
+			if !ok {
 				return runtimeFlags{}, nil, false
 			}
+			i = next
 			continue
 		}
 
@@ -261,6 +252,43 @@ func parseRuntimeArgs(args []string, positionalCount int) (runtimeFlags, []strin
 		return runtimeFlags{}, nil, false
 	}
 	return flags, positional, true
+}
+
+func (state *runtimeFlagState) parse(args []string, index int, flags *runtimeFlags, allowIdempotencyKey bool) (int, bool) {
+	value, next, ok := nextValue(args, index)
+	if !ok {
+		return index, false
+	}
+
+	switch args[index] {
+	case "--context":
+		if state.contextSet {
+			return index, false
+		}
+		flags.kubeContext = value
+		state.contextSet = true
+	case "--namespace":
+		if state.namespaceSet {
+			return index, false
+		}
+		flags.namespace = value
+		state.namespaceSet = true
+	case "--address":
+		if state.addressSet {
+			return index, false
+		}
+		flags.address = value
+		state.addressSet = true
+	case "--idempotency-key":
+		if !allowIdempotencyKey || state.idempotencyKeySet {
+			return index, false
+		}
+		flags.idempotencyKey = value
+		state.idempotencyKeySet = true
+	default:
+		return index, false
+	}
+	return next, true
 }
 
 func parseControllerArgs(args []string) (configPath, databasePath string, ok bool) {
@@ -322,6 +350,8 @@ func taskCommandUsage(command string) (string, int, bool) {
 		return taskListUsage, 0, true
 	case "show":
 		return taskShowUsage, 1, true
+	case "wait":
+		return taskWaitUsage, 1, true
 	case "cancel":
 		return taskCancelUsage, 1, true
 	case "retry":

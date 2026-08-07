@@ -2,7 +2,6 @@ package controller
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -24,9 +23,9 @@ import (
 func TestCreateTaskPersistsQueuesAndCreatesSecretBeforeOneJob(t *testing.T) {
 	fixture := newFixture(t)
 	params := store.CreateTaskParams{
-		Repository:   repositoryURL,
-		Prompt:       "fix the flaky test",
-		SlackEventID: "Ev-123",
+		Repository:     repositoryURL,
+		Prompt:         "fix the flaky test",
+		IdempotencyKey: "request-123",
 	}
 
 	created, err := fixture.controller.CreateTask(fixture.ctx, params)
@@ -77,12 +76,12 @@ func TestCreateTaskPersistsQueuesAndCreatesSecretBeforeOneJob(t *testing.T) {
 	}
 
 	replayed, err := fixture.controller.CreateTask(fixture.ctx, store.CreateTaskParams{
-		Repository:   "https://bitbucket.example/ignored/other.git",
-		Prompt:       "different replay payload",
-		SlackEventID: params.SlackEventID,
+		Repository:     "https://bitbucket.example/ignored/other.git",
+		Prompt:         "different replay payload",
+		IdempotencyKey: params.IdempotencyKey,
 	})
 	if err != nil {
-		t.Fatalf("CreateTask(replayed Slack event) error = %v", err)
+		t.Fatalf("CreateTask(replayed request) error = %v", err)
 	}
 	if replayed.ID != created.ID {
 		t.Fatalf("replayed event task ID = %q; want %q", replayed.ID, created.ID)
@@ -132,33 +131,6 @@ func TestCreateTaskIdempotencyReplayDoesNotCreateAnotherJobOrAttempt(t *testing.
 	}
 	if len(attempts) != 1 || attempts[0].Number != 1 {
 		t.Fatalf("idempotency replay attempts = %#v; want only attempt 1", attempts)
-	}
-}
-
-func TestCreateTaskRejectsGenericAndSlackKeysBeforeCreatingResources(t *testing.T) {
-	fixture := newFixture(t)
-	created, err := fixture.controller.CreateTask(fixture.ctx, store.CreateTaskParams{
-		Repository:     repositoryURL,
-		Prompt:         "ambiguous idempotency source",
-		IdempotencyKey: "generic-1",
-		SlackEventID:   "slack-1",
-	})
-
-	if !errors.Is(err, store.ErrConflict) {
-		t.Errorf("CreateTask() error = %v, want store.ErrConflict", err)
-	}
-	if created.ID != "" {
-		t.Errorf("CreateTask() task = %#v, want zero task", created)
-	}
-	if resources := createResources(fixture.kube.Actions()); len(resources) != 0 {
-		t.Errorf("CreateTask() created Kubernetes resources: %v", resources)
-	}
-	tasks, listErr := fixture.store.ListTasks(fixture.ctx)
-	if listErr != nil {
-		t.Fatalf("ListTasks(): %v", listErr)
-	}
-	if len(tasks) != 0 {
-		t.Errorf("CreateTask() persisted tasks: %#v", tasks)
 	}
 }
 
@@ -534,7 +506,7 @@ func TestWorkerFailureEventRecordsExplicitFailure(t *testing.T) {
 	assertFailureDetails(t, events[len(events)-1], "worker", jobName, "worker-pod-a1", 9)
 }
 
-func TestBranchPushedCreatesAndNotifiesPullRequestAtMostOnce(t *testing.T) {
+func TestBranchPushedCreatesPullRequestAtMostOnce(t *testing.T) {
 	fixture := newFixture(t)
 	created := createRunningTask(t, fixture, "open a pull request", "branch-pushed")
 	jobName := jobs.Name(created.ID, 1)
@@ -563,10 +535,6 @@ func TestBranchPushedCreatesAndNotifiesPullRequestAtMostOnce(t *testing.T) {
 		call.input.SourceBranch != event.Branch || call.input.DestinationBranch != "main" {
 		t.Fatalf("Bitbucket PR request = %#v; want acme/widget from %q to main", call, event.Branch)
 	}
-	if len(fixture.notifier.calls) != 1 || fixture.notifier.calls[0].taskID != created.ID ||
-		fixture.notifier.calls[0].url != pullRequestURL {
-		t.Fatalf("notifier calls = %#v; want task and PR link once", fixture.notifier.calls)
-	}
 	runs, err := fixture.store.ListValidationRuns(fixture.ctx, created.CurrentAttemptID)
 	if err != nil || len(runs) != 1 || runs[0].State != "succeeded" {
 		t.Fatalf("successful validation runs = %#v, %v", runs, err)
@@ -574,15 +542,15 @@ func TestBranchPushedCreatesAndNotifiesPullRequestAtMostOnce(t *testing.T) {
 
 	// Replay after reconstructing the controller to require durable, not merely
 	// in-memory, idempotency.
-	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.notifier, fixture.pullRequests)
+	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("restart controller: %v", err)
 	}
 	if err := restarted.HandleWorkerEvent(fixture.ctx, jobName, podName, event); err != nil {
 		t.Fatalf("replay branch_pushed: %v", err)
 	}
-	if len(fixture.pullRequests.calls) != 1 || len(fixture.notifier.calls) != 1 {
-		t.Fatalf("replayed branch event duplicated PR/notification: %d/%d calls", len(fixture.pullRequests.calls), len(fixture.notifier.calls))
+	if len(fixture.pullRequests.calls) != 1 {
+		t.Fatalf("replayed branch event duplicated PR: %d calls", len(fixture.pullRequests.calls))
 	}
 	job, err := fixture.kube.BatchV1().Jobs(workerNamespace).Get(fixture.ctx, jobName, metav1.GetOptions{})
 	if err != nil {

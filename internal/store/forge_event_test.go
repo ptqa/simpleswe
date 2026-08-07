@@ -2,10 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -170,43 +168,6 @@ func TestListIncompleteForgeEventsReturnsOrderedDueBatch(t *testing.T) {
 		if event.ID != fmt.Sprintf("batched-%02d", want) {
 			t.Fatalf("ListIncompleteForgeEvents()[%d] = %q; want batched-%02d", i, event.ID, want)
 		}
-	}
-}
-
-func TestOpenMigratesForgeEventRetrySchedule(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pre-retry-schedule.sqlite")
-	legacy, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := stamp(time.Now().UTC())
-	_, err = legacy.Exec(`CREATE TABLE forge_events (
-		id TEXT PRIMARY KEY, provider TEXT NOT NULL, kind TEXT NOT NULL, owner TEXT NOT NULL,
-		repository TEXT NOT NULL, pull_request_number INTEGER NOT NULL DEFAULT 0, commit_sha TEXT NOT NULL,
-		branch TEXT NOT NULL, comment_id INTEGER NOT NULL DEFAULT 0, comment_kind TEXT NOT NULL DEFAULT '',
-		title TEXT NOT NULL DEFAULT '', body TEXT NOT NULL DEFAULT '', author TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
-		task_id TEXT, attempt_id TEXT, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-		last_error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, handled_at TEXT, failed_at TEXT
-	);
-	INSERT INTO forge_events (id, provider, kind, owner, repository, pull_request_number, commit_sha, branch,
-		comment_id, comment_kind, title, body, author, url, created_at, updated_at)
-	VALUES ('legacy-forge-event', 'bitbucket', 'review_comment', 'acme', 'widget', 42, 'abc', 'work',
-		501, 'comment', 'review', 'fix it', 'Ada', 'https://example.test/comment', ?, ?)`, now, now)
-	if err != nil {
-		_ = legacy.Close()
-		t.Fatal(err)
-	}
-	if err := legacy.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err := Open(t.Context(), path)
-	if err != nil {
-		t.Fatalf("Open migrated store: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	stored, err := db.GetForgeEvent(t.Context(), "legacy-forge-event")
-	if err != nil || stored.NextAttemptAt != nil {
-		t.Fatalf("migrated forge event = %#v, %v", stored, err)
 	}
 }
 
@@ -477,9 +438,6 @@ func TestRetryTaskOnceRebindsRunningForgeEventAndCopiesFollowUpContext(t *testin
 	if err != nil {
 		t.Fatalf("start forge follow-up: %v", err)
 	}
-	if err := db.MarkPullRequestNotified(ctx, failed.ID); err != nil {
-		t.Fatalf("mark follow-up pull request notified: %v", err)
-	}
 	if err := db.Transition(ctx, record.ID, task.QUEUED, task.FAILED, TransitionParams{Reason: "follow-up failed", Trigger: "kubernetes"}); err != nil {
 		t.Fatalf("fail follow-up: %v", err)
 	}
@@ -498,8 +456,8 @@ func TestRetryTaskOnceRebindsRunningForgeEventAndCopiesFollowUpContext(t *testin
 	if err != nil {
 		t.Fatalf("get retry pull request: %v", err)
 	}
-	if copiedPR.Number != originalPR.Number || copiedPR.URL != originalPR.URL || copiedPR.HeadBranch != originalPR.HeadBranch || !copiedPR.Notified {
-		t.Fatalf("retry pull request = %#v; want copied open notified PR %#v", copiedPR, originalPR)
+	if copiedPR.Number != originalPR.Number || copiedPR.URL != originalPR.URL || copiedPR.HeadBranch != originalPR.HeadBranch {
+		t.Fatalf("retry pull request = %#v; want copied open PR %#v", copiedPR, originalPR)
 	}
 	associated, err := db.GetForgeEvent(ctx, event.ID)
 	if err != nil || associated.Status != ForgeEventRunning || associated.AttemptID != retry.ID || associated.TaskID != record.ID {

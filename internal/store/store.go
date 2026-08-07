@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,7 +12,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/simpleswe/simpleswe/internal/task"
-	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 
 	// Register the SQLite database/sql driver used by Open.
 	_ "modernc.org/sqlite"
@@ -33,8 +31,6 @@ type CreateTaskParams struct {
 	Repository     string
 	Prompt         string
 	IdempotencyKey string
-	SlackEventID   string
-	SlackOrigin    protocol.SlackOrigin
 }
 
 type Task struct {
@@ -45,8 +41,6 @@ type Task struct {
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
 	CurrentAttemptID      string
-	SlackEventID          string
-	SlackOrigin           protocol.SlackOrigin
 	CancellationRequested bool
 }
 
@@ -65,27 +59,6 @@ type Attempt struct {
 	ResourceSnapshot []byte
 	ConfigDigest     string
 	CreatedAt        time.Time
-}
-
-const (
-	SlackInboxPending  = "pending"
-	SlackInboxHandled  = "handled"
-	SlackInboxRejected = "rejected"
-)
-
-// SlackInboxEvent is one normalized Socket Mode event durably accepted for
-// processing.
-type SlackInboxEvent struct {
-	EventID   string
-	Kind      string
-	Text      string
-	Origin    protocol.SlackOrigin
-	Status    string
-	Attempts  int
-	LastError string
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	HandledAt *time.Time
 }
 
 type TransitionParams struct {
@@ -135,7 +108,6 @@ type PullRequest struct {
 	HeadBranch string
 	BaseBranch string
 	Error      string
-	Notified   bool
 }
 
 // ValidationRun is one durable validation result for an attempt.
@@ -167,12 +139,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     current_attempt_id TEXT NOT NULL,
-    slack_event_id TEXT,
-    slack_workspace_id TEXT NOT NULL DEFAULT '',
-    slack_channel_id TEXT NOT NULL DEFAULT '',
-    slack_message_ts TEXT NOT NULL DEFAULT '',
-    slack_thread_ts TEXT NOT NULL DEFAULT '',
-    slack_user_id TEXT NOT NULL DEFAULT '',
     cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancellation_requested IN (0, 1))
 );
 
@@ -219,34 +185,6 @@ CREATE TABLE IF NOT EXISTS task_events (
     resource_identity TEXT NOT NULL DEFAULT '{}',
     metadata TEXT NOT NULL DEFAULT '{}',
     error TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS slack_events (
-    event_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL REFERENCES tasks(id),
-    processed_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS slack_inbox (
-	event_id TEXT PRIMARY KEY,
-	kind TEXT NOT NULL,
-	text TEXT NOT NULL,
-	origin_json TEXT NOT NULL,
-	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'handled')),
-	attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-	last_error TEXT NOT NULL DEFAULT '',
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	handled_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS slack_inbox_rejections (
-	event_id TEXT PRIMARY KEY,
-	kind TEXT NOT NULL,
-	attempts INTEGER NOT NULL DEFAULT 1 CHECK (attempts > 0),
-	last_error TEXT NOT NULL,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS forge_events (
@@ -385,6 +323,10 @@ CREATE TABLE IF NOT EXISTS validation_runs (
     created_at TEXT NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_attempt_sequence ON validation_runs(attempt_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_start_event ON validation_runs(start_event_id) WHERE start_event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_result_event ON validation_runs(result_event_id) WHERE result_event_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS git_results (
     attempt_id TEXT PRIMARY KEY REFERENCES task_attempts(id),
     state TEXT NOT NULL,
@@ -401,12 +343,8 @@ CREATE TABLE IF NOT EXISTS pull_requests (
     title TEXT NOT NULL DEFAULT '',
     head_branch TEXT NOT NULL DEFAULT '',
     base_branch TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT '',
-    notified_at TEXT
+    error TEXT NOT NULL DEFAULT ''
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS tasks_slack_event_id
-    ON tasks(slack_event_id) WHERE slack_event_id IS NOT NULL;
 `
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -446,61 +384,32 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if !strings.EqualFold(journalMode, "wal") {
 		return closeOnError(fmt.Errorf("SQLite journal mode is %q, want wal", journalMode))
 	}
-	if _, err := db.ExecContext(ctx, schema); err != nil {
-		return closeOnError(fmt.Errorf("create SQLite schema: %w", err))
+	var version, userTables int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return closeOnError(fmt.Errorf("read SQLite schema version: %w", err))
 	}
-	for _, migration := range []string{
-		"ALTER TABLE tasks ADD COLUMN slack_workspace_id TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE tasks ADD COLUMN slack_channel_id TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE tasks ADD COLUMN slack_message_ts TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE tasks ADD COLUMN slack_thread_ts TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE tasks ADD COLUMN slack_user_id TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE pull_requests ADD COLUMN notified_at TEXT",
-		"ALTER TABLE task_attempts ADD COLUMN logs_exhausted INTEGER NOT NULL DEFAULT 0 CHECK (logs_exhausted IN (0, 1))",
-		"ALTER TABLE task_attempts ADD COLUMN prompt TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN base_branch TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN task_branch TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN validation_state TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN manifest_json BLOB NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN resource_snapshot BLOB NOT NULL DEFAULT ''",
-		"ALTER TABLE task_attempts ADD COLUMN config_digest TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE validation_runs ADD COLUMN sequence INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE validation_runs ADD COLUMN exit_code INTEGER",
-		"ALTER TABLE validation_runs ADD COLUMN start_event_id TEXT",
-		"ALTER TABLE validation_runs ADD COLUMN result_event_id TEXT",
-		"ALTER TABLE secret_cleanups ADD COLUMN attempt_number INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE secret_cleanups ADD COLUMN secret_uid TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE secret_cleanups ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
-		"ALTER TABLE forge_events ADD COLUMN next_attempt_at TEXT",
-	} {
-		if _, err := db.ExecContext(ctx, migration); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {
-			return closeOnError(fmt.Errorf("migrate SQLite schema: %w", err))
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&userTables); err != nil {
+		return closeOnError(fmt.Errorf("inspect SQLite schema: %w", err))
+	}
+	if version != 1 && (version != 0 || userTables != 0) {
+		return closeOnError(fmt.Errorf("unsupported SQLite schema version %d with %d user tables; recreate the controller PVC/database for schema version 1", version, userTables))
+	}
+	if version == 0 {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return closeOnError(fmt.Errorf("begin SQLite schema initialization: %w", err))
 		}
-	}
-	if _, err := db.ExecContext(ctx, `
-		UPDATE validation_runs SET sequence = (
-			SELECT COUNT(*) FROM validation_runs AS earlier
-			WHERE earlier.attempt_id = validation_runs.attempt_id AND earlier.rowid <= validation_runs.rowid
-		) WHERE sequence = 0`); err != nil {
-		return closeOnError(fmt.Errorf("migrate validation sequences: %w", err))
-	}
-	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_attempt_sequence ON validation_runs(attempt_id, sequence)`); err != nil {
-		return closeOnError(fmt.Errorf("index validation sequences: %w", err))
-	}
-	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_start_event ON validation_runs(start_event_id) WHERE start_event_id IS NOT NULL`); err != nil {
-		return closeOnError(fmt.Errorf("index validation start events: %w", err))
-	}
-	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS validation_runs_result_event ON validation_runs(result_event_id) WHERE result_event_id IS NOT NULL`); err != nil {
-		return closeOnError(fmt.Errorf("index validation result events: %w", err))
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE secret_cleanups SET attempt_number = COALESCE((SELECT number FROM task_attempts WHERE id = secret_cleanups.attempt_id), attempt_number) WHERE attempt_number = 0`); err != nil {
-		return closeOnError(fmt.Errorf("migrate Secret cleanup attempt numbers: %w", err))
-	}
-	if _, err := db.ExecContext(ctx, `
-		UPDATE task_attempts
-		SET state = (SELECT tasks.state FROM tasks WHERE tasks.current_attempt_id = task_attempts.id)
-		WHERE id IN (SELECT current_attempt_id FROM tasks)`); err != nil {
-		return closeOnError(fmt.Errorf("repair current attempt states: %w", err))
+		if _, err := tx.ExecContext(ctx, schema); err != nil {
+			_ = tx.Rollback()
+			return closeOnError(fmt.Errorf("create SQLite schema: %w", err))
+		}
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+			_ = tx.Rollback()
+			return closeOnError(fmt.Errorf("mark SQLite schema version: %w", err))
+		}
+		if err := tx.Commit(); err != nil {
+			return closeOnError(fmt.Errorf("commit SQLite schema initialization: %w", err))
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -512,139 +421,14 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// PutSlackInboxEvent inserts a normalized event once and returns the durable
-// version. A duplicate event ID never replaces the original payload.
-func (s *Store) PutSlackInboxEvent(ctx context.Context, event SlackInboxEvent) (SlackInboxEvent, error) {
-	if strings.TrimSpace(event.EventID) == "" {
-		return SlackInboxEvent{}, errors.New("Slack inbox event ID is empty")
-	}
-	if strings.TrimSpace(event.Kind) == "" {
-		return SlackInboxEvent{}, errors.New("Slack inbox event kind is empty")
-	}
-	origin, err := json.Marshal(event.Origin)
-	if err != nil {
-		return SlackInboxEvent{}, fmt.Errorf("marshal Slack inbox origin: %w", err)
-	}
-	now := stamp(time.Now().UTC())
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT INTO slack_inbox
-			(event_id, kind, text, origin_json, status, attempts, last_error, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'pending', 0, '', ?, ?)
-		ON CONFLICT(event_id) DO NOTHING`, event.EventID, event.Kind, event.Text, string(origin), now, now); err != nil {
-		return SlackInboxEvent{}, fmt.Errorf("insert Slack inbox event %q: %w", event.EventID, err)
-	}
-	stored, err := scanSlackInboxEvent(s.db.QueryRowContext(ctx, slackInboxSelect+" WHERE event_id = ?", event.EventID))
-	if err != nil {
-		return SlackInboxEvent{}, fmt.Errorf("read Slack inbox event %q: %w", event.EventID, err)
-	}
-	return stored, nil
-}
-
-// RecordRejectedSlackInboxEvent records a malformed supported envelope
-// without placing it in the pending handler queue.
-func (s *Store) RecordRejectedSlackInboxEvent(ctx context.Context, eventID, kind string, cause error) error {
-	if strings.TrimSpace(eventID) == "" {
-		return errors.New("rejected Slack inbox event ID is empty")
-	}
-	if strings.TrimSpace(kind) == "" {
-		return errors.New("rejected Slack inbox event kind is empty")
-	}
-	message := ""
-	if cause != nil {
-		message = cause.Error()
-	}
-	now := stamp(time.Now().UTC())
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO slack_inbox_rejections
-			(event_id, kind, attempts, last_error, created_at, updated_at)
-		VALUES (?, ?, 1, ?, ?, ?)
-		ON CONFLICT(event_id) DO UPDATE SET
-			attempts = attempts + 1, last_error = excluded.last_error, updated_at = excluded.updated_at`,
-		eventID, kind, message, now, now)
-	if err != nil {
-		return fmt.Errorf("record rejected Slack inbox event %q: %w", eventID, err)
-	}
-	return nil
-}
-
-// ListPendingSlackInboxEvents returns unhandled events in acceptance order.
-func (s *Store) ListPendingSlackInboxEvents(ctx context.Context) (_ []SlackInboxEvent, resultErr error) {
-	rows, err := s.db.QueryContext(ctx, slackInboxSelect+" WHERE status = 'pending' ORDER BY created_at, rowid")
-	if err != nil {
-		return nil, fmt.Errorf("list pending Slack inbox events: %w", err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
-	var events []SlackInboxEvent
-	for rows.Next() {
-		event, err := scanSlackInboxEvent(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan pending Slack inbox event: %w", err)
-		}
-		events = append(events, event)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list pending Slack inbox events: %w", err)
-	}
-	return events, nil
-}
-
-// StartSlackInboxAttempt records that handler execution has begun.
-func (s *Store) StartSlackInboxAttempt(ctx context.Context, eventID string) error {
-	return s.updatePendingSlackInbox(ctx, eventID, `
-		UPDATE slack_inbox SET attempts = attempts + 1, updated_at = ?
-		WHERE event_id = ? AND status = 'pending'`, stamp(time.Now().UTC()), eventID)
-}
-
-// RecordSlackInboxError leaves an event pending for startup or redelivery.
-func (s *Store) RecordSlackInboxError(ctx context.Context, eventID string, cause error) error {
-	message := ""
-	if cause != nil {
-		message = cause.Error()
-	}
-	return s.updatePendingSlackInbox(ctx, eventID, `
-		UPDATE slack_inbox SET last_error = ?, updated_at = ?
-		WHERE event_id = ? AND status = 'pending'`, message, stamp(time.Now().UTC()), eventID)
-}
-
-// MarkSlackInboxHandled completes an event only after its handler succeeds.
-func (s *Store) MarkSlackInboxHandled(ctx context.Context, eventID string) error {
-	now := stamp(time.Now().UTC())
-	return s.updatePendingSlackInbox(ctx, eventID, `
-		UPDATE slack_inbox
-		SET status = 'handled', last_error = '', updated_at = ?, handled_at = ?
-		WHERE event_id = ? AND status = 'pending'`, now, now, eventID)
-}
-
-func (s *Store) updatePendingSlackInbox(ctx context.Context, eventID, query string, args ...any) error {
-	if strings.TrimSpace(eventID) == "" {
-		return errors.New("Slack inbox event ID is empty")
-	}
-	result, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("update Slack inbox event %q: %w", eventID, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("confirm Slack inbox event %q update: %w", eventID, err)
-	}
-	if affected != 1 {
-		return fmt.Errorf("%w: pending Slack inbox event %s", ErrNotFound, eventID)
-	}
-	return nil
-}
-
 func (s *Store) CreateTask(ctx context.Context, params CreateTaskParams) (Task, error) {
 	created, _, err := s.CreateTaskOnce(ctx, params)
 	return created, err
 }
 
 // CreateTaskOnce creates a task or returns the task already associated with a
-// generic idempotency key or Slack event. The boolean reports whether this call
-// inserted the task.
+// generic idempotency key. The boolean reports whether this call inserted the task.
 func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Task, bool, error) {
-	if params.IdempotencyKey != "" && params.SlackEventID != "" {
-		return Task{}, false, fmt.Errorf("%w: idempotency key and Slack event ID are mutually exclusive", ErrConflict)
-	}
 	if params.IdempotencyKey != "" && strings.TrimSpace(params.IdempotencyKey) == "" {
 		return Task{}, false, errors.New("task create idempotency key is empty")
 	}
@@ -673,14 +457,6 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 			return Task{}, false, fmt.Errorf("look up task create intent: %w", err)
 		}
 	}
-	if existingID == "" && params.SlackEventID != "" {
-		err := tx.QueryRowContext(ctx,
-			"SELECT task_id FROM slack_events WHERE event_id = ?", params.SlackEventID,
-		).Scan(&existingID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return Task{}, false, fmt.Errorf("look up Slack event: %w", err)
-		}
-	}
 	if existingID != "" {
 		existing, err := scanTask(tx.QueryRowContext(ctx, taskSelect, existingID))
 		if err != nil {
@@ -703,13 +479,10 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tasks
-			(id, repository, prompt, state, created_at, updated_at, current_attempt_id, slack_event_id,
-			 slack_workspace_id, slack_channel_id, slack_message_ts, slack_thread_ts, slack_user_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, repository, prompt, state, created_at, updated_at, current_attempt_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		taskID, params.Repository, params.Prompt, task.RECEIVED,
-		stamp(now), stamp(now), attemptID, nullableString(params.SlackEventID),
-		params.SlackOrigin.WorkspaceID, params.SlackOrigin.ChannelID, params.SlackOrigin.MessageTS,
-		params.SlackOrigin.ThreadTS, params.SlackOrigin.UserID,
+		stamp(now), stamp(now), attemptID,
 	); err != nil {
 		return Task{}, false, fmt.Errorf("insert task: %w", err)
 	}
@@ -725,13 +498,6 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 			return Task{}, false, fmt.Errorf("record task create intent: %w", err)
 		}
 	}
-	if params.SlackEventID != "" {
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO slack_events (event_id, task_id, processed_at)
-			VALUES (?, ?, ?)`, params.SlackEventID, taskID, stamp(now)); err != nil {
-			return Task{}, false, fmt.Errorf("record Slack event: %w", err)
-		}
-	}
 	if err := tx.Commit(); err != nil {
 		return Task{}, false, fmt.Errorf("commit task creation: %w", err)
 	}
@@ -743,8 +509,6 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 		CreatedAt:        now,
 		UpdatedAt:        now,
 		CurrentAttemptID: attemptID,
-		SlackEventID:     params.SlackEventID,
-		SlackOrigin:      params.SlackOrigin,
 	}, true, nil
 }
 
@@ -759,10 +523,7 @@ func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey stri
 	}
 	got, err := scanTask(s.db.QueryRowContext(ctx, `
 		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at,
-		       tasks.updated_at, tasks.current_attempt_id, tasks.slack_event_id,
-		       tasks.slack_workspace_id, tasks.slack_channel_id, tasks.slack_message_ts,
-		       tasks.slack_thread_ts, tasks.slack_user_id,
-		       tasks.cancellation_requested
+		       tasks.updated_at, tasks.current_attempt_id, tasks.cancellation_requested
 		FROM task_create_intents JOIN tasks ON tasks.id = task_create_intents.task_id
 		WHERE task_create_intents.idempotency_key = ?`, idempotencyKey))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -770,28 +531,6 @@ func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey stri
 	}
 	if err != nil {
 		return Task{}, fmt.Errorf("get task for idempotency key %q: %w", idempotencyKey, err)
-	}
-	return got, nil
-}
-
-// GetTaskBySlackEventID returns the task already associated with an event.
-func (s *Store) GetTaskBySlackEventID(ctx context.Context, eventID string) (Task, error) {
-	if strings.TrimSpace(eventID) == "" {
-		return Task{}, errors.New("Slack event ID is empty")
-	}
-	got, err := scanTask(s.db.QueryRowContext(ctx, `
-		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at,
-		       tasks.updated_at, tasks.current_attempt_id, tasks.slack_event_id,
-		       tasks.slack_workspace_id, tasks.slack_channel_id, tasks.slack_message_ts,
-		       tasks.slack_thread_ts, tasks.slack_user_id,
-		       tasks.cancellation_requested
-		FROM slack_events JOIN tasks ON tasks.id = slack_events.task_id
-		WHERE slack_events.event_id = ?`, eventID))
-	if errors.Is(err, sql.ErrNoRows) {
-		return Task{}, fmt.Errorf("%w: Slack event %s", ErrNotFound, eventID)
-	}
-	if err != nil {
-		return Task{}, fmt.Errorf("get task for Slack event %q: %w", eventID, err)
 	}
 	return got, nil
 }
@@ -811,8 +550,7 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
 func (s *Store) ListTasks(ctx context.Context) (_ []Task, resultErr error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, repository, prompt, state, created_at, updated_at,
-		       current_attempt_id, slack_event_id, slack_workspace_id, slack_channel_id,
-		       slack_message_ts, slack_thread_ts, slack_user_id, cancellation_requested
+		       current_attempt_id, cancellation_requested
 		FROM tasks ORDER BY created_at DESC, rowid DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list tasks: %w", err)
@@ -838,8 +576,7 @@ func (s *Store) ListTasks(ctx context.Context) (_ []Task, resultErr error) {
 func (s *Store) ListActiveTasks(ctx context.Context) (_ []Task, resultErr error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at, tasks.updated_at,
-		       tasks.current_attempt_id, tasks.slack_event_id, tasks.slack_workspace_id, tasks.slack_channel_id,
-		       tasks.slack_message_ts, tasks.slack_thread_ts, tasks.slack_user_id, tasks.cancellation_requested
+		       tasks.current_attempt_id, tasks.cancellation_requested
 		FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
 		WHERE tasks.state NOT IN (?, ?, ?) OR task_attempts.logs_exhausted = 0
 		ORDER BY tasks.created_at, tasks.rowid`, task.READY, task.FAILED, task.CANCELLED)
@@ -1128,8 +865,8 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	if forgeEventID != "" {
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO pull_requests
-				(attempt_id, state, number, url, title, head_branch, base_branch, error, notified_at)
-			SELECT ?, state, number, url, title, head_branch, base_branch, error, notified_at
+				(attempt_id, state, number, url, title, head_branch, base_branch, error)
+			SELECT ?, state, number, url, title, head_branch, base_branch, error
 			FROM pull_requests WHERE attempt_id = ? AND state = 'open'`, attempt.ID, currentAttemptID)
 		if err != nil {
 			return Attempt{}, false, fmt.Errorf("copy forge retry pull request: %w", err)
@@ -1809,8 +1546,7 @@ func (s *Store) ReservePullRequest(ctx context.Context, attemptID, title, headBr
 	return affected == 1, nil
 }
 
-// CompletePullRequest stores the provider result before any notification is
-// sent. It only completes a previously reserved row.
+// CompletePullRequest stores the provider result. It only completes a previously reserved row.
 func (s *Store) CompletePullRequest(ctx context.Context, attemptID string, number int, url string) error {
 	if number <= 0 || strings.TrimSpace(url) == "" {
 		return errors.New("pull request number and URL are required")
@@ -1848,12 +1584,11 @@ func (s *Store) FailPullRequest(ctx context.Context, attemptID string, cause err
 func (s *Store) GetPullRequest(ctx context.Context, attemptID string) (PullRequest, error) {
 	var result PullRequest
 	var number sql.NullInt64
-	var notifiedAt sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT attempt_id, state, number, url, title, head_branch, base_branch, error, notified_at
+		SELECT attempt_id, state, number, url, title, head_branch, base_branch, error
 		FROM pull_requests WHERE attempt_id = ?`, attemptID).Scan(
 		&result.AttemptID, &result.State, &number, &result.URL, &result.Title,
-		&result.HeadBranch, &result.BaseBranch, &result.Error, &notifiedAt,
+		&result.HeadBranch, &result.BaseBranch, &result.Error,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PullRequest{}, fmt.Errorf("%w: pull request for attempt %s", ErrNotFound, attemptID)
@@ -1864,27 +1599,7 @@ func (s *Store) GetPullRequest(ctx context.Context, attemptID string) (PullReque
 	if number.Valid {
 		result.Number = int(number.Int64)
 	}
-	result.Notified = notifiedAt.Valid
 	return result, nil
-}
-
-// MarkPullRequestNotified records successful delivery so event replay after a
-// controller restart does not post the same durable result again.
-func (s *Store) MarkPullRequestNotified(ctx context.Context, attemptID string) error {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE pull_requests SET notified_at = COALESCE(notified_at, ?)
-		WHERE attempt_id = ? AND state = 'open'`, stamp(time.Now().UTC()), attemptID)
-	if err != nil {
-		return fmt.Errorf("mark pull request notified for attempt %q: %w", attemptID, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("confirm pull request notification for attempt %q: %w", attemptID, err)
-	}
-	if affected != 1 {
-		return fmt.Errorf("%w: open pull request for attempt %s", ErrNotFound, attemptID)
-	}
-	return nil
 }
 
 func (s *Store) Pragmas(ctx context.Context) (SQLitePragmas, error) {
@@ -1905,14 +1620,8 @@ func (s *Store) Pragmas(ctx context.Context) (SQLitePragmas, error) {
 
 const taskSelect = `
 	SELECT id, repository, prompt, state, created_at, updated_at,
-	       current_attempt_id, slack_event_id, slack_workspace_id, slack_channel_id,
-	       slack_message_ts, slack_thread_ts, slack_user_id, cancellation_requested
+	       current_attempt_id, cancellation_requested
 	FROM tasks WHERE id = ?`
-
-const slackInboxSelect = `
-	SELECT event_id, kind, text, origin_json, status, attempts, last_error,
-	       created_at, updated_at, handled_at
-	FROM slack_inbox`
 
 type scanner interface {
 	Scan(dest ...any) error
@@ -1921,13 +1630,10 @@ type scanner interface {
 func scanTask(row scanner) (Task, error) {
 	var result Task
 	var state, createdAt, updatedAt string
-	var slackEventID sql.NullString
 	var cancellationRequested int
 	if err := row.Scan(
 		&result.ID, &result.Repository, &result.Prompt, &state, &createdAt, &updatedAt,
-		&result.CurrentAttemptID, &slackEventID,
-		&result.SlackOrigin.WorkspaceID, &result.SlackOrigin.ChannelID, &result.SlackOrigin.MessageTS,
-		&result.SlackOrigin.ThreadTS, &result.SlackOrigin.UserID, &cancellationRequested,
+		&result.CurrentAttemptID, &cancellationRequested,
 	); err != nil {
 		return Task{}, err
 	}
@@ -1941,9 +1647,6 @@ func scanTask(row scanner) (Task, error) {
 		return Task{}, err
 	}
 	result.State = task.State(state)
-	if slackEventID.Valid {
-		result.SlackEventID = slackEventID.String
-	}
 	result.CancellationRequested = cancellationRequested == 1
 	return result, nil
 }
@@ -1968,38 +1671,6 @@ func scanAttempt(row scanner) (Attempt, error) {
 	result.LogsExhausted = logsExhausted == 1
 	result.State = task.State(state)
 	return result, nil
-}
-
-func scanSlackInboxEvent(row scanner) (SlackInboxEvent, error) {
-	var event SlackInboxEvent
-	var origin, createdAt, updatedAt string
-	var handledAt sql.NullString
-	if err := row.Scan(
-		&event.EventID, &event.Kind, &event.Text, &origin, &event.Status,
-		&event.Attempts, &event.LastError, &createdAt, &updatedAt, &handledAt,
-	); err != nil {
-		return SlackInboxEvent{}, err
-	}
-	if err := json.Unmarshal([]byte(origin), &event.Origin); err != nil {
-		return SlackInboxEvent{}, fmt.Errorf("parse Slack inbox origin: %w", err)
-	}
-	var err error
-	event.CreatedAt, err = parseTime(createdAt)
-	if err != nil {
-		return SlackInboxEvent{}, err
-	}
-	event.UpdatedAt, err = parseTime(updatedAt)
-	if err != nil {
-		return SlackInboxEvent{}, err
-	}
-	if handledAt.Valid {
-		handled, err := parseTime(handledAt.String)
-		if err != nil {
-			return SlackInboxEvent{}, err
-		}
-		event.HandledAt = &handled
-	}
-	return event, nil
 }
 
 func validTrigger(trigger string) bool {

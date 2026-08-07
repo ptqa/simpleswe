@@ -28,16 +28,45 @@ resources:
     cpu: 500m
     memory: 512Mi
 
+hermes:
+  enabled: false
+  image:
+    repository: ghcr.io/simpleswe/simpleswe-hermes
+    # Hermes must use an immutable release tag or digest when enabled.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  config:
+    model: ""
+  storage:
+    storageClass: ""
+    size: 5Gi
+    accessModes:
+      - ReadWriteOnce
+  secrets:
+    slack:
+      name: ""
+      keys:
+        botToken: ""
+        appToken: ""
+        allowedUser: ""
+    modelProvider:
+      name: ""
+      key: ""
+      env: ""
+
 nodeSelector: {}
 tolerations: []
 affinity: {}
 
 secrets:
-  slack:
-    name: simpleswe-slack
-    keys:
-      botToken: bot-token
-      appToken: app-token
   webhooks:
     name: simpleswe-webhooks
     keys:
@@ -82,11 +111,6 @@ config:
     command: opencode
     branch_prefix: simpleswe/
     deadline: 30m
-  slack:
-    bot_token:
-      file: /run/secrets/slack/bot-token
-    app_token:
-      file: /run/secrets/slack/app-token
   bitbucket:
     base_url: https://api.bitbucket.org
     webhook_secret:

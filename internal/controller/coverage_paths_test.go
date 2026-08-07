@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -30,31 +29,30 @@ func TestNewRejectsInvalidDependenciesAndConfiguration(t *testing.T) {
 		want string
 	}{
 		{"nil store", func() error {
-			_, err := New(nil, fixture.kube, valid, fixture.notifier, fixture.pullRequests)
+			_, err := New(nil, fixture.kube, valid, fixture.pullRequests)
 			return err
 		}, "Store is nil"},
 		{"nil Kubernetes", func() error {
-			_, err := New(fixture.store, nil, valid, fixture.notifier, fixture.pullRequests)
+			_, err := New(fixture.store, nil, valid, fixture.pullRequests)
 			return err
 		}, "Kubernetes client is nil"},
-		{"nil notifier", func() error { _, err := New(fixture.store, fixture.kube, valid, nil, fixture.pullRequests); return err }, "Notifier is nil"},
-		{"nil pull requests", func() error { _, err := New(fixture.store, fixture.kube, valid, fixture.notifier, nil); return err }, "PullRequestCreator is nil"},
+		{"nil pull requests", func() error { _, err := New(fixture.store, fixture.kube, valid, nil); return err }, "PullRequestCreator is nil"},
 		{"empty namespace", func() error {
 			cfg := valid
 			cfg.Controller.Namespace = " "
-			_, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+			_, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 			return err
 		}, "namespace is empty"},
 		{"invalid deadline", func() error {
 			cfg := valid
 			cfg.Controller.Deadline = 0
-			_, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+			_, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 			return err
 		}, "deadline must be positive"},
 		{"duplicate repository", func() error {
 			cfg := valid
 			cfg.Repositories = append(cfg.Repositories, cfg.Repositories[0])
-			_, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+			_, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 			return err
 		}, "duplicate repository"},
 	}
@@ -64,24 +62,6 @@ func TestNewRejectsInvalidDependenciesAndConfiguration(t *testing.T) {
 				t.Fatalf("New() error = %v; want %q", err, test.want)
 			}
 		})
-	}
-}
-
-func TestControllerFacadePreservesOriginAndDelegatesReads(t *testing.T) {
-	fixture := newFixture(t)
-	control := fixture.controller.(*Controller)
-	origin := protocol.SlackOrigin{WorkspaceID: "T1", ChannelID: "C1", MessageTS: "1.2", UserID: "U1"}
-	created, err := control.CreateTaskWithOrigin(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "facade"}, origin)
-	if err != nil {
-		t.Fatalf("CreateTaskWithOrigin(): %v", err)
-	}
-	got, err := control.GetTask(fixture.ctx, created.ID)
-	if err != nil || !reflect.DeepEqual(got.SlackOrigin, origin) {
-		t.Fatalf("GetTask() origin = %#v, %v; want %#v", got.SlackOrigin, err, origin)
-	}
-	attempts, err := control.ListAttempts(fixture.ctx, created.ID)
-	if err != nil || len(attempts) != 1 || attempts[0].ID != created.CurrentAttemptID {
-		t.Fatalf("ListAttempts() = %#v, %v", attempts, err)
 	}
 }
 
@@ -351,79 +331,6 @@ func TestWorkerLogsExhaustedRejectsMismatchedResources(t *testing.T) {
 	}
 	if err := fixture.controller.WorkerLogsExhausted(fixture.ctx, jobName, podName); err == nil || !strings.Contains(err.Error(), "is not owned") {
 		t.Fatalf("unowned Pod error = %v", err)
-	}
-}
-
-func TestNotifyDurablePullRequestGuardsOutcomeAndDurableState(t *testing.T) {
-	fixture := newFixture(t)
-	control := fixture.controller.(*Controller)
-	record, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "notify guards"})
-	if err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	attempt, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
-	if err != nil {
-		t.Fatalf("current attempt: %v", err)
-	}
-	if err := control.notifyDurablePullRequest(fixture.ctx, record.ID, attempt.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("missing pull request error = %v; want not found", err)
-	}
-	if _, err := fixture.store.ReservePullRequest(fixture.ctx, attempt.ID, record.Prompt, "work/notify", "main"); err != nil {
-		t.Fatalf("reserve pull request: %v", err)
-	}
-	if err := control.notifyDurablePullRequest(fixture.ctx, record.ID, attempt.ID); err == nil || !strings.Contains(err.Error(), "durably \"creating\"") {
-		t.Fatalf("creating pull request error = %v", err)
-	}
-	if err := fixture.store.RequestCancellation(fixture.ctx, record.ID); err != nil {
-		t.Fatalf("request cancellation: %v", err)
-	}
-	if err := control.notifyDurablePullRequest(fixture.ctx, record.ID, attempt.ID); err != nil {
-		t.Fatalf("cancelled notification should be ignored: %v", err)
-	}
-}
-
-func TestNotifyPendingPullRequestsSkipsIneligibleTasks(t *testing.T) {
-	fixture := newFixture(t)
-	withoutPR, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "no pull request"})
-	if err != nil {
-		t.Fatalf("create task without PR: %v", err)
-	}
-	creating, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "creating pull request"})
-	if err != nil {
-		t.Fatalf("create task with creating PR: %v", err)
-	}
-	creatingAttempt, err := fixture.store.CurrentAttempt(fixture.ctx, creating.ID)
-	if err != nil {
-		t.Fatalf("current creating attempt: %v", err)
-	}
-	if _, err := fixture.store.ReservePullRequest(fixture.ctx, creatingAttempt.ID, creating.Prompt, "work/creating", "main"); err != nil {
-		t.Fatalf("reserve creating PR: %v", err)
-	}
-	cancelled, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "cancelled pull request"})
-	if err != nil {
-		t.Fatalf("create cancelled task: %v", err)
-	}
-	cancelledAttempt, err := fixture.store.CurrentAttempt(fixture.ctx, cancelled.ID)
-	if err != nil {
-		t.Fatalf("current cancelled attempt: %v", err)
-	}
-	if _, err := fixture.store.ReservePullRequest(fixture.ctx, cancelledAttempt.ID, cancelled.Prompt, "work/cancelled", "main"); err != nil {
-		t.Fatalf("reserve cancelled PR: %v", err)
-	}
-	if err := fixture.store.CompletePullRequest(fixture.ctx, cancelledAttempt.ID, 42, pullRequestURL); err != nil {
-		t.Fatalf("complete cancelled PR: %v", err)
-	}
-	if err := fixture.store.RequestCancellation(fixture.ctx, cancelled.ID); err != nil {
-		t.Fatalf("request cancellation: %v", err)
-	}
-	if err := fixture.controller.(*Controller).NotifyPendingPullRequests(fixture.ctx); err != nil {
-		t.Fatalf("NotifyPendingPullRequests(): %v", err)
-	}
-	if len(fixture.notifier.calls) != 0 {
-		t.Fatalf("ineligible tasks generated notifications: %#v", fixture.notifier.calls)
-	}
-	if got := getTask(t, fixture, withoutPR.ID); got.ID != withoutPR.ID {
-		t.Fatalf("task without PR changed: %#v", got)
 	}
 }
 

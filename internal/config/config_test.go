@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -53,13 +52,12 @@ repositories:
 	}
 }
 
-func TestLoadAllowsDisabledSlack(t *testing.T) {
-	cfg, err := Load(strings.NewReader("slack:\n  disabled: true\nrepositories: []\n"))
-	if err != nil {
-		t.Fatalf("load config: %v", err)
+func TestLoadRejectsSlackAndLoadsSlackFreeConfig(t *testing.T) {
+	if _, err := Load(strings.NewReader("repositories: []\n")); err != nil {
+		t.Fatalf("load Slack-free config: %v", err)
 	}
-	if !cfg.Slack.Disabled {
-		t.Fatal("Slack disabled setting was not preserved")
+	if _, err := Load(strings.NewReader("slack:\n  disabled: true\nrepositories: []\n")); err == nil || !strings.Contains(strings.ToLower(err.Error()), "slack") {
+		t.Fatalf("Load slack key error = %v, want unknown top-level slack key", err)
 	}
 }
 
@@ -307,20 +305,5 @@ repositories:
     bitbucket: {workspace: acme, repository: widget, credentials_secret_name: widget-bitbucket}
 `)); err != nil {
 		t.Fatalf("Load loopback test server: %v", err)
-	}
-}
-
-func TestExampleConfigUsesRepositoryCredentialTag(t *testing.T) {
-	file, err := os.Open("../../examples/config.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	cfg, err := Load(file)
-	if err != nil {
-		t.Fatalf("Load example config: %v", err)
-	}
-	if got := cfg.Repositories[0].Bitbucket.CredentialsSecret; got != "bitbucket-widget" {
-		t.Fatalf("example Bitbucket credentials Secret = %q", got)
 	}
 }

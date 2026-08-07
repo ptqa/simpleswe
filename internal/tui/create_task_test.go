@@ -161,9 +161,6 @@ func TestCreateTaskSubmissionIsSingleFlightAndImmediatelySelectsAndWatchesTask(t
 	if !strings.HasPrefix(request.IdempotencyKey, "tui-") {
 		t.Fatalf("create idempotency key = %q, want nonempty tui- prefix", request.IdempotencyKey)
 	}
-	if request.SlackEventID != "" {
-		t.Fatalf("create Slack event ID = %q, want empty for TUI caller", request.SlackEventID)
-	}
 	if !app.createPending || app.actionPending {
 		t.Fatalf("create pending = %v, action pending = %v", app.createPending, app.actionPending)
 	}
@@ -351,7 +348,7 @@ func TestCreateTaskAmbiguousFailureWhileModalHiddenRestoresExactRetry(t *testing
 	}
 }
 
-func TestCreateTaskAmbiguousFailureRetryReusesEventKey(t *testing.T) {
+func TestCreateTaskAmbiguousFailureRetryReusesIdempotencyKey(t *testing.T) {
 	fixture := newControllerFixture(t)
 	fixture.failCreateAfterPersist.Store(true)
 	app := newTestApplication(t, fixture.client())
@@ -360,9 +357,6 @@ func TestCreateTaskAmbiguousFailureRetryReusesEventKey(t *testing.T) {
 	firstRequest := receive(t, fixture.createRequestCh)
 	if !strings.HasPrefix(firstRequest.IdempotencyKey, "tui-") {
 		t.Fatalf("first create idempotency key = %q, want nonempty tui- prefix", firstRequest.IdempotencyKey)
-	}
-	if firstRequest.SlackEventID != "" {
-		t.Fatalf("first create Slack event ID = %q, want empty", firstRequest.SlackEventID)
 	}
 	app.applyAction(receive(t, app.actionCh))
 	if app.createPending || app.createEventKey != firstRequest.IdempotencyKey || !strings.Contains(app.createError, "response lost") {
@@ -380,7 +374,7 @@ func TestCreateTaskAmbiguousFailureRetryReusesEventKey(t *testing.T) {
 	}
 }
 
-func TestCreateTaskAmbiguousFailureChangedPayloadUsesNewEventKey(t *testing.T) {
+func TestCreateTaskAmbiguousFailureChangedPayloadUsesNewIdempotencyKey(t *testing.T) {
 	const repository = "https://git.example/acme/new.git"
 	const prompt = "retry changed"
 	for _, test := range []struct {
@@ -427,9 +421,6 @@ func TestCreateTaskAmbiguousFailureChangedPayloadUsesNewEventKey(t *testing.T) {
 			}
 			if !strings.HasPrefix(secondRequest.IdempotencyKey, "tui-") || secondRequest.IdempotencyKey == firstRequest.IdempotencyKey {
 				t.Fatalf("edited retry idempotency keys = first %q, second %q", firstRequest.IdempotencyKey, secondRequest.IdempotencyKey)
-			}
-			if secondRequest.SlackEventID != "" {
-				t.Fatalf("edited retry Slack event ID = %q, want empty", secondRequest.SlackEventID)
 			}
 			result := receive(t, app.actionCh)
 			if result.err != nil || result.task.Repository != test.wantRepository || result.task.Prompt != test.wantPrompt {

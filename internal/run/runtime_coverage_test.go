@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,17 +15,14 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/client-go/kubernetes/fake"
-
 	"github.com/simpleswe/simpleswe/internal/config"
-	"github.com/simpleswe/simpleswe/internal/controller"
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
-	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
 
 const dependencyTaskJSON = `{"task_id":"task-1","state":"queued","created_at":"2026-08-06T00:00:00Z","updated_at":"2026-08-06T00:00:00Z"}`
+const dependencyReadyTaskJSON = `{"task_id":"task-1","state":"ready","pull_request":{"state":"open","url":"https://bitbucket.example/acme/widget/pull-requests/1"}}`
 
 func TestDependenciesCallControllerAPI(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +31,7 @@ func TestDependenciesCallControllerAPI(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks":
 			fmt.Fprintf(w, `{"data":{"tasks":[%s]}}`, dependencyTaskJSON)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks/task-1":
-			fmt.Fprintf(w, `{"data":%s}`, dependencyTaskJSON)
+			fmt.Fprintf(w, `{"data":%s}`, dependencyReadyTaskJSON)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks/task-1/cancel":
 			fmt.Fprintf(w, `{"data":%s}`, dependencyTaskJSON)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks/task-1/retry":
@@ -84,6 +80,10 @@ func TestDependenciesCallControllerAPI(t *testing.T) {
 		if id, err := call(); err != nil || id != "task-1" {
 			t.Errorf("%s() = %q, %v", name, id, err)
 		}
+	}
+	waited, err := deps.WaitTask(ctx, server.URL, "task-1")
+	if err != nil || waited.ID != "task-1" || waited.State != "ready" {
+		t.Fatalf("WaitTask() = %#v, %v, want ready task", waited, err)
 	}
 	var output bytes.Buffer
 	if err := deps.StreamLogs(ctx, server.URL, "task-1", &output); err != nil {
@@ -207,115 +207,6 @@ func TestReadSecretSelectionAndValidation(t *testing.T) {
 	t.Setenv("EMPTY_SECRET", " \n")
 	if _, err := readSecret(config.SecretSource{Env: "EMPTY_SECRET"}, "", "", "", "token"); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("readSecret(empty env) error = %v", err)
-	}
-}
-
-func TestSlackServicesCanBeDisabled(t *testing.T) {
-	missing := config.SecretSource{Env: "MISSING_SLACK_TOKEN"}
-	if _, err := newSlackServices(config.Config{Slack: config.SlackConfig{BotToken: missing}}); err == nil {
-		t.Fatal("newSlackServices accepted missing bot token")
-	}
-	t.Setenv("SLACK_BOT_TOKEN", "xoxb-test")
-	if _, err := newSlackServices(config.Config{Slack: config.SlackConfig{
-		BotToken: config.SecretSource{Env: "SLACK_BOT_TOKEN"},
-		AppToken: missing,
-	}}); err == nil {
-		t.Fatal("newSlackServices accepted missing app token")
-	}
-
-	disabled, err := newSlackServices(config.Config{Slack: config.SlackConfig{Disabled: true}})
-	if err != nil {
-		t.Fatalf("newSlackServices(disabled) error = %v", err)
-	}
-	if disabled.socket != nil || disabled.messenger != nil || len(disabled.components(nil, nil, nil)) != 0 {
-		t.Fatal("disabled Slack configured runtime services")
-	}
-	if err := disabled.notifier(nil).PostPullRequest(context.Background(), "task", "url"); err != nil {
-		t.Fatalf("disabled Slack notifier error = %v", err)
-	}
-
-	t.Setenv("SIMPLESWE_SLACK_BOT_TOKEN", "xoxb-test")
-	t.Setenv("SIMPLESWE_SLACK_APP_TOKEN", "xapp-test")
-	enabled, err := newSlackServices(config.Config{})
-	if err != nil {
-		t.Fatalf("newSlackServices(enabled) error = %v", err)
-	}
-	db := openRunTestStore(t)
-	if enabled.socket == nil || enabled.messenger == nil || len(enabled.components(db, nil, slog.Default())) != 2 {
-		t.Fatal("enabled Slack omitted runtime services")
-	}
-	if _, ok := enabled.notifier(db).(*pullRequestNotifier); !ok {
-		t.Fatal("enabled Slack did not configure pull-request notifier")
-	}
-}
-
-type adapterNotifier struct{}
-
-func (adapterNotifier) PostPullRequest(context.Context, string, string) error { return nil }
-
-type adapterPullRequests struct{}
-
-func (adapterPullRequests) CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
-	return forge.PullRequest{}, nil
-}
-
-func (adapterPullRequests) FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error) {
-	return forge.PullRequest{}, false, nil
-}
-func (adapterPullRequests) GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error) {
-	return forge.PullRequestState{}, nil
-}
-func (adapterPullRequests) PullRequestReplyExists(context.Context, forge.Target, forge.ReplyRequest, string) (bool, error) {
-	return false, nil
-}
-func (adapterPullRequests) ReplyToPullRequest(context.Context, forge.Target, forge.ReplyRequest) error {
-	return nil
-}
-
-func TestLifecycleAdapterDelegatesToController(t *testing.T) {
-	db := openRunTestStore(t)
-	cfg := config.Config{
-		Controller: config.ControllerConfig{Namespace: "simpleswe-workers", Deadline: time.Minute},
-		Worker:     config.WorkerConfig{Command: "opencode", BranchPrefix: "simpleswe/"},
-		Bitbucket:  config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"},
-		Repositories: config.RepositoryConfigs{{
-			Name: "widget", CloneURL: "https://bitbucket.example/acme/widget.git", DefaultBranch: "main",
-			Worker:    config.WorkerConfig{Image: "registry.example/widget:latest"},
-			Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
-		}},
-	}
-	control, err := controller.New(db, fake.NewSimpleClientset(), cfg, adapterNotifier{}, adapterPullRequests{})
-	if err != nil {
-		t.Fatalf("controller.New() error = %v", err)
-	}
-	adapter := lifecycleAdapter{controller: control}
-	ctx := context.Background()
-	created, err := adapter.CreateTask(ctx, store.CreateTaskParams{Repository: "widget", Prompt: "fix"})
-	if err != nil {
-		t.Fatalf("CreateTask() error = %v", err)
-	}
-	origin := protocol.SlackOrigin{ChannelID: "C1"}
-	withOrigin, err := adapter.CreateTaskWithOrigin(ctx, store.CreateTaskParams{Repository: "widget", Prompt: "fix another"}, origin)
-	if err != nil || withOrigin.SlackOrigin != origin {
-		t.Fatalf("CreateTaskWithOrigin() = %#v, %v", withOrigin, err)
-	}
-	if got, err := adapter.GetTask(ctx, created.ID); err != nil || got.ID != created.ID {
-		t.Fatalf("GetTask() = %#v, %v", got, err)
-	}
-	if attempts, err := adapter.ListAttempts(ctx, created.ID); err != nil || len(attempts) != 1 {
-		t.Fatalf("ListAttempts() = %#v, %v", attempts, err)
-	}
-	if err := adapter.RequestCancellation(ctx, created.ID); err != nil {
-		t.Fatalf("RequestCancellation() error = %v", err)
-	}
-	if err := adapter.RequestCancellation(ctx, created.ID); err != nil {
-		t.Fatalf("RequestCancellation(replayed) error = %v", err)
-	}
-	if err := adapter.RequestCancellation(ctx, "missing"); err == nil {
-		t.Fatal("RequestCancellation(missing) error = nil")
-	}
-	if _, err := adapter.RetryTaskWithKey(ctx, "missing", "retry-1"); err == nil {
-		t.Fatal("RetryTaskWithKey(missing) error = nil")
 	}
 }
 
@@ -449,7 +340,7 @@ func TestMetricsHandlerReportsTaskStateAndFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	failed, err := db.CreateTask(ctx, store.CreateTaskParams{Repository: "repo", Prompt: "failed", SlackEventID: "event-1"})
+	failed, err := db.CreateTask(ctx, store.CreateTaskParams{Repository: "repo", Prompt: "failed"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +372,6 @@ func TestMetricsHandlerReportsTaskStateAndFailures(t *testing.T) {
 		"simpleswe_tasks_cancelled_total 1",
 		"simpleswe_active_tasks 1",
 		"simpleswe_jobs_created_total 3",
-		"simpleswe_slack_events_total 1",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("metrics body missing %q:\n%s", want, body)
@@ -509,22 +399,21 @@ func TestMetricsHandlerReportsTaskStateAndFailures(t *testing.T) {
 	_ = active
 }
 
-func TestNotifierIgnoresTasksWithoutSlackOriginAndReportsLookupErrors(t *testing.T) {
-	db := openRunTestStore(t)
-	messenger := new(recordingMessenger)
-	notifier := &pullRequestNotifier{store: db, messenger: messenger}
-	if err := notifier.PostPullRequest(context.Background(), "missing", "https://example/pr/1"); err == nil {
-		t.Fatal("PostPullRequest(missing) error = nil")
+func TestMetricsHandlerOmitsSlackMetricNames(t *testing.T) {
+	handler := metricsHandler{store: openRunTestStore(t)}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d", recorder.Code)
 	}
-	record, err := db.CreateTask(context.Background(), store.CreateTaskParams{Repository: "repo", Prompt: "fix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := notifier.PostPullRequest(context.Background(), record.ID, "https://example/pr/1"); err != nil {
-		t.Fatalf("PostPullRequest(no origin) error = %v", err)
-	}
-	if messenger.text != "" {
-		t.Fatalf("message posted without Slack origin: %q", messenger.text)
+	for line := range strings.SplitSeq(recorder.Body.String(), "\n") {
+		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
+			continue
+		}
+		name := strings.Fields(line)[0]
+		if strings.Contains(strings.ToLower(name), "slack") {
+			t.Fatalf("metrics contains Slack metric name %q", name)
+		}
 	}
 }
 

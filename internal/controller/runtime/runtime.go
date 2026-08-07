@@ -41,16 +41,15 @@ type Clock interface {
 }
 
 type Options struct {
-	Namespace                 string
-	LogChunkBytes             int
-	MaxLogBytes               int
-	SecretRetention           time.Duration
-	PodLogs                   PodLogs
-	Logger                    *slog.Logger
-	Clock                     Clock
-	RecoveryInterval          time.Duration
-	NotifyPendingPullRequests func(context.Context) error
-	ProcessForgeEvents        func(context.Context) error
+	Namespace          string
+	LogChunkBytes      int
+	MaxLogBytes        int
+	SecretRetention    time.Duration
+	PodLogs            PodLogs
+	Logger             *slog.Logger
+	Clock              Clock
+	RecoveryInterval   time.Duration
+	ProcessForgeEvents func(context.Context) error
 }
 
 // Runtime connects Kubernetes watches and Pod output to the durable controller.
@@ -202,11 +201,6 @@ func (r *Runtime) recoverOnce(ctx context.Context) error {
 		}
 	}
 	r.recoverSecretCleanups(ctx)
-	if r.options.NotifyPendingPullRequests != nil {
-		if err := r.options.NotifyPendingPullRequests(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("notify pending pull requests: %w", err))
-		}
-	}
 	return errors.Join(errs...)
 }
 

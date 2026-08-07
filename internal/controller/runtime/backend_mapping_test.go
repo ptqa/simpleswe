@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -49,7 +50,7 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	controller := &backendErrorController{fakeController: newFakeController(db)}
 	backend := NewBackend(db, controller)
 
-	payload, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"work","slack_event_id":"event-1","slack_origin":{"channel_id":"channel-1"}}`))
+	payload, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"work","idempotency_key":"generic-1"}`))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -57,19 +58,10 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	if err := json.Unmarshal(payload, &created); err != nil {
 		t.Fatalf("decode created task: %v", err)
 	}
-	if created["repository"] != "repo" || created["slack_event_id"] != "event-1" {
+	if created["repository"] != "repo" {
 		t.Fatalf("created task = %#v", created)
 	}
-	if controller.createParams.SlackEventID != "event-1" {
-		t.Fatalf("create params = %#v, want Slack event ID", controller.createParams)
-	}
-	if origin, ok := created["slack_origin"].(map[string]any); !ok || origin["channel_id"] != "channel-1" {
-		t.Fatalf("created Slack origin = %#v", created["slack_origin"])
-	}
-	if _, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"generic work","idempotency_key":"generic-1"}`)); err != nil {
-		t.Fatalf("CreateTask with generic key: %v", err)
-	}
-	if controller.createParams.IdempotencyKey != "generic-1" || controller.createParams.SlackEventID != "" {
+	if controller.createParams.IdempotencyKey != "generic-1" {
 		t.Fatalf("generic create params = %#v", controller.createParams)
 	}
 	if _, err := backend.CreateTask(context.Background(), []byte("{")); !errors.Is(err, api.ErrInvalid) {
@@ -136,6 +128,32 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	}
 	if _, err := backend.GetPullRequest(context.Background(), "missing"); !errors.Is(err, api.ErrNotFound) {
 		t.Errorf("missing pull request error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestBackendModelsAndPayloadOmitSlackFields(t *testing.T) {
+	for _, model := range []any{store.CreateTaskParams{}, store.Task{}, store.Attempt{}, store.PullRequest{}} {
+		typeOfModel := reflect.TypeOf(model)
+		for field := range typeOfModel.Fields() {
+			if field.PkgPath == "" && strings.Contains(strings.ToLower(field.Name), "slack") {
+				t.Errorf("%s has removed Slack field %q", typeOfModel.Name(), field.Name)
+			}
+		}
+	}
+
+	db, taskRecord, _, _ := backendStore(t)
+	payload, err := NewBackend(db, newFakeController(db)).GetTask(context.Background(), taskRecord.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	var model map[string]any
+	if err := json.Unmarshal(payload, &model); err != nil {
+		t.Fatalf("decode task model: %v", err)
+	}
+	for field := range model {
+		if strings.Contains(strings.ToLower(field), "slack") {
+			t.Errorf("task model contains removed Slack field %q: %#v", field, model[field])
+		}
 	}
 }
 

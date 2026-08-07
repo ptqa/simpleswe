@@ -7,6 +7,9 @@ image:
   tag: kind
   pullPolicy: Never
 
+hermes:
+  enabled: false
+
 storage:
   size: 1Gi
 
@@ -30,8 +33,6 @@ config:
     command: opencode
     branch_prefix: simpleswe/
     deadline: 10m
-  slack:
-    disabled: true
   bitbucket:
     base_url: https://api.bitbucket.org
   repositories:

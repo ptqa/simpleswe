@@ -12,6 +12,126 @@
         "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
       }
     },
+    "hermes": {
+      "type": "object",
+      "required": ["enabled", "image", "resources", "config", "storage", "secrets"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "required": ["repository", "tag", "digest", "pullPolicy"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "not": { "const": "latest" } },
+            "digest": { "type": "string", "pattern": "^(|sha256:[a-f0-9]{64})$" },
+            "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+          },
+          "additionalProperties": false
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "config": {
+          "type": "object",
+          "required": ["model"],
+          "properties": {
+            "model": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "storage": { "$ref": "#/definitions/hermesStorage" },
+        "secrets": {
+          "type": "object",
+          "required": ["slack", "modelProvider"],
+          "properties": {
+            "slack": {
+              "type": "object",
+              "required": ["name", "keys"],
+              "properties": {
+                "name": { "$ref": "#/definitions/kubernetesNameOrEmpty" },
+                "keys": {
+                  "type": "object",
+                  "required": ["botToken", "appToken", "allowedUser"],
+                  "properties": {
+                    "botToken": { "$ref": "#/definitions/secretKeyOrEmpty" },
+                    "appToken": { "$ref": "#/definitions/secretKeyOrEmpty" },
+                    "allowedUser": { "$ref": "#/definitions/secretKeyOrEmpty" }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "modelProvider": {
+              "type": "object",
+              "required": ["name", "key", "env"],
+              "properties": {
+                "name": { "$ref": "#/definitions/kubernetesNameOrEmpty" },
+                "key": { "$ref": "#/definitions/secretKeyOrEmpty" },
+                "env": { "$ref": "#/definitions/environmentNameOrEmpty" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": { "enabled": { "const": true } },
+            "required": ["enabled"]
+          },
+          "then": {
+            "properties": {
+              "image": {
+                "oneOf": [
+                  {
+                    "properties": {
+                      "tag": { "type": "string", "minLength": 1, "not": { "const": "latest" } },
+                      "digest": { "const": "" }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tag": { "const": "" },
+                      "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+                    }
+                  }
+                ]
+              },
+              "config": {
+                "properties": {
+                  "model": { "type": "string", "pattern": ".*\\S.*" }
+                }
+              },
+              "secrets": {
+                "properties": {
+                  "slack": {
+                    "properties": {
+                      "name": { "$ref": "#/definitions/kubernetesName" },
+                      "keys": {
+                        "properties": {
+                          "botToken": { "$ref": "#/definitions/secretKey" },
+                          "appToken": { "$ref": "#/definitions/secretKey" },
+                          "allowedUser": { "$ref": "#/definitions/secretKey" }
+                        }
+                      }
+                    }
+                  },
+                  "modelProvider": {
+                    "properties": {
+                      "name": { "$ref": "#/definitions/kubernetesName" },
+                      "key": { "$ref": "#/definitions/secretKey" },
+                      "env": { "$ref": "#/definitions/modelProviderEnvironmentName" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
     "config": {
       "type": "object",
       "properties": {
@@ -88,6 +208,50 @@
     }
   },
   "definitions": {
+    "resourceQuantity": {
+      "type": "string",
+      "pattern": "^(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+|n|u|m|k|K|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$"
+    },
+    "resources": {
+      "type": "object",
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/resourceQuantity" },
+            "memory": { "$ref": "#/definitions/resourceQuantity" }
+          },
+          "additionalProperties": false
+        },
+        "limits": {
+          "type": "object",
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/resourceQuantity" },
+            "memory": { "$ref": "#/definitions/resourceQuantity" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "hermesStorage": {
+      "type": "object",
+      "required": ["storageClass", "size", "accessModes"],
+      "properties": {
+        "storageClass": { "anyOf": [{ "const": "" }, { "$ref": "#/definitions/kubernetesName" }] },
+        "size": { "$ref": "#/definitions/resourceQuantity" },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadWriteOncePod"] }
+        }
+      },
+      "additionalProperties": false
+    },
     "githubWebhookSecretSource": {
       "type": "object",
       "required": ["file"],
@@ -137,6 +301,47 @@
       "type": "string",
       "maxLength": 253,
       "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+    },
+    "kubernetesNameOrEmpty": {
+      "anyOf": [{ "const": "" }, { "$ref": "#/definitions/kubernetesName" }]
+    },
+    "secretKey": {
+      "type": "string",
+      "maxLength": 253,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "secretKeyOrEmpty": {
+      "anyOf": [{ "const": "" }, { "$ref": "#/definitions/secretKey" }]
+    },
+    "environmentName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "environmentNameOrEmpty": {
+      "anyOf": [{ "const": "" }, { "$ref": "#/definitions/environmentName" }]
+    },
+    "modelProviderEnvironmentName": {
+      "allOf": [
+        { "$ref": "#/definitions/environmentName" },
+        {
+          "not": {
+            "enum": [
+              "SLACK_BOT_TOKEN",
+              "SLACK_APP_TOKEN",
+              "SLACK_ALLOWED_USERS",
+              "HERMES_HOME",
+              "HERMES_DISABLE_LAZY_INSTALLS",
+              "HERMES_MODEL_PROVIDER_ENV",
+              "PATH",
+              "PYTHONPATH",
+              "PYTHONHOME",
+              "LD_PRELOAD",
+              "LD_LIBRARY_PATH",
+              "NODE_OPTIONS"
+            ]
+          }
+        }
+      ]
     },
     "networkPolicyPeer": {
       "type": "object",

@@ -26,13 +26,7 @@ import (
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
-	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
-
-// Notifier posts the durable pull-request result for a task.
-type Notifier interface {
-	PostPullRequest(context.Context, string, string) error
-}
 
 // PullRequestCreator is the forge surface owned by the pull-request saga.
 type PullRequestCreator interface {
@@ -47,7 +41,6 @@ type Controller struct {
 	store           *store.Store
 	kubernetes      kubernetes.Interface
 	config          config.Config
-	notifier        Notifier
 	pullRequests    PullRequestCreator
 	logger          *slog.Logger
 	locks           *keyedLocks
@@ -62,15 +55,12 @@ type attemptResourceSnapshot struct {
 
 var errResourceCreationBlocked = errors.New("resource creation blocked by current task outcome")
 
-func New(db *store.Store, client kubernetes.Interface, cfg config.Config, notifier Notifier, pullRequests PullRequestCreator) (*Controller, error) {
+func New(db *store.Store, client kubernetes.Interface, cfg config.Config, pullRequests PullRequestCreator) (*Controller, error) {
 	if db == nil {
 		return nil, errors.New("controller Store is nil")
 	}
 	if client == nil {
 		return nil, errors.New("controller Kubernetes client is nil")
-	}
-	if notifier == nil {
-		return nil, errors.New("controller Notifier is nil")
 	}
 	if pullRequests == nil {
 		return nil, errors.New("controller PullRequestCreator is nil")
@@ -98,7 +88,6 @@ func New(db *store.Store, client kubernetes.Interface, cfg config.Config, notifi
 		store:           db,
 		kubernetes:      client,
 		config:          cfg,
-		notifier:        notifier,
 		pullRequests:    pullRequests,
 		logger:          slog.Default(),
 		locks:           newKeyedLocks(),
@@ -107,9 +96,6 @@ func New(db *store.Store, client kubernetes.Interface, cfg config.Config, notifi
 }
 
 func (c *Controller) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
-	if params.IdempotencyKey != "" && params.SlackEventID != "" {
-		return store.Task{}, fmt.Errorf("%w: idempotency key and Slack event ID are mutually exclusive", store.ErrConflict)
-	}
 	if params.IdempotencyKey != "" {
 		existing, err := c.store.GetTaskByIdempotencyKey(ctx, params.IdempotencyKey)
 		if err == nil {
@@ -119,16 +105,6 @@ func (c *Controller) CreateTask(ctx context.Context, params store.CreateTaskPara
 			return store.Task{}, fmt.Errorf("load task by idempotency key: %w", err)
 		}
 	}
-	if params.SlackEventID != "" {
-		existing, err := c.store.GetTaskBySlackEventID(ctx, params.SlackEventID)
-		if err == nil {
-			return existing, nil
-		}
-		if !errors.Is(err, store.ErrNotFound) {
-			return store.Task{}, err
-		}
-	}
-
 	repository, err := c.repository(params.Repository)
 	if err != nil {
 		return store.Task{}, err
@@ -207,71 +183,6 @@ func (c *Controller) CreateTask(ctx context.Context, params store.CreateTaskPara
 	return c.store.GetTask(ctx, created.ID)
 }
 
-func (c *Controller) CreateTaskWithOrigin(ctx context.Context, params store.CreateTaskParams, origin protocol.SlackOrigin) (store.Task, error) {
-	params.SlackOrigin = origin
-	return c.CreateTask(ctx, params)
-}
-
-func (c *Controller) GetTask(ctx context.Context, taskID string) (store.Task, error) {
-	return c.store.GetTask(ctx, taskID)
-}
-
-func (c *Controller) ListAttempts(ctx context.Context, taskID string) ([]store.Attempt, error) {
-	return c.store.ListAttempts(ctx, taskID)
-}
-
-// NotifyPendingPullRequests retries durable Slack delivery independently of
-// worker log replay, including after a controller restart.
-func (c *Controller) NotifyPendingPullRequests(ctx context.Context) error {
-	tasks, err := c.store.ListTasks(ctx)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, record := range tasks {
-		unlock, err := c.locks.lock(ctx, record.ID)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("lock task %q for notification: %w", record.ID, err))
-			continue
-		}
-		record, err = c.store.GetTask(ctx, record.ID)
-		if err != nil {
-			unlock()
-			errs = append(errs, fmt.Errorf("reload task %q for notification: %w", record.ID, err))
-			continue
-		}
-		if record.CancellationRequested || record.State == task.CANCELLED {
-			unlock()
-			continue
-		}
-		attempt, err := c.store.CurrentAttempt(ctx, record.ID)
-		if err != nil {
-			unlock()
-			errs = append(errs, fmt.Errorf("load task %q notification attempt: %w", record.ID, err))
-			continue
-		}
-		pullRequest, err := c.store.GetPullRequest(ctx, attempt.ID)
-		if errors.Is(err, store.ErrNotFound) {
-			unlock()
-			continue
-		}
-		if err != nil {
-			unlock()
-			errs = append(errs, fmt.Errorf("load task %q pull request: %w", record.ID, err))
-			continue
-		}
-		if pullRequest.State == "open" && !pullRequest.Notified {
-			if err := c.notifyDurablePullRequest(ctx, record.ID, attempt.ID); err != nil {
-				unlock()
-				errs = append(errs, err)
-				continue
-			}
-		}
-		unlock()
-	}
-	return errors.Join(errs...)
-}
-
 func (c *Controller) Retry(ctx context.Context, taskID string) (store.Attempt, error) {
 	return c.RetryWithKey(ctx, taskID, "")
 }
@@ -302,7 +213,7 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 		unlock()
 		return store.Attempt{}, err
 	}
-	if err := c.validateAttemptConfig(store.CreateTaskParams{Repository: current.Repository, Prompt: current.Prompt, SlackOrigin: current.SlackOrigin}, repository); err != nil {
+	if err := c.validateAttemptConfig(store.CreateTaskParams{Repository: current.Repository, Prompt: current.Prompt}, repository); err != nil {
 		unlock()
 		return store.Attempt{}, err
 	}
@@ -576,7 +487,6 @@ func (c *Controller) buildAttemptResources(taskRecord store.Task, attempt store.
 		BaseBranch:         baseBranch,
 		TaskBranch:         taskBranch,
 		Prompt:             prompt,
-		Slack:              taskRecord.SlackOrigin,
 		OpenCodeCommand:    c.openCodeCommand(repository),
 		ValidationCommands: c.validationCommands(repository),
 		MaxFixAttempts:     c.maxFixAttempts(repository),
@@ -639,7 +549,7 @@ func (c *Controller) buildAttemptSnapshot(taskRecord store.Task, attempt store.A
 }
 
 func (c *Controller) validateAttemptConfig(params store.CreateTaskParams, repository config.RepositoryConfig) error {
-	_, _, err := c.buildAttemptResources(store.Task{ID: "swe-validation", Prompt: params.Prompt, SlackOrigin: params.SlackOrigin}, store.Attempt{ID: "swe-attempt-validation", Number: 1}, repository)
+	_, _, err := c.buildAttemptResources(store.Task{ID: "swe-validation", Prompt: params.Prompt}, store.Attempt{ID: "swe-attempt-validation", Number: 1}, repository)
 	if err != nil {
 		return fmt.Errorf("validate worker manifest before task acceptance: %w", err)
 	}

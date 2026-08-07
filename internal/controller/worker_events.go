@@ -166,10 +166,7 @@ func (c *Controller) eventTransition(ctx context.Context, record store.Task, exp
 
 func (c *Controller) handleBranchPushedLocked(ctx context.Context, record store.Task, attempt store.Attempt, jobName, podName string, event protocol.Event) error {
 	if stateAtOrAfter(record.State, task.PR_OPEN) {
-		return errors.Join(
-			c.notifyDurablePullRequest(ctx, record.ID, attempt.ID),
-			c.completeForgeEventLocked(ctx, record, attempt),
-		)
+		return c.completeForgeEventLocked(ctx, record, attempt)
 	}
 	if record.CancellationRequested || terminal(record.State) {
 		return nil
@@ -249,10 +246,7 @@ func (c *Controller) resumePullRequestLocked(ctx context.Context, record store.T
 		case task.CREATING_PR:
 			goto create
 		case task.PR_OPEN, task.WAITING_CI, task.WAITING_REVIEW, task.READY:
-			return errors.Join(
-				c.notifyDurablePullRequest(ctx, record.ID, attempt.ID),
-				c.completeForgeEventLocked(ctx, record, attempt),
-			)
+			return c.completeForgeEventLocked(ctx, record, attempt)
 		default:
 			return fmt.Errorf("durable branch for task %q cannot resume from state %q", record.ID, record.State)
 		}
@@ -316,9 +310,6 @@ create:
 			fmt.Sprintf("pull request open number=%d url=%s", durable.Number, durable.URL), "controller"); err != nil {
 			return err
 		}
-	}
-	if err := c.notifyDurablePullRequest(ctx, record.ID, attempt.ID); err != nil {
-		c.logger.ErrorContext(ctx, "notify durable pull request", "task", record.ID, "attempt", attempt.ID, "error", err)
 	}
 	c.logger.InfoContext(ctx, "pull request opened", "task", record.ID, "attempt", attempt.ID, "url", durable.URL)
 	return c.completeForgeEventLocked(ctx, record, attempt)
@@ -444,32 +435,6 @@ func (c *Controller) WorkerLogsExhausted(ctx context.Context, jobName, podName s
 		return c.finishCompletedJob(ctx, record, attempt, job.Name)
 	}
 	return nil
-}
-
-func (c *Controller) notifyDurablePullRequest(ctx context.Context, taskID, attemptID string) error {
-	record, err := c.store.GetTask(ctx, taskID)
-	if err != nil {
-		return err
-	}
-	if record.CancellationRequested || record.State == task.CANCELLED {
-		return nil
-	}
-	pullRequest, err := c.store.GetPullRequest(ctx, attemptID)
-	if err != nil {
-		return err
-	}
-	if pullRequest.State != "open" {
-		return fmt.Errorf("pull request for attempt %q is durably %q", attemptID, pullRequest.State)
-	}
-	if pullRequest.Notified {
-		return nil
-	}
-	notifyCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
-	defer cancel()
-	if err := c.notifier.PostPullRequest(notifyCtx, taskID, pullRequest.URL); err != nil {
-		return fmt.Errorf("notify pull request for task %q: %w", taskID, err)
-	}
-	return c.store.MarkPullRequestNotified(ctx, attemptID)
 }
 
 func failureMessage(stage, job, pod string, command []string, exitCode int, cause error) string {

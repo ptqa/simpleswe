@@ -49,7 +49,7 @@ func TestReconcileUsesAttemptSnapshottedForgeTargetAfterConfigChanges(t *testing
 	changed.Repositories[0].Bitbucket = config.RepositoryBitbucketConfig{}
 	changed.Repositories[0].GitHub = config.RepositoryGitHubConfig{Owner: "new-owner", Repository: "new-repository", CredentialsSecret: "new-github"}
 	changed.GitHub.BaseURL = "https://github.enterprise.example/api/v3"
-	restarted, err := New(fixture.store, fixture.kube, changed, fixture.notifier, fixture.pullRequests)
+	restarted, err := New(fixture.store, fixture.kube, changed, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("restart controller: %v", err)
 	}
@@ -107,17 +107,16 @@ func TestWorkerTaskJSONStrictlyDecodesWithPreForgeTargetSchema(t *testing.T) {
 		t.Fatalf("decode resource snapshot: %v", err)
 	}
 	type oldTaskManifest struct {
-		TaskID             string               `json:"task_id"`
-		Repository         string               `json:"repository,omitempty"`
-		CloneURL           string               `json:"clone_url,omitempty"`
-		BaseBranch         string               `json:"base_branch,omitempty"`
-		TaskBranch         string               `json:"task_branch,omitempty"`
-		Prompt             string               `json:"prompt"`
-		Slack              protocol.SlackOrigin `json:"slack"`
-		OpenCodeCommand    []string             `json:"opencode_command,omitempty"`
-		ValidationCommand  []string             `json:"validation_command,omitempty"`
-		ValidationCommands [][]string           `json:"validation_commands,omitempty"`
-		MaxFixAttempts     int                  `json:"max_fix_attempts"`
+		TaskID             string     `json:"task_id"`
+		Repository         string     `json:"repository,omitempty"`
+		CloneURL           string     `json:"clone_url,omitempty"`
+		BaseBranch         string     `json:"base_branch,omitempty"`
+		TaskBranch         string     `json:"task_branch,omitempty"`
+		Prompt             string     `json:"prompt"`
+		OpenCodeCommand    []string   `json:"opencode_command,omitempty"`
+		ValidationCommand  []string   `json:"validation_command,omitempty"`
+		ValidationCommands [][]string `json:"validation_commands,omitempty"`
+		MaxFixAttempts     int        `json:"max_fix_attempts"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(resources.Secret.Data["task.json"]))
 	decoder.DisallowUnknownFields()

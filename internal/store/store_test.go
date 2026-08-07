@@ -11,156 +11,7 @@ import (
 	"time"
 
 	"github.com/simpleswe/simpleswe/internal/task"
-	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
-
-func TestSlackInboxPersistsPendingEventsAndDeduplicatesByEventID(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "inbox.sqlite")
-	db, err := Open(context.Background(), path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	ctx := context.Background()
-	want := SlackInboxEvent{
-		EventID: "Ev-inbox-1",
-		Kind:    "app_mention",
-		Text:    "run workspace/repository fix it",
-		Origin: protocol.SlackOrigin{
-			WorkspaceID: "T1", ChannelID: "C1", MessageTS: "1.2", ThreadTS: "1.1", UserID: "U1",
-		},
-	}
-	stored, err := db.PutSlackInboxEvent(ctx, want)
-	if err != nil {
-		t.Fatalf("put inbox event: %v", err)
-	}
-	if stored.Status != SlackInboxPending || stored.Attempts != 0 || stored.CreatedAt.IsZero() || stored.UpdatedAt.IsZero() {
-		t.Fatalf("new inbox event = %#v; want pending with timestamps", stored)
-	}
-
-	changed := want
-	changed.Text = "retry swe-other"
-	duplicate, err := db.PutSlackInboxEvent(ctx, changed)
-	if err != nil {
-		t.Fatalf("put duplicate inbox event: %v", err)
-	}
-	if duplicate.Text != want.Text || duplicate.Origin != want.Origin {
-		t.Fatalf("duplicate replaced durable event: %#v", duplicate)
-	}
-	if err := db.StartSlackInboxAttempt(ctx, want.EventID); err != nil {
-		t.Fatalf("start inbox attempt: %v", err)
-	}
-	if err := db.RecordSlackInboxError(ctx, want.EventID, errors.New("temporary failure")); err != nil {
-		t.Fatalf("record inbox error: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-
-	db, err = Open(context.Background(), path)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	pending, err := db.ListPendingSlackInboxEvents(ctx)
-	if err != nil {
-		t.Fatalf("list pending inbox: %v", err)
-	}
-	if len(pending) != 1 || pending[0].EventID != want.EventID || pending[0].Attempts != 1 || pending[0].LastError != "temporary failure" {
-		t.Fatalf("reopened pending inbox = %#v", pending)
-	}
-	if pending[0].Origin != want.Origin {
-		t.Fatalf("reopened origin = %#v; want %#v", pending[0].Origin, want.Origin)
-	}
-	if !pending[0].UpdatedAt.After(stored.UpdatedAt) {
-		t.Fatalf("error timestamp = %v; want after insertion timestamp %v", pending[0].UpdatedAt, stored.UpdatedAt)
-	}
-	if err := db.StartSlackInboxAttempt(ctx, want.EventID); err != nil {
-		t.Fatalf("start replay attempt: %v", err)
-	}
-	beforeHandled := time.Now().UTC()
-	if err := db.MarkSlackInboxHandled(ctx, want.EventID); err != nil {
-		t.Fatalf("mark inbox handled: %v", err)
-	}
-	if pending, err := db.ListPendingSlackInboxEvents(ctx); err != nil || len(pending) != 0 {
-		t.Fatalf("pending inbox after success = %#v, %v; want none", pending, err)
-	}
-	handled, err := db.PutSlackInboxEvent(ctx, want)
-	if err != nil {
-		t.Fatalf("read handled duplicate: %v", err)
-	}
-	if handled.Status != SlackInboxHandled || handled.Attempts != 2 || handled.LastError != "" || handled.HandledAt == nil || handled.HandledAt.Before(beforeHandled) {
-		t.Fatalf("handled inbox event = %#v", handled)
-	}
-}
-
-func TestSlackInboxRecordsRejectedEnvelopeAttemptsAndTimestamps(t *testing.T) {
-	db := openTestStore(t)
-	ctx := context.Background()
-	before := time.Now().UTC()
-	if err := db.RecordRejectedSlackInboxEvent(ctx, "envelope-bad-1", "events_api", errors.New("invalid JSON")); err != nil {
-		t.Fatalf("record rejected Slack envelope: %v", err)
-	}
-	if err := db.RecordRejectedSlackInboxEvent(ctx, "envelope-bad-1", "events_api", errors.New("invalid JSON again")); err != nil {
-		t.Fatalf("record repeated rejected Slack envelope: %v", err)
-	}
-
-	var kind, lastError, createdAt, updatedAt string
-	var attempts int
-	if err := db.db.QueryRowContext(ctx, `
-		SELECT kind, attempts, last_error, created_at, updated_at
-		FROM slack_inbox_rejections WHERE event_id = ?`, "envelope-bad-1").Scan(
-		&kind, &attempts, &lastError, &createdAt, &updatedAt,
-	); err != nil {
-		t.Fatalf("read rejected Slack envelope: %v", err)
-	}
-	created, err := parseTime(createdAt)
-	if err != nil {
-		t.Fatalf("parse rejection creation time: %v", err)
-	}
-	updated, err := parseTime(updatedAt)
-	if err != nil {
-		t.Fatalf("parse rejection update time: %v", err)
-	}
-	if kind != "events_api" || attempts != 2 || lastError != "invalid JSON again" || created.Before(before) || updated.Before(created) {
-		t.Fatalf("rejected Slack envelope = kind %q, attempts %d, error %q, created %v, updated %v", kind, attempts, lastError, created, updated)
-	}
-	if pending, err := db.ListPendingSlackInboxEvents(ctx); err != nil || len(pending) != 0 {
-		t.Fatalf("rejected envelope entered pending inbox: %#v, %v", pending, err)
-	}
-}
-
-func TestCreateTaskIsIdempotentForSlackEventsAndCreatesOneAttempt(t *testing.T) {
-	db := openTestStore(t)
-	ctx := context.Background()
-
-	first, err := db.CreateTask(ctx, CreateTaskParams{
-		Repository:   "https://bitbucket.example/repo",
-		Prompt:       "fix the bug",
-		SlackEventID: "event-123",
-	})
-	if err != nil {
-		t.Fatalf("create first task: %v", err)
-	}
-	second, err := db.CreateTask(ctx, CreateTaskParams{
-		Repository:   "https://bitbucket.example/other-repo",
-		Prompt:       "a different payload",
-		SlackEventID: "event-123",
-	})
-	if err != nil {
-		t.Fatalf("replay Slack event: %v", err)
-	}
-
-	if second.ID != first.ID {
-		t.Fatalf("replayed event created task %q; want existing task %q", second.ID, first.ID)
-	}
-	attempts, err := db.ListAttempts(ctx, first.ID)
-	if err != nil {
-		t.Fatalf("list attempts: %v", err)
-	}
-	if len(attempts) != 1 || attempts[0].Number != 1 {
-		t.Fatalf("replayed event has attempts %#v; want exactly attempt 1", attempts)
-	}
-}
 
 func TestRetryCreatesAttemptTwoWithoutChangingAttemptOne(t *testing.T) {
 	db := openTestStore(t)
@@ -503,32 +354,13 @@ func TestOpenEnablesRequiredSQLitePragmas(t *testing.T) {
 	}
 }
 
-func TestOpenMigratesPreWebhookDatabaseAndPreservesAttempts(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "pre-webhook.sqlite")
+func TestOpenRejectsLegacyVersionZeroDatabaseBeforeApplyingSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite")
 	legacy, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open legacy database: %v", err)
 	}
-	now := stamp(time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
-	_, err = legacy.Exec(`
-		CREATE TABLE tasks (
-			id TEXT PRIMARY KEY, repository TEXT NOT NULL, prompt TEXT NOT NULL, state TEXT NOT NULL,
-			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, current_attempt_id TEXT NOT NULL,
-			slack_event_id TEXT, slack_workspace_id TEXT NOT NULL DEFAULT '', slack_channel_id TEXT NOT NULL DEFAULT '',
-			slack_message_ts TEXT NOT NULL DEFAULT '', slack_thread_ts TEXT NOT NULL DEFAULT '', slack_user_id TEXT NOT NULL DEFAULT '',
-			cancellation_requested INTEGER NOT NULL DEFAULT 0
-		);
-		CREATE TABLE task_attempts (
-			id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
-			immutable INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL, logs_exhausted INTEGER NOT NULL DEFAULT 0,
-			validation_state TEXT NOT NULL DEFAULT '', manifest_json BLOB NOT NULL DEFAULT '',
-			resource_snapshot BLOB NOT NULL DEFAULT '', config_digest TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
-			UNIQUE(task_id, number)
-		);
-		INSERT INTO tasks (id, repository, prompt, state, created_at, updated_at, current_attempt_id)
-		VALUES ('legacy-task', 'legacy-repo', 'legacy prompt', 'failed', ?, ?, 'legacy-attempt');
-		INSERT INTO task_attempts (id, task_id, number, state, logs_exhausted, created_at)
-		VALUES ('legacy-attempt', 'legacy-task', 1, 'failed', 1, ?);`, now, now, now)
+	_, err = legacy.Exec(`CREATE TABLE slack_inbox (event_id TEXT PRIMARY KEY, origin_json TEXT NOT NULL)`)
 	if err != nil {
 		_ = legacy.Close()
 		t.Fatalf("create legacy schema: %v", err)
@@ -537,22 +369,18 @@ func TestOpenMigratesPreWebhookDatabaseAndPreservesAttempts(t *testing.T) {
 		t.Fatalf("close legacy database: %v", err)
 	}
 
-	db, err := Open(context.Background(), path)
+	_, err = Open(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "schema version 0") || !strings.Contains(err.Error(), "recreate the controller PVC/database") {
+		t.Fatalf("Open() error = %v, want actionable legacy schema rejection", err)
+	}
+	check, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("open migrated database: %v", err)
+		t.Fatalf("reopen rejected database: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	got, err := db.GetTask(context.Background(), "legacy-task")
-	if err != nil || got.Prompt != "legacy prompt" || got.CurrentAttemptID != "legacy-attempt" {
-		t.Fatalf("migrated task = %#v, %v", got, err)
-	}
-	attempt, err := db.CurrentAttempt(context.Background(), got.ID)
-	if err != nil || attempt.Number != 1 || attempt.State != task.FAILED || !attempt.LogsExhausted || attempt.Prompt != "" || attempt.BaseBranch != "" || attempt.TaskBranch != "" {
-		t.Fatalf("migrated attempt = %#v, %v", attempt, err)
-	}
-	event := testForgeEvent("legacy-db-event", "quality_gate_failed")
-	if _, err := db.PutForgeEvent(context.Background(), event); err != nil {
-		t.Fatalf("insert forge event after migration: %v", err)
+	defer check.Close()
+	var tasks int
+	if err := check.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'`).Scan(&tasks); err != nil || tasks != 0 {
+		t.Fatalf("tasks table after rejected open = %d, %v; want schema untouched", tasks, err)
 	}
 }
 

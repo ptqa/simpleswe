@@ -1,16 +1,20 @@
 # simpleswe
 
-`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks created from Slack, the CLI, or the terminal UI. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, and creates a Bitbucket or GitHub pull request. Slack-originated tasks report the result in the original Slack thread.
+`simpleswe` is a Kubernetes-native supervisor for autonomous software-engineering tasks created through Hermes Slack, the CLI, or the terminal UI. It runs each task attempt as an immutable Kubernetes Job, executes OpenCode in a repository-specific worker image, validates and pushes the changes, and creates a Bitbucket or GitHub pull request. When enabled, Hermes reports Slack task results in the originating thread.
 
 ```text
-Slack / CLI / TUI
+Slack
+  -> optional Hermes gateway sidecar
+  -> simpleswe CLI over Pod localhost
   -> simpleswe controller
   -> Kubernetes Job
   -> OpenCode
   -> repository validation
   -> Git push
   -> forge pull request
-  -> Slack thread (Slack-originated tasks)
+
+CLI / TUI
+  -> simpleswe controller
 ```
 
 A Vaxis terminal UI provides a k9s-style operational view of tasks, attempts, Kubernetes resources, logs, validation results, and pull requests.
@@ -19,8 +23,7 @@ A Vaxis terminal UI provides a k9s-style operational view of tasks, attempts, Ku
 
 The initial vertical slice supports:
 
-- Slack app mentions and `/simpleswe` commands over Socket Mode;
-- durable Slack event deduplication;
+- optional Hermes Slack gateway sidecar;
 - SQLite task state in WAL mode;
 - one Kubernetes Job and task Secret per immutable attempt;
 - controller restart reconciliation;
@@ -39,7 +42,7 @@ The initial vertical slice supports:
 - Kubernetes 1.29 or newer;
 - Helm 3;
 - a default or configured `ReadWriteOnce` StorageClass suitable for SQLite WAL locking;
-- Slack bot and app-level tokens for Socket Mode;
+- Hermes Slack bot and app-level tokens when the optional sidecar is enabled;
 - Bitbucket or GitHub credentials for each configured repository;
 - a webhook signing secret for each configured forge provider;
 - a repository-specific worker image containing `simpleswe`, OpenCode, Git, SSH, language runtimes, and validation tools;
@@ -59,6 +62,17 @@ Build the controller image:
 ```sh
 docker build --target controller -t ghcr.io/example/simpleswe:0.1.0 .
 ```
+
+Build the derived Hermes image when Slack is required:
+
+```sh
+docker build --target hermes \
+  -t ghcr.io/simpleswe/simpleswe-hermes:v0.20.0-simpleswe.1 .
+```
+
+The Hermes target contains the SimpleSWE CLI and uses the pinned Hermes Agent
+v0.20.0 (`v2026.8.3`) base. Publish the derived image with an immutable
+non-`latest` release tag or deploy it by digest.
 
 The worker target expects a prebuilt OpenCode executable inside the Docker build context:
 
@@ -81,7 +95,7 @@ With Docker, kind, kubectl, and Helm 3 installed, start or refresh the local con
 make local
 ```
 
-This creates a pinned Kubernetes 1.36 cluster, builds and loads the controller image, installs the Helm chart, and verifies the API through a port-forward. Slack is explicitly disabled; [`examples/values-kind.yaml`](examples/values-kind.yaml) registers the committed `ptqa/simpleswe` GitHub repository. `make local` creates non-overwriting placeholder Secrets so the controller can start and observe.
+This creates a pinned Kubernetes 1.36 cluster, builds and loads the controller image, installs the Helm chart, and verifies the API through a port-forward. Hermes is explicitly disabled; [`examples/values-kind.yaml`](examples/values-kind.yaml) registers the committed `ptqa/simpleswe` GitHub repository. `make local` creates non-overwriting placeholder Secrets so the controller can start and observe.
 
 Inspect the controller:
 
@@ -105,23 +119,56 @@ Delete the local cluster when finished:
 make local-down
 ```
 
-## Slack Setup
+## Hermes Slack Setup
 
-Create a Slack app with:
+The SimpleSWE controller has no Slack configuration, runtime, credentials,
+API, domain, or schema. Hermes is the only Slack integration and runs as an
+optional Helm sidecar when `hermes.enabled: true`. Hermes owns Socket Mode and
+must be the only consumer of the Slack app token.
 
-- Socket Mode enabled;
-- an app-level token with `connections:write`;
-- bot scopes `app_mentions:read`, `chat:write`, and `commands`;
-- an `app_mention` event subscription;
-- a `/simpleswe` slash command.
-
-No public request URL is required. Store the tokens in an existing Kubernetes Secret:
+Generate the Slack app manifest with Hermes:
 
 ```sh
-kubectl create namespace simpleswe
-kubectl -n simpleswe create secret generic simpleswe-slack \
-  --from-literal=bot-token='xoxb-...' \
-  --from-literal=app-token='xapp-...'
+hermes slack manifest --agent-view --write
+```
+
+Apply the generated manifest to the Slack app rather than hand-maintaining a
+manifest from this list. The pinned v2026.8.3 manifest enables Socket Mode,
+uses the app token connection scope `connections:write`, and includes these bot
+scopes:
+
+- `chat:write`, `app_mentions:read`;
+- `channels:history`, `channels:read`;
+- `groups:history`, `groups:read`;
+- `im:history`, `im:read`, `im:write`;
+- `mpim:history`, `mpim:read`;
+- `users:read`, `files:read`, `files:write`;
+- `assistant:write`, `commands`, `reactions:read`.
+
+Subscribe the bot to `message.im`, `message.mpim`, `message.channels`,
+`message.groups`, `app_mention`, `app_context_changed`, `app_home_opened`,
+`reaction_added`, and `reaction_removed`. The bot token is an `xoxb` token, the
+Socket Mode app token is an `xapp` token, and the allowed-user value is a
+comma-separated list of Slack Member IDs.
+
+Create the pre-existing Secrets from shell environment inputs. Do not put
+these values in Helm values or controller configuration:
+
+```sh
+: "${SLACK_BOT_TOKEN:?set SLACK_BOT_TOKEN}"
+: "${SLACK_APP_TOKEN:?set SLACK_APP_TOKEN}"
+: "${SLACK_ALLOWED_USER_IDS:?set comma-separated Slack Member IDs}"
+: "${MODEL_PROVIDER_KEY:?set the model-provider API key}"
+
+kubectl create namespace simpleswe --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n simpleswe create secret generic simpleswe-hermes-slack \
+  --from-literal=bot-token="$SLACK_BOT_TOKEN" \
+  --from-literal=app-token="$SLACK_APP_TOKEN" \
+  --from-literal=allowed-user="$SLACK_ALLOWED_USER_IDS" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n simpleswe create secret generic simpleswe-hermes-model \
+  --from-literal=api-key="$MODEL_PROVIDER_KEY" \
+  --dry-run=client -o yaml | kubectl apply -f -
 ```
 
 ## Repository Credentials
@@ -169,12 +216,6 @@ worker:
   command: opencode
   branch_prefix: simpleswe/
   deadline: 30m
-
-slack:
-  bot_token:
-    file: /run/secrets/slack/bot-token
-  app_token:
-    file: /run/secrets/slack/app-token
 
 bitbucket:
   base_url: https://api.bitbucket.org
@@ -231,7 +272,7 @@ repositories:
       credentials_secret_name: github-widget
 ```
 
-Configuration is strict: unknown fields, inline credentials, invalid Secret names, and invalid resource settings fail controller startup. See [`examples/config.yaml`](examples/config.yaml) and [`examples/values-eks.yaml`](examples/values-eks.yaml) for complete examples.
+Configuration is strict: unknown fields, inline credentials, invalid Secret names, and invalid resource settings fail controller startup. The controller configuration has no Slack section; see [`examples/config.yaml`](examples/config.yaml) and [`examples/values-eks.yaml`](examples/values-eks.yaml) for complete examples.
 
 For a standalone controller, set `BITBUCKET_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_SECRET` to the exact secrets for configured providers, then run `./simpleswe controller --config config.yaml --database tasks.db`. Configure Bitbucket to POST to `/v1/webhooks/bitbucket`; GitHub uses `/v1/webhooks/github`.
 
@@ -248,7 +289,37 @@ kubectl -n simpleswe create secret generic simpleswe-webhooks \
   --from-literal=bitbucket='bitbucket-webhook-secret'
 ```
 
-Then install a values file containing image references and repository configuration:
+Then install a values file containing image references and repository configuration. To enable Hermes, use the current values shape:
+
+```yaml
+hermes:
+  enabled: true
+  image:
+    repository: ghcr.io/simpleswe/simpleswe-hermes
+    tag: v0.20.0-simpleswe.1
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {cpu: "1", memory: 2Gi}
+  config:
+    model: openai/gpt-5.6-luna
+  storage:
+    storageClass: gp3
+    size: 10Gi
+    accessModes: [ReadWriteOnce]
+  secrets:
+    slack:
+      name: simpleswe-hermes-slack
+      keys: {botToken: bot-token, appToken: app-token, allowedUser: allowed-user}
+    modelProvider:
+      name: simpleswe-hermes-model
+      key: api-key
+      env: OPENAI_API_KEY
+```
+
+The tag above must be published immutably, or replace it with the derived
+image digest. Hermes credentials are SecretKeyRef environment variables only.
 
 ```sh
 helm upgrade --install simpleswe ./deploy/helm/simpleswe \
@@ -265,21 +336,40 @@ helm upgrade --install simpleswe ./deploy/helm/simpleswe \
   --values examples/values-eks.yaml
 ```
 
-The chart creates one controller Deployment, private API Service, signed `simpleswe-webhooks` Service, ServiceAccount, namespace Role and RoleBinding, PVC, ConfigMap, and default-deny NetworkPolicies. It references pre-existing Secrets and never creates credential values. Deliberately expose only the signed webhook listener and configure `networkPolicy.webhookIngress`; keep the unauthenticated API private.
+The chart creates one controller Deployment, private API Service, signed `simpleswe-webhooks` Service, ServiceAccount, namespace Role and RoleBinding, controller PVC, optional Hermes sidecar and `/opt/data` PVC, ConfigMap, and default-deny NetworkPolicies. It references pre-existing Secrets and never creates credential values. Deliberately expose only the signed webhook listener and configure `networkPolicy.webhookIngress`; keep the unauthenticated API private.
 
 The API is unauthenticated and is intended for `kubectl port-forward` access only. Keep the default NetworkPolicy enabled unless another access boundary is in place.
 
-## Slack Commands
+## Hermes Slack Operations
 
-```text
-@simpleswe run widget Fix the failing ClaimService tests
-/simpleswe run widget JIRA-1555
-/simpleswe status swe-...
-/simpleswe cancel swe-...
-/simpleswe retry swe-...
+For each Slack request, Hermes preserves the request as the task prompt,
+requires a configured repository name, and generates one idempotency key. It
+calls the local controller with:
+
+```sh
+simpleswe task create \
+  --address http://127.0.0.1:8080 \
+  --idempotency-key REQUEST_KEY \
+  REPOSITORY "ENGINEERING REQUEST"
 ```
 
-Accepted tasks receive a Slack thread with meaningful lifecycle updates and the final pull-request URL. Raw worker logs are not copied into Slack.
+Hermes reports the accepted task ID immediately, then runs the following with
+`terminal(background=true, notify_on_complete=true)` so the conversation
+remains responsive and completion generates a follow-up event:
+
+```sh
+simpleswe task wait --address http://127.0.0.1:8080 TASK_ID
+```
+
+`task wait` outputs the final task JSON when a pull-request URL appears or the
+task reaches `failed`, `cancelled`, or `ready`. Hermes reports that result to
+the originating thread. Retrying `task create` with the same idempotency key
+returns the existing task instead of creating a duplicate.
+
+Hermes is limited to `task create`, `list`, `show`, `wait`, `logs`, `cancel`,
+and `retry`. It never invokes the SimpleSWE controller, worker, or TUI
+top-level commands; it asks for confirmation before cancellation or retry
+unless the user explicitly requested that operation.
 
 ## CLI and TUI
 
@@ -289,14 +379,16 @@ The local commands automatically run `kubectl port-forward` to the `simpleswe` S
 simpleswe tui --context production --namespace simpleswe
 
 simpleswe task create --context production --namespace simpleswe widget "Fix the failing ClaimService tests"
+simpleswe task create --context production --namespace simpleswe --idempotency-key request-123 widget "Fix the failing ClaimService tests"
 simpleswe task list --context production --namespace simpleswe
 simpleswe task show --context production --namespace simpleswe swe-...
+simpleswe task wait --context production --namespace simpleswe swe-...
 simpleswe task logs --context production --namespace simpleswe swe-...
 simpleswe task cancel --context production --namespace simpleswe swe-...
 simpleswe task retry --context production --namespace simpleswe swe-...
 ```
 
-The create command accepts a configured repository name followed by the task prompt. Quote prompts that contain spaces.
+The create command accepts a configured repository name followed by the task prompt. Quote prompts that contain spaces. `--idempotency-key` is optional and lets machine callers safely retry task creation. `task wait` polls until a pull-request URL appears or the task reaches `failed`, `cancelled`, or `ready`, then writes the final JSON.
 
 Use `--address http://127.0.0.1:8080` to connect to an existing port-forward instead.
 
@@ -324,16 +416,42 @@ TUI keys:
 
 The controller is the only component that owns task intent and logical state. Kubernetes remains the execution scheduler and source of truth for Job and Pod lifecycle.
 
-- SQLite stores task intent, attempts, events, Slack origins, validation results, Git results, pull requests, log checkpoints, and deduplication records.
+- The controller has no Slack runtime, credentials, API, domain, or schema. SQLite stores task intent, attempts, events, validation results, Git results, pull requests, log checkpoints, and idempotency records.
+- When enabled, Hermes owns Slack Socket Mode and conversations, and calls the SimpleSWE CLI at `http://127.0.0.1:8080`.
 - One immutable attempt maps to one deterministic Kubernetes Job.
 - The task prompt is delivered in a task-specific read-only Secret.
-- Long-lived Git, OpenCode, and forge credentials are mounted from separate existing Secrets.
+- The controller retains its database, forge-credential, and webhook mounts. Hermes receives Slack and model credentials only through SecretKeyRef environment variables.
+- Hermes has a dedicated PVC mounted at `/opt/data`; it has no controller database, forge, webhook, or repository mounts.
+- Hermes' skill and toolset are limited to `terminal`, `skills`, and the seven task commands documented above.
 - Workers have no Kubernetes API token and cannot create tasks or retries.
 - Only `@@simpleswe:` JSON log lines are interpreted as lifecycle events; all other output remains raw logs.
 - Retrying creates a new attempt, Job, task branch, and history entry.
 - The controller reconciles persisted intent and labelled Kubernetes resources after restart.
+- The direct CLI and TUI paths remain unchanged.
 
 The OpenAPI contract is available at [`api/openapi.yaml`](api/openapi.yaml).
+
+## Destructive Cutover and Rollback
+
+This release does not migrate the old controller database or retain the former
+Slack integration. Before deploying this version, stop the old Deployment and
+delete the existing controller PVC/database:
+
+```sh
+kubectl -n simpleswe scale deployment/simpleswe --replicas=0
+kubectl -n simpleswe delete pvc simpleswe-data
+```
+
+Then perform one cutover:
+
+1. Update the Slack app with the Hermes-generated manifest.
+2. Replace the Slack and model-provider Secrets with the Hermes Secret shape.
+3. Deploy the controller and Hermes sidecar together.
+4. Verify that only Hermes opens the Slack Socket Mode connection.
+5. Submit a Slack task and verify task creation, background `task wait`, pull-request creation, and final thread delivery.
+
+Rollback requires reinstalling the old application version and creating a new
+empty database compatible with that version. Task history is not migrated.
 
 ## Development
 
@@ -363,7 +481,8 @@ Normal tests use fake Kubernetes clients, fake executables, and local HTTP serve
 - Run exactly one controller replica. SQLite and process-local task serialization do not support active-active controllers.
 - Use a block-backed PVC with reliable POSIX file locking. The EKS example uses EBS `gp3`.
 - The API has no application authentication. Cluster networking is the security boundary.
-- Slack and pull-request notifications are at-least-once around rare crash windows.
+- Hermes must be the only consumer of the Slack app token.
+- Keep the namespace dedicated to SimpleSWE: every Pod container inherits the Pod ServiceAccount token. RBAC remains namespace-scoped; no cluster-scoped permissions are required.
 - Pull requests are never merged automatically.
 
 ## License

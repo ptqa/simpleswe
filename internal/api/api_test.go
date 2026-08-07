@@ -126,20 +126,8 @@ func TestHandlerRejectsInvalidCreateIdempotencyKeys(t *testing.T) {
 			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"` + strings.Repeat("k", 257) + `"}`,
 		},
 		{
-			name: "generic and Slack keys",
-			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"generic-1","slack_event_id":"slack-1"}`,
-		},
-		{
 			name: "explicit null",
 			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":null}`,
-		},
-		{
-			name: "explicit null Slack event ID",
-			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":null}`,
-		},
-		{
-			name: "explicit null and Slack key",
-			body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":null,"slack_event_id":"slack-1"}`,
 		},
 	}
 	for _, test := range tests {
@@ -166,6 +154,31 @@ func TestHandlerRejectsInvalidCreateIdempotencyKeys(t *testing.T) {
 			}
 			if dependency.wasCalled("create") {
 				t.Fatal("invalid create request reached dependency")
+			}
+		})
+	}
+}
+
+func TestHandlerRejectsSlackCreateFieldsAsUnknown(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "slack origin", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_origin":{"workspace_id":"T1","channel_id":"C1","message_ts":"1.2"}}`},
+		{name: "slack event ID", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":"event-1"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dependency := new(fakeHandlerDependency)
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(test.body))
+
+			NewHandler(dependency).ServeHTTP(recorder, request)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			if dependency.wasCalled("create") {
+				t.Fatal("unknown Slack create field reached dependency")
 			}
 		})
 	}
@@ -536,8 +549,6 @@ func TestHandlerRejectsInvalidQueriesAndCreateBodies(t *testing.T) {
 		{name: "inline credentials", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://user:pass@bitbucket.example/acme/widget","prompt":"fix"}`},
 		{name: "empty idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":""}`},
 		{name: "whitespace idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":" \t"}`},
-		{name: "empty event ID", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_event_id":" "}`},
-		{name: "incomplete Slack origin", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","slack_origin":{"workspace_id":"T1"}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

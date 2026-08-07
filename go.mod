@@ -3,7 +3,6 @@ module github.com/simpleswe/simpleswe
 go 1.26.5
 
 require (
-	github.com/slack-go/slack v0.17.3
 	go.rockorager.dev/vaxis v0.17.1
 	gopkg.in/yaml.v3 v3.0.1
 	k8s.io/api v0.33.4

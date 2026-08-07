@@ -105,12 +105,6 @@ func TestCreateTaskOnceRejectsInvalidIdempotencyKeysWithoutWrites(t *testing.T) 
 				Repository: "repo", Prompt: "prompt", IdempotencyKey: strings.Repeat("k", 257),
 			},
 		},
-		{
-			name: "generic and Slack keys",
-			params: CreateTaskParams{
-				Repository: "repo", Prompt: "prompt", IdempotencyKey: "generic-1", SlackEventID: "slack-1",
-			},
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -129,7 +123,7 @@ func TestCreateTaskOnceRejectsInvalidIdempotencyKeysWithoutWrites(t *testing.T) 
 
 func assertNoCreateRows(t *testing.T, db *Store) {
 	t.Helper()
-	for _, table := range []string{"tasks", "task_attempts", "task_create_intents", "slack_events", "task_events"} {
+	for _, table := range []string{"tasks", "task_attempts", "task_create_intents", "task_events"} {
 		var count int
 		if err := db.db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil {
 			t.Fatalf("count %s: %v", table, err)
@@ -140,7 +134,7 @@ func assertNoCreateRows(t *testing.T, db *Store) {
 	}
 }
 
-func TestStoreOpenAndInboxValidationEdges(t *testing.T) {
+func TestStoreOpenValidationEdges(t *testing.T) {
 	ctx := context.Background()
 	var nilContext context.Context
 	if _, err := Open(nilContext, "store.sqlite"); err == nil {
@@ -158,29 +152,6 @@ func TestStoreOpenAndInboxValidationEdges(t *testing.T) {
 	if err := nilStore.Close(); err != nil {
 		t.Fatalf("close nil store: %v", err)
 	}
-
-	db := openTestStore(t)
-	if _, err := db.PutSlackInboxEvent(ctx, SlackInboxEvent{Kind: "mention"}); err == nil {
-		t.Fatal("Slack inbox accepted an empty event ID")
-	}
-	if _, err := db.PutSlackInboxEvent(ctx, SlackInboxEvent{EventID: "event"}); err == nil {
-		t.Fatal("Slack inbox accepted an empty kind")
-	}
-	if err := db.RecordRejectedSlackInboxEvent(ctx, "", "event", nil); err == nil {
-		t.Fatal("rejected inbox accepted an empty event ID")
-	}
-	if err := db.RecordRejectedSlackInboxEvent(ctx, "event", "", nil); err == nil {
-		t.Fatal("rejected inbox accepted an empty kind")
-	}
-	if err := db.StartSlackInboxAttempt(ctx, " "); err == nil {
-		t.Fatal("inbox update accepted an empty event ID")
-	}
-	if err := db.MarkSlackInboxHandled(ctx, "missing"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("mark missing inbox event = %v, want ErrNotFound", err)
-	}
-	if err := db.RecordRejectedSlackInboxEvent(ctx, "rejected", "event", nil); err != nil {
-		t.Fatalf("record rejection without cause: %v", err)
-	}
 }
 
 func TestTaskCRUDAndSnapshotEdges(t *testing.T) {
@@ -192,19 +163,9 @@ func TestTaskCRUDAndSnapshotEdges(t *testing.T) {
 	if _, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo"}); err == nil {
 		t.Fatal("task creation accepted an empty prompt")
 	}
-	first, inserted, err := db.CreateTaskOnce(ctx, CreateTaskParams{Repository: "repo-1", Prompt: "prompt-1", SlackEventID: "slack-1"})
+	first, inserted, err := db.CreateTaskOnce(ctx, CreateTaskParams{Repository: "repo-1", Prompt: "prompt-1"})
 	if err != nil || !inserted {
 		t.Fatalf("create task once = %#v, %t, %v", first, inserted, err)
-	}
-	bySlack, err := db.GetTaskBySlackEventID(ctx, "slack-1")
-	if err != nil || bySlack.ID != first.ID {
-		t.Fatalf("get by Slack event = %#v, %v", bySlack, err)
-	}
-	if _, err := db.GetTaskBySlackEventID(ctx, " "); err == nil {
-		t.Fatal("Slack lookup accepted an empty event ID")
-	}
-	if _, err := db.GetTaskBySlackEventID(ctx, "missing"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("missing Slack lookup = %v, want ErrNotFound", err)
 	}
 	if _, err := db.GetTask(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing task lookup = %v, want ErrNotFound", err)
@@ -344,7 +305,7 @@ func TestLogChunkValidationAndEmptyTails(t *testing.T) {
 	}
 }
 
-func TestPullRequestCRUDAndNotificationEdges(t *testing.T) {
+func TestPullRequestCRUDEdges(t *testing.T) {
 	ctx := context.Background()
 	db := openTestStore(t)
 	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "prompt"})
@@ -373,11 +334,8 @@ func TestPullRequestCRUDAndNotificationEdges(t *testing.T) {
 		t.Fatalf("duplicate pull request reservation = %t, %v", reserved, err)
 	}
 	creating, err := db.GetPullRequest(ctx, attempt)
-	if err != nil || creating.State != "creating" || creating.Title != "title" || creating.Number != 0 || creating.Notified {
+	if err != nil || creating.State != "creating" || creating.Title != "title" || creating.Number != 0 {
 		t.Fatalf("creating pull request = %#v, %v", creating, err)
-	}
-	if err := db.MarkPullRequestNotified(ctx, attempt); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("notify creating pull request = %v, want ErrNotFound", err)
 	}
 	if err := db.CompletePullRequest(ctx, attempt, 0, ""); err == nil {
 		t.Fatal("pull request completion accepted an invalid result")
@@ -395,9 +353,6 @@ func TestPullRequestCRUDAndNotificationEdges(t *testing.T) {
 	if _, err := db.GetPullRequest(ctx, "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing pull request = %v, want ErrNotFound", err)
 	}
-	if err := db.MarkPullRequestNotified(ctx, "missing"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("notify missing pull request = %v, want ErrNotFound", err)
-	}
 
 	second, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "second"})
 	if err != nil {
@@ -409,14 +364,8 @@ func TestPullRequestCRUDAndNotificationEdges(t *testing.T) {
 	if err := db.CompletePullRequest(ctx, second.CurrentAttemptID, 7, "https://example/pr/7"); err != nil {
 		t.Fatalf("complete pull request: %v", err)
 	}
-	if err := db.MarkPullRequestNotified(ctx, second.CurrentAttemptID); err != nil {
-		t.Fatalf("mark pull request notified: %v", err)
-	}
-	if err := db.MarkPullRequestNotified(ctx, second.CurrentAttemptID); err != nil {
-		t.Fatalf("replay pull request notification: %v", err)
-	}
 	opened, err := db.GetPullRequest(ctx, second.CurrentAttemptID)
-	if err != nil || opened.State != "open" || opened.Number != 7 || !opened.Notified {
+	if err != nil || opened.State != "open" || opened.Number != 7 {
 		t.Fatalf("open pull request = %#v, %v", opened, err)
 	}
 }

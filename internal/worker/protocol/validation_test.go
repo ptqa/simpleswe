@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -13,7 +14,6 @@ func TestValidateManifestAcceptsFullShape(t *testing.T) {
 		BaseBranch:         "main",
 		TaskBranch:         "simpleswe/task-1",
 		Prompt:             "add focused tests",
-		Slack:              SlackOrigin{WorkspaceID: "T1", ChannelID: "C1", MessageTS: "1.2", ThreadTS: "1.1", UserID: "U1"},
 		OpenCodeCommand:    []string{"opencode", "run"},
 		ValidationCommands: [][]string{{"go", "test", "./..."}},
 		MaxFixAttempts:     maxFixAttempts,
@@ -21,6 +21,26 @@ func TestValidateManifestAcceptsFullShape(t *testing.T) {
 
 	if err := ValidateManifest(manifest); err != nil {
 		t.Fatalf("full manifest rejected: %v", err)
+	}
+}
+
+func TestTaskManifestSerializationOmitsSlackField(t *testing.T) {
+	manifest := TaskManifest{
+		TaskID:            "task-1",
+		Repository:        "acme/widget",
+		Prompt:            "prompt",
+		ValidationCommand: []string{"go", "test"},
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("marshal manifest: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if _, ok := fields["slack"]; ok {
+		t.Fatalf("serialized manifest contains removed Slack field: %s", payload)
 	}
 }
 
@@ -34,9 +54,6 @@ func TestValidateManifestValidationCommandsErrors(t *testing.T) {
 	for name, edit := range map[string]func(*TaskManifest){
 		"empty command":     func(m *TaskManifest) { m.ValidationCommands = [][]string{{}} },
 		"too many attempts": func(m *TaskManifest) { m.MaxFixAttempts = maxFixAttempts + 1 },
-		"invalid Slack origin": func(m *TaskManifest) {
-			m.Slack.WorkspaceID = strings.Repeat("x", 257)
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			manifest := valid

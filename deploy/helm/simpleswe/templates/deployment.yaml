@@ -13,7 +13,6 @@
 {{- end -}}
 {{- $bitbucketSecretNames := keys $bitbucketSecrets | sortAlpha -}}
 {{- $githubSecretNames := keys $githubSecrets | sortAlpha -}}
-{{- $slackDisabled := dig "slack" "disabled" false .Values.config -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -109,11 +108,6 @@ spec:
             - name: config
               mountPath: /etc/simpleswe
               readOnly: true
-          {{- if not $slackDisabled }}
-            - name: slack-credentials
-              mountPath: /run/secrets/slack
-              readOnly: true
-          {{- end }}
           {{- range $index, $secretName := $bitbucketSecretNames }}
             - name: bitbucket-credentials-{{ $index }}
               mountPath: {{ printf "/run/secrets/bitbucket/%s" $secretName | quote }}
@@ -129,6 +123,67 @@ spec:
               mountPath: /run/secrets/webhooks
               readOnly: true
           {{- end }}
+        {{- if .Values.hermes.enabled }}
+        - name: hermes
+          image: {{ include "simpleswe.hermesImage" . | quote }}
+          imagePullPolicy: {{ .Values.hermes.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              : "${SLACK_BOT_TOKEN:?SLACK_BOT_TOKEN is empty}"
+              : "${SLACK_APP_TOKEN:?SLACK_APP_TOKEN is empty}"
+              : "${SLACK_ALLOWED_USERS:?SLACK_ALLOWED_USERS is empty}"
+              eval ': "${'"$HERMES_MODEL_PROVIDER_ENV"':?model-provider credential is empty}"'
+              exec hermes gateway
+          env:
+            - name: HERMES_HOME
+              value: /opt/data
+            - name: HERMES_DISABLE_LAZY_INSTALLS
+              value: "1"
+            - name: HERMES_MODEL_PROVIDER_ENV
+              value: {{ .Values.hermes.secrets.modelProvider.env | quote }}
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hermes.secrets.slack.name | quote }}
+                  key: {{ .Values.hermes.secrets.slack.keys.botToken | quote }}
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hermes.secrets.slack.name | quote }}
+                  key: {{ .Values.hermes.secrets.slack.keys.appToken | quote }}
+            - name: SLACK_ALLOWED_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hermes.secrets.slack.name | quote }}
+                  key: {{ .Values.hermes.secrets.slack.keys.allowedUser | quote }}
+            - name: {{ .Values.hermes.secrets.modelProvider.env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.hermes.secrets.modelProvider.name | quote }}
+                  key: {{ .Values.hermes.secrets.modelProvider.key | quote }}
+          resources:
+            {{- toYaml .Values.hermes.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10000
+            runAsGroup: 10000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: hermes-data
+              mountPath: /opt/data
+            - name: config
+              mountPath: /opt/data/config.yaml
+              subPath: hermes-config.yaml
+              readOnly: true
+            - name: config
+              mountPath: /opt/data/skills/simpleswe/SKILL.md
+              subPath: hermes-skill.md
+              readOnly: true
+        {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -139,15 +194,16 @@ spec:
             items:
               - key: config.yaml
                 path: config.yaml
-      {{- if not $slackDisabled }}
-        - name: slack-credentials
-          secret:
-            secretName: {{ .Values.secrets.slack.name | quote }}
-            items:
-              - key: {{ .Values.secrets.slack.keys.botToken | quote }}
-                path: bot-token
-              - key: {{ .Values.secrets.slack.keys.appToken | quote }}
-                path: app-token
+          {{- if .Values.hermes.enabled }}
+              - key: hermes-config.yaml
+                path: hermes-config.yaml
+              - key: hermes-skill.md
+                path: hermes-skill.md
+          {{- end }}
+      {{- if .Values.hermes.enabled }}
+        - name: hermes-data
+          persistentVolumeClaim:
+            claimName: {{ include "simpleswe.fullname" . }}-hermes-data
       {{- end }}
       {{- range $index, $secretName := $bitbucketSecretNames }}
         - name: bitbucket-credentials-{{ $index }}

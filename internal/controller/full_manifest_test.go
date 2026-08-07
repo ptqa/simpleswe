@@ -26,12 +26,11 @@ func TestCreateTaskMapsRepositoryConfigurationIntoFullManifestAndJob(t *testing.
 	repository.Git = config.GitConfig{BranchPrefix: "work/", SSHSecret: "git-ssh"}
 	repository.OpenCode = config.OpenCodeConfig{Command: []string{"opencode", "run"}, ConfigSecret: "opencode-config"}
 	repository.Validation = config.ValidationConfig{Commands: [][]string{{"go", "test", "./..."}}, MaxFixAttempts: &maxFixes}
-	control, err := New(fixture.store, fixture.kube, fixture.config, fixture.notifier, fixture.pullRequests)
+	control, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("recreate controller: %v", err)
 	}
-	origin := protocol.SlackOrigin{WorkspaceID: "T1", ChannelID: "C1", MessageTS: "1.2", ThreadTS: "1.2", UserID: "U1"}
-	created, err := control.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "fix", SlackEventID: "E1", SlackOrigin: origin})
+	created, err := control.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "fix", IdempotencyKey: "request-1"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -44,7 +43,7 @@ func TestCreateTaskMapsRepositoryConfigurationIntoFullManifestAndJob(t *testing.
 	if err := json.Unmarshal(secrets.Items[0].Data["task.json"], &manifest); err != nil {
 		t.Fatalf("decode task manifest: %v", err)
 	}
-	if manifest.TaskID != created.ID || manifest.CloneURL != repositoryURL || manifest.BaseBranch != "main" || manifest.TaskBranch != "work/"+created.ID+"-a1" || !reflect.DeepEqual(manifest.Slack, origin) {
+	if manifest.TaskID != created.ID || manifest.CloneURL != repositoryURL || manifest.BaseBranch != "main" || manifest.TaskBranch != "work/"+created.ID+"-a1" {
 		t.Fatalf("manifest identity = %#v", manifest)
 	}
 	if !reflect.DeepEqual(manifest.OpenCodeCommand, []string{"opencode", "run"}) || !reflect.DeepEqual(manifest.ValidationCommands, [][]string{{"go", "test", "./..."}}) || manifest.MaxFixAttempts != 2 {
@@ -61,41 +60,5 @@ func TestCreateTaskMapsRepositoryConfigurationIntoFullManifestAndJob(t *testing.
 	}
 	if jobs.Items[0].Spec.ActiveDeadlineSeconds == nil || *jobs.Items[0].Spec.ActiveDeadlineSeconds != 420 || pod.PriorityClassName != "swe-worker" || pod.ServiceAccountName != "swe-worker" {
 		t.Fatalf("Job scheduling = %#v", pod)
-	}
-}
-
-func TestPendingPullRequestNotificationReconcilesOnceAcrossRestart(t *testing.T) {
-	fixture := newFixture(t)
-	taskRecord, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "notify"})
-	if err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	attempt, err := fixture.store.CurrentAttempt(fixture.ctx, taskRecord.ID)
-	if err != nil {
-		t.Fatalf("current attempt: %v", err)
-	}
-	reserved, err := fixture.store.ReservePullRequest(fixture.ctx, attempt.ID, "notify", "work/notify", "main")
-	if err != nil || !reserved {
-		t.Fatalf("reserve pull request = %t, %v", reserved, err)
-	}
-	if err := fixture.store.CompletePullRequest(fixture.ctx, attempt.ID, 42, pullRequestURL); err != nil {
-		t.Fatalf("complete pull request: %v", err)
-	}
-	control, err := New(fixture.store, fixture.kube, fixture.config, fixture.notifier, fixture.pullRequests)
-	if err != nil {
-		t.Fatalf("restart controller: %v", err)
-	}
-	if err := control.NotifyPendingPullRequests(fixture.ctx); err != nil {
-		t.Fatalf("notify pending: %v", err)
-	}
-	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.notifier, fixture.pullRequests)
-	if err != nil {
-		t.Fatalf("restart controller again: %v", err)
-	}
-	if err := restarted.NotifyPendingPullRequests(fixture.ctx); err != nil {
-		t.Fatalf("notify pending after restart: %v", err)
-	}
-	if len(fixture.notifier.calls) != 1 {
-		t.Fatalf("notification calls = %d, want 1", len(fixture.notifier.calls))
 	}
 }

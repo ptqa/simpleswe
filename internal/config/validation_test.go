@@ -105,13 +105,7 @@ func TestConfigValidateTopLevelFields(t *testing.T) {
 		},
 		"worker command":       func(c *Config) { c.Worker.Command = " " },
 		"worker branch prefix": func(c *Config) { c.Worker.BranchPrefix = " " },
-		"slack bot token": func(c *Config) {
-			c.Slack.BotToken = SecretSource{File: "relative"}
-		},
-		"slack app token": func(c *Config) {
-			c.Slack.AppToken = SecretSource{Env: "bad-name"}
-		},
-		"bitbucket URL": func(c *Config) { c.Bitbucket.BaseURL = "http://example.com" },
+		"bitbucket URL":        func(c *Config) { c.Bitbucket.BaseURL = "http://example.com" },
 		"worker resources": func(c *Config) {
 			c.Worker.Resources.Requests = ResourceList{"cpu": Quantity("-1")}
 		},

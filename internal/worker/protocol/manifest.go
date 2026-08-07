@@ -9,30 +9,19 @@ import (
 
 const maxFixAttempts = 10
 
-// SlackOrigin identifies the Slack message that created a task. It contains
-// routing metadata only; credentials must not be put in a task manifest.
-type SlackOrigin struct {
-	WorkspaceID string `json:"workspace_id,omitempty"`
-	ChannelID   string `json:"channel_id,omitempty"`
-	MessageTS   string `json:"message_ts,omitempty"`
-	ThreadTS    string `json:"thread_ts,omitempty"`
-	UserID      string `json:"user_id,omitempty"`
-}
-
 // TaskManifest is the worker's trusted, serialized task boundary. Commands
 // are argv vectors, never shell snippets.
 type TaskManifest struct {
-	TaskID             string      `json:"task_id"`
-	Repository         string      `json:"repository,omitempty"`
-	CloneURL           string      `json:"clone_url,omitempty"`
-	BaseBranch         string      `json:"base_branch,omitempty"`
-	TaskBranch         string      `json:"task_branch,omitempty"`
-	Prompt             string      `json:"prompt"`
-	Slack              SlackOrigin `json:"slack,omitempty"`
-	OpenCodeCommand    []string    `json:"opencode_command,omitempty"`
-	ValidationCommand  []string    `json:"validation_command,omitempty"`
-	ValidationCommands [][]string  `json:"validation_commands,omitempty"`
-	MaxFixAttempts     int         `json:"max_fix_attempts"`
+	TaskID             string     `json:"task_id"`
+	Repository         string     `json:"repository,omitempty"`
+	CloneURL           string     `json:"clone_url,omitempty"`
+	BaseBranch         string     `json:"base_branch,omitempty"`
+	TaskBranch         string     `json:"task_branch,omitempty"`
+	Prompt             string     `json:"prompt"`
+	OpenCodeCommand    []string   `json:"opencode_command,omitempty"`
+	ValidationCommand  []string   `json:"validation_command,omitempty"`
+	ValidationCommands [][]string `json:"validation_commands,omitempty"`
+	MaxFixAttempts     int        `json:"max_fix_attempts"`
 }
 
 // ValidateManifest checks values crossing into the worker. It deliberately
@@ -81,22 +70,6 @@ func ValidateManifest(manifest TaskManifest) error {
 	}
 	if manifest.MaxFixAttempts < 0 || manifest.MaxFixAttempts > maxFixAttempts {
 		return fmt.Errorf("max_fix_attempts must be between 0 and %d", maxFixAttempts)
-	}
-	return validateSlackOrigin(manifest.Slack)
-}
-
-func validateSlackOrigin(origin SlackOrigin) error {
-	values := map[string]string{
-		"slack.workspace_id": origin.WorkspaceID,
-		"slack.channel_id":   origin.ChannelID,
-		"slack.message_ts":   origin.MessageTS,
-		"slack.thread_ts":    origin.ThreadTS,
-		"slack.user_id":      origin.UserID,
-	}
-	for name, value := range values {
-		if err := validateText(name, value, 256, false); err != nil {
-			return err
-		}
 	}
 	return nil
 }

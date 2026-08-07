@@ -236,11 +236,9 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var request struct {
-		Repository     string       `json:"repository"`
-		Prompt         string       `json:"prompt"`
-		IdempotencyKey *string      `json:"idempotency_key"`
-		SlackOrigin    *slackOrigin `json:"slack_origin"`
-		SlackEventID   *string      `json:"slack_event_id"`
+		Repository     string  `json:"repository"`
+		Prompt         string  `json:"prompt"`
+		IdempotencyKey *string `json:"idempotency_key"`
 	}
 	if err := decoder.Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "request body must be valid JSON")
@@ -257,7 +255,6 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 	idempotencyKeyJSON, idempotencyKeyPresent := properties["idempotency_key"]
-	slackEventIDJSON, slackEventIDPresent := properties["slack_event_id"]
 	if strings.TrimSpace(request.Repository) == "" || strings.TrimSpace(request.Prompt) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "repository and prompt are required")
 		return nil, false
@@ -266,16 +263,8 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "repository must not contain inline credentials")
 		return nil, false
 	}
-	if idempotencyKeyPresent && slackEventIDPresent {
-		writeError(w, http.StatusBadRequest, "invalid_request", "idempotency_key and slack_event_id are mutually exclusive")
-		return nil, false
-	}
 	if idempotencyKeyPresent && bytes.Equal(bytes.TrimSpace(idempotencyKeyJSON), []byte("null")) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "idempotency_key must not be null")
-		return nil, false
-	}
-	if slackEventIDPresent && bytes.Equal(bytes.TrimSpace(slackEventIDJSON), []byte("null")) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "slack_event_id must not be null")
 		return nil, false
 	}
 	if request.IdempotencyKey != nil && strings.TrimSpace(*request.IdempotencyKey) == "" {
@@ -286,23 +275,7 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "idempotency_key must not exceed 256 characters")
 		return nil, false
 	}
-	if request.SlackEventID != nil && strings.TrimSpace(*request.SlackEventID) == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "slack_event_id must not be empty")
-		return nil, false
-	}
-	if request.SlackOrigin != nil && (strings.TrimSpace(request.SlackOrigin.WorkspaceID) == "" || strings.TrimSpace(request.SlackOrigin.ChannelID) == "" || strings.TrimSpace(request.SlackOrigin.MessageTS) == "") {
-		writeError(w, http.StatusBadRequest, "invalid_request", "slack_origin is missing required fields")
-		return nil, false
-	}
 	return body, true
-}
-
-type slackOrigin struct {
-	WorkspaceID string `json:"workspace_id"`
-	ChannelID   string `json:"channel_id"`
-	MessageTS   string `json:"message_ts"`
-	ThreadTS    string `json:"thread_ts"`
-	UserID      string `json:"user_id"`
 }
 
 func taskID(w http.ResponseWriter, r *http.Request) (string, bool) {

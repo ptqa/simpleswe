@@ -17,8 +17,6 @@ type Pod = client.KubernetesPod
 type ValidationRun = client.ValidationRun
 type GitResult = client.GitResult
 type PullRequest = client.PullRequest
-type SlackDetails = client.SlackDetails
-
 type TaskDetail struct {
 	Task     Task
 	Attempts []Attempt

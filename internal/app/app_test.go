@@ -23,8 +23,8 @@ const (
 	usageController = "usage: simpleswe controller --config PATH --database PATH"
 	usageWorker     = "usage: simpleswe worker [--manifest PATH]"
 	usageTUI        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
-	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs>"
-	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] REPOSITORY PROMPT"
+	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
+	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] REPOSITORY PROMPT"
 	usageTaskList   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	usageTaskShow   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	usageTaskCancel = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
@@ -286,6 +286,108 @@ func TestTaskCommandsWriteJSONAndLogsWriteLines(t *testing.T) {
 				t.Fatalf("task JSON = %#v, want task ID %q", document, tt.wantID)
 			}
 		})
+	}
+}
+
+func TestRunParsesHermesCreateIdempotencyKey(t *testing.T) {
+	var gotAddress string
+	var gotRequest client.CreateTaskRequest
+	deps := Dependencies{
+		PortForward: func(context.Context, string, string) (string, func() error, error) {
+			t.Fatal("create used port-forward with an explicit address")
+			return "", nil, nil
+		},
+		CreateTask: func(_ context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {
+			gotAddress, gotRequest = address, request
+			return client.Task{ID: "task-create"}, nil
+		},
+	}
+	args := []string{
+		"task", "create", "--idempotency-key", "KEY", "--address", "https://controller.example",
+		"https://bitbucket.example/acme/widget", "fix the failing test",
+	}
+	if err := Run(context.Background(), args, strings.NewReader(""), io.Discard, io.Discard, deps); err != nil {
+		t.Fatalf("Run(%q) error = %v", args, err)
+	}
+	if gotAddress != "https://controller.example" {
+		t.Fatalf("create address = %q, want explicit address", gotAddress)
+	}
+	want := client.CreateTaskRequest{
+		Repository:     "https://bitbucket.example/acme/widget",
+		Prompt:         "fix the failing test",
+		IdempotencyKey: "KEY",
+	}
+	if !reflect.DeepEqual(gotRequest, want) {
+		t.Fatalf("CreateTaskRequest = %#v, want %#v", gotRequest, want)
+	}
+}
+
+func TestRunRejectsInvalidHermesCreateIdempotencyKeyPlacement(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "duplicate",
+			args: []string{"task", "create", "--idempotency-key", "one", "--idempotency-key", "two", "repo", "prompt"},
+		},
+		{
+			name: "missing value",
+			args: []string{"task", "create", "--idempotency-key", "--address", "https://controller.example", "repo", "prompt"},
+		},
+		{
+			name: "empty value",
+			args: []string{"task", "create", "--idempotency-key", "", "repo", "prompt"},
+		},
+		{
+			name: "late",
+			args: []string{"task", "create", "repo", "prompt", "--idempotency-key", "KEY"},
+		},
+		{
+			name: "unsupported placement",
+			args: []string{"task", "create", "repo", "--idempotency-key", "KEY", "prompt"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := Run(context.Background(), tt.args, strings.NewReader(""), io.Discard, io.Discard, Dependencies{}); err == nil || err.Error() != usageTaskCreate {
+				t.Fatalf("Run(%q) error = %v, want %q", tt.args, err, usageTaskCreate)
+			}
+		})
+	}
+}
+
+func TestRunWaitUsesExplicitAddressAndWritesFinalTaskJSON(t *testing.T) {
+	final := client.Task{
+		ID:          "task-wait",
+		State:       "ready",
+		PullRequest: client.PullRequest{State: "open", URL: "https://bitbucket.example/acme/widget/pull-requests/1"},
+	}
+	var gotAddress, gotID string
+	var stdout bytes.Buffer
+	deps := Dependencies{
+		PortForward: func(context.Context, string, string) (string, func() error, error) {
+			t.Fatal("wait used port-forward with an explicit address")
+			return "", nil, nil
+		},
+		WaitTask: func(_ context.Context, address, id string) (client.Task, error) {
+			gotAddress, gotID = address, id
+			return final, nil
+		},
+	}
+	args := []string{"task", "wait", "--context", "staging", "--namespace", "team-a", "--address", "https://controller.example", "task-wait"}
+	if err := Run(context.Background(), args, strings.NewReader(""), &stdout, io.Discard, deps); err != nil {
+		t.Fatalf("Run(%q) error = %v", args, err)
+	}
+	if gotAddress != "https://controller.example" || gotID != "task-wait" {
+		t.Fatalf("WaitTask() address/id = %q/%q, want explicit address/task-wait", gotAddress, gotID)
+	}
+	var got client.Task
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("wait stdout is not Task JSON: %v\n%s", err, stdout.String())
+	}
+	if !reflect.DeepEqual(got, final) {
+		t.Fatalf("wait JSON = %#v, want %#v", got, final)
 	}
 }
 

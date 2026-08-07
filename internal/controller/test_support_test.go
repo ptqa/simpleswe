@@ -32,14 +32,14 @@ const (
 
 // Controller contract under test:
 //
-//	New(*store.Store, kubernetes.Interface, config.Config, Notifier, PullRequestCreator) (*Controller, error)
+//	New(*store.Store, kubernetes.Interface, config.Config, PullRequestCreator) (*Controller, error)
 //	(*Controller).CreateTask(context.Context, store.CreateTaskParams) (store.Task, error)
 //	(*Controller).Cancel(context.Context, string) error
 //	(*Controller).Retry(context.Context, string) (store.Attempt, error)
 //	(*Controller).Reconcile(context.Context) error
 //	(*Controller).HandleWorkerEvent(context.Context, jobName, podName string, protocol.Event) error
 //
-// Notifier and PullRequestCreator stay narrow at their external boundaries.
+// PullRequestCreator stays narrow at its external boundary.
 type controllerContract interface {
 	CreateTask(context.Context, store.CreateTaskParams) (store.Task, error)
 	Cancel(context.Context, string) error
@@ -56,7 +56,6 @@ type fixture struct {
 	store        *store.Store
 	kube         *fake.Clientset
 	config       config.Config
-	notifier     *fakeNotifier
 	pullRequests *fakePullRequestCreator
 	controller   controllerContract
 }
@@ -91,9 +90,8 @@ func newFixture(t *testing.T) *fixture {
 			Bitbucket:     config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "bitbucket-widget"},
 		}},
 	}
-	notifier := new(fakeNotifier)
 	pullRequests := new(fakePullRequestCreator)
-	controller, err := New(db, kube, cfg, notifier, pullRequests)
+	controller, err := New(db, kube, cfg, pullRequests)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
@@ -103,42 +101,9 @@ func newFixture(t *testing.T) *fixture {
 		store:        db,
 		kube:         kube,
 		config:       cfg,
-		notifier:     notifier,
 		pullRequests: pullRequests,
 		controller:   controller,
 	}
-}
-
-type notificationCall struct {
-	taskID string
-	url    string
-}
-
-type fakeNotifier struct {
-	mu      sync.Mutex
-	calls   []notificationCall
-	errors  map[string]error
-	blocked chan struct{}
-	release chan struct{}
-}
-
-func (f *fakeNotifier) PostPullRequest(ctx context.Context, taskID, url string) error {
-	f.mu.Lock()
-	f.calls = append(f.calls, notificationCall{taskID: taskID, url: url})
-	blocked, release, err := f.blocked, f.release, f.errors[taskID]
-	f.mu.Unlock()
-	if blocked != nil {
-		select {
-		case blocked <- struct{}{}:
-		default:
-		}
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	return err
 }
 
 type pullRequestCall struct {
@@ -247,17 +212,14 @@ func (f *fakePullRequestCreator) PullRequestReplyExists(_ context.Context, targe
 	return f.replyExists, f.replyExistsErr
 }
 
-var (
-	_ Notifier           = (*fakeNotifier)(nil)
-	_ PullRequestCreator = (*fakePullRequestCreator)(nil)
-)
+var _ PullRequestCreator = (*fakePullRequestCreator)(nil)
 
-func createTask(t *testing.T, fixture *fixture, prompt, slackEventID string) store.Task {
+func createTask(t *testing.T, fixture *fixture, prompt, idempotencyKey string) store.Task {
 	t.Helper()
 	created, err := fixture.controller.CreateTask(fixture.ctx, store.CreateTaskParams{
-		Repository:   repositoryURL,
-		Prompt:       prompt,
-		SlackEventID: slackEventID,
+		Repository:     repositoryURL,
+		Prompt:         prompt,
+		IdempotencyKey: idempotencyKey,
 	})
 	if err != nil {
 		t.Fatalf("CreateTask() error = %v", err)
@@ -265,9 +227,9 @@ func createTask(t *testing.T, fixture *fixture, prompt, slackEventID string) sto
 	return created
 }
 
-func createRunningTask(t *testing.T, fixture *fixture, prompt, slackEventID string) store.Task {
+func createRunningTask(t *testing.T, fixture *fixture, prompt, idempotencyKey string) store.Task {
 	t.Helper()
-	created := createTask(t, fixture, prompt, slackEventID)
+	created := createTask(t, fixture, prompt, idempotencyKey)
 	jobName := jobs.Name(created.ID, 1)
 	job, err := fixture.kube.BatchV1().Jobs(workerNamespace).Get(fixture.ctx, jobName, metav1.GetOptions{})
 	if err != nil {

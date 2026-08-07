@@ -1,0 +1,18 @@
+{{- if .Values.hermes.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "simpleswe.fullname" . }}-hermes-data
+  namespace: {{ include "simpleswe.namespace" . }}
+  labels:
+    {{- include "simpleswe.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.hermes.storage.accessModes | nindent 4 }}
+  {{- with .Values.hermes.storage.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.hermes.storage.size | quote }}
+{{- end }}

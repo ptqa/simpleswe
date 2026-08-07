@@ -10,3 +10,67 @@ metadata:
 data:
   config.yaml: |
     {{- toYaml $config | nindent 4 }}
+  {{- if .Values.hermes.enabled }}
+  hermes-config.yaml: |
+    model: {{ .Values.hermes.config.model | quote }}
+    toolsets: []
+    agent:
+      disabled_toolsets:
+        - bfl
+        - kanban
+    platform_toolsets:
+      slack:
+        - terminal
+        - skills
+    terminal:
+      backend: local
+      cwd: /opt/data
+    platforms:
+      slack:
+        enabled: true
+        extra:
+          reply_in_thread: true
+    slack:
+      require_mention: true
+      thread_require_mention: false
+      strict_mention: false
+    unauthorized_dm_behavior: ignore
+    group_sessions_per_user: true
+    thread_sessions_per_user: true
+    memory:
+      memory_enabled: false
+      user_profile_enabled: false
+      nudge_interval: 0
+    skills:
+      creation_nudge_interval: 0
+      inline_shell: false
+      write_approval: true
+    curator:
+      enabled: false
+    mcp_servers: {}
+  hermes-skill.md: |
+    ---
+    name: simpleswe
+    description: Operate SimpleSWE through its narrow local CLI contract.
+    ---
+
+    # SimpleSWE operations
+
+    Use only these commands, always with `--address http://127.0.0.1:8080` before positional arguments:
+
+    - `simpleswe task create --address http://127.0.0.1:8080 --idempotency-key KEY REPOSITORY PROMPT`
+    - `simpleswe task list --address http://127.0.0.1:8080`
+    - `simpleswe task show --address http://127.0.0.1:8080 ID`
+    - `simpleswe task wait --address http://127.0.0.1:8080 ID`
+    - `simpleswe task logs --address http://127.0.0.1:8080 ID`
+    - `simpleswe task cancel --address http://127.0.0.1:8080 ID`
+    - `simpleswe task retry --address http://127.0.0.1:8080 ID`
+
+    Never use the controller, worker, or TUI top-level commands. Require a configured repository name before creating anything. Preserve the user's engineering request as the prompt without inventing requirements.
+
+    Generate one idempotency key per Slack request and reuse the same key if the create call is retried. Report the accepted task ID immediately. Run `simpleswe task wait` with `terminal(background=true, notify_on_complete=true)` so the Slack conversation remains responsive and completion generates a follow-up event. When the wait command completes, report the pull-request URL or terminal failure to the originating thread.
+
+    Use `simpleswe task show` only for explicit status questions. Use `simpleswe task logs` only when the user asks for logs or diagnosis. Ask for confirmation before cancel and before retry, unless the user explicitly requested cancellation or retry.
+
+    This is the minimum toolset for the CLI workflow. Do not use unrelated file, browser, or infrastructure tools by default.
+  {{- end }}

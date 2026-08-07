@@ -458,10 +458,8 @@ components:
   schemas:
     CreateTaskRequest:
       type: object
-      description: Repository and instruction submitted as a new task. At most one of idempotency_key and slack_event_id may be provided.
+      description: Repository and instruction submitted as a new task.
       additionalProperties: false
-      not:
-        required: [idempotency_key, slack_event_id]
       required: [repository, prompt]
       example:
         repository: https://github.com/simpleswe/example-service
@@ -480,14 +478,7 @@ components:
           minLength: 1
           maxLength: 256
           pattern: .*\S.*
-          description: Optional generic, caller-generated opaque key used to deduplicate task-creation retries; mutually exclusive with slack_event_id.
-        slack_origin:
-          $ref: '#/components/schemas/SlackOrigin'
-        slack_event_id:
-          type: string
-          minLength: 1
-          pattern: .*\S.*
-          description: Optional Slack-specific event identifier used to deduplicate retries of a Slack-originated task and support tracing; mutually exclusive with idempotency_key.
+          description: Optional generic, caller-generated opaque key used to deduplicate task-creation retries.
 
     WebhookPayload:
       type: object
@@ -641,13 +632,6 @@ components:
           type: boolean
           description: True after cancellation is accepted and before the task reaches cancelled.
           readOnly: true
-        slack_origin:
-          $ref: '#/components/schemas/SlackOrigin'
-          readOnly: true
-        slack_event_id:
-          type: string
-          minLength: 1
-          readOnly: true
         kubernetes_job:
           $ref: '#/components/schemas/KubernetesJobState'
           readOnly: true
@@ -686,29 +670,6 @@ components:
         - ready
         - failed
         - cancelled
-
-    SlackOrigin:
-      type: object
-      description: Slack event metadata that originated the task, when available.
-      additionalProperties: false
-      required: [workspace_id, channel_id, message_ts]
-      properties:
-        workspace_id:
-          type: string
-          minLength: 1
-          description: Slack workspace identifier, not a credential.
-        channel_id:
-          type: string
-          minLength: 1
-        message_ts:
-          type: string
-          minLength: 1
-        thread_ts:
-          type: string
-          minLength: 1
-        user_id:
-          type: string
-          minLength: 1
 
     ResourceIdentity:
       type: object

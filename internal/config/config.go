@@ -28,7 +28,6 @@ const (
 type Config struct {
 	Controller   ControllerConfig  `yaml:"controller"`
 	Worker       WorkerConfig      `yaml:"worker"`
-	Slack        SlackConfig       `yaml:"slack,omitempty"`
 	Bitbucket    BitbucketConfig   `yaml:"bitbucket,omitempty"`
 	GitHub       GitHubConfig      `yaml:"github,omitempty"`
 	Repositories RepositoryConfigs `yaml:"repositories"`
@@ -39,12 +38,6 @@ type Config struct {
 type SecretSource struct {
 	File string `yaml:"file,omitempty"`
 	Env  string `yaml:"env,omitempty"`
-}
-
-type SlackConfig struct {
-	BotToken SecretSource `yaml:"bot_token"`
-	AppToken SecretSource `yaml:"app_token"`
-	Disabled bool         `yaml:"disabled,omitempty"`
 }
 
 type BitbucketConfig struct {
@@ -361,12 +354,6 @@ func (c Config) validate() error {
 	}
 	if strings.TrimSpace(c.Worker.BranchPrefix) == "" {
 		return fmt.Errorf("worker.branch_prefix must not be empty")
-	}
-	if err := validateSecretSource(c.Slack.BotToken, "slack.bot_token"); err != nil {
-		return err
-	}
-	if err := validateSecretSource(c.Slack.AppToken, "slack.app_token"); err != nil {
-		return err
 	}
 	if err := validateSecretSource(c.Bitbucket.WebhookSecret, "bitbucket.webhook_secret"); err != nil {
 		return err

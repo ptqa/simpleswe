@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -258,7 +257,7 @@ func TestRecreatedResourcesUseImmutableAttemptSnapshot(t *testing.T) {
 	}
 	changed := fixture.config
 	changed.Repositories[0].Worker.Image = "registry.example/simpleswe/widget-worker:v99"
-	restarted, err := New(fixture.store, fixture.kube, changed, fixture.notifier, fixture.pullRequests)
+	restarted, err := New(fixture.store, fixture.kube, changed, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("restart controller: %v", err)
 	}
@@ -274,7 +273,7 @@ func TestRecreatedResourcesUseImmutableAttemptSnapshot(t *testing.T) {
 func TestPermanentManifestErrorIsRejectedBeforeTaskAcceptance(t *testing.T) {
 	fixture := newFixture(t)
 	fixture.config.Repositories[0].Worker.Image = ""
-	control, err := New(fixture.store, fixture.kube, fixture.config, fixture.notifier, fixture.pullRequests)
+	control, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
@@ -372,32 +371,6 @@ func TestValidationFailureBlocksRetryUntilOldLogFollowerCloses(t *testing.T) {
 	}
 }
 
-func TestPendingNotificationsContinueAfterOneFailure(t *testing.T) {
-	fixture := newFixture(t)
-	var taskIDs []string
-	for i := range 2 {
-		record, err := fixture.store.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: fmt.Sprintf("notify %d", i)})
-		if err != nil {
-			t.Fatalf("create notification task: %v", err)
-		}
-		attempt, _ := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
-		if _, err := fixture.store.ReservePullRequest(fixture.ctx, attempt.ID, record.Prompt, fmt.Sprintf("work/%d", i), "main"); err != nil {
-			t.Fatalf("reserve pull request: %v", err)
-		}
-		if err := fixture.store.CompletePullRequest(fixture.ctx, attempt.ID, i+1, fmt.Sprintf("%s/%d", pullRequestURL, i)); err != nil {
-			t.Fatalf("complete pull request: %v", err)
-		}
-		taskIDs = append(taskIDs, record.ID)
-	}
-	fixture.notifier.errors = map[string]error{taskIDs[1]: errors.New("temporary notification failure")}
-	if err := fixture.controller.(*Controller).NotifyPendingPullRequests(fixture.ctx); err == nil {
-		t.Fatal("notification failure was not returned")
-	}
-	if len(fixture.notifier.calls) != 2 {
-		t.Fatalf("notification calls = %#v, want both pending tasks attempted", fixture.notifier.calls)
-	}
-}
-
 func TestTaskLockWaitHonorsCallerDeadline(t *testing.T) {
 	fixture := newFixture(t)
 	created := createRunningTask(t, fixture, "lock deadline", "lock-deadline")
@@ -435,44 +408,6 @@ func TestTaskLockWaitHonorsCallerDeadline(t *testing.T) {
 	close(fixture.pullRequests.release)
 	if err := <-branchDone; err != nil {
 		t.Fatalf("release provider call: %v", err)
-	}
-}
-
-func TestNotifierCallIsBoundedAndReleasesTaskLock(t *testing.T) {
-	fixture := newFixture(t)
-	control := fixture.controller.(*Controller)
-	control.providerTimeout = 25 * time.Millisecond
-	fixture.notifier.blocked = make(chan struct{}, 1)
-	fixture.notifier.release = make(chan struct{})
-	created := createRunningTask(t, fixture, "bounded notifier", "bounded-notifier")
-	jobName, podName := jobs.Name(created.ID, 1), "worker-pod-a1"
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: created.ID})
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: created.ID, Command: []string{"go", "test", "./..."}})
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationResult, TaskID: created.ID, Command: []string{"go", "test", "./..."}})
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationSucceeded, TaskID: created.ID})
-	done := make(chan error, 1)
-	go func() {
-		done <- fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: created.ID, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA})
-	}()
-	select {
-	case <-fixture.notifier.blocked:
-	case <-time.After(time.Second):
-		t.Fatal("notifier was not called")
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("branch event after notifier timeout: %v", err)
-		}
-	case <-time.After(250 * time.Millisecond):
-		close(fixture.notifier.release)
-		<-done
-		t.Fatal("notifier call was not bounded")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if err := fixture.controller.Cancel(ctx, created.ID); err != nil {
-		t.Fatalf("task lock remained held after notifier timeout: %v", err)
 	}
 }
 
@@ -544,8 +479,8 @@ func TestQueuedBranchPushedAfterCancellationIsLogicalNoop(t *testing.T) {
 	if _, err := fixture.store.GetPullRequest(fixture.ctx, created.CurrentAttemptID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("cancelled branch event persisted pull request: %v", err)
 	}
-	if len(fixture.pullRequests.calls) != 0 || len(fixture.notifier.calls) != 0 {
-		t.Fatalf("cancelled branch event called provider/notifier: PR=%d Slack=%d", len(fixture.pullRequests.calls), len(fixture.notifier.calls))
+	if len(fixture.pullRequests.calls) != 0 {
+		t.Fatalf("cancelled branch event called provider: PR=%d", len(fixture.pullRequests.calls))
 	}
 	if got := getTask(t, fixture, created.ID); !got.CancellationRequested || got.State != task.VALIDATING {
 		t.Fatalf("cancelled branch event changed outcome owner: %#v", got)

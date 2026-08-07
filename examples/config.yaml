@@ -9,11 +9,6 @@ worker:
   command: opencode
   branch_prefix: simpleswe/
   deadline: 30m
-slack:
-  bot_token:
-    file: /run/secrets/slack/bot-token
-  app_token:
-    file: /run/secrets/slack/app-token
 bitbucket:
   base_url: https://api.bitbucket.org
   webhook_secret:

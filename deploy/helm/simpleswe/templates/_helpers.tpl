@@ -31,6 +31,14 @@
 {{- end -}}
 {{- end -}}
 
+{{- define "simpleswe.hermesImage" -}}
+{{- if .Values.hermes.image.digest -}}
+{{- printf "%s@%s" .Values.hermes.image.repository .Values.hermes.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.hermes.image.repository .Values.hermes.image.tag -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "simpleswe.labels" -}}
 helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" | quote }}
 app.kubernetes.io/name: {{ include "simpleswe.name" . | quote }}

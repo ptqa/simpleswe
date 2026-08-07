@@ -22,13 +22,10 @@ func (h metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	states := make(map[string]int)
-	completed, failed, cancelled, active, slackEvents, attempts := 0, 0, 0, 0, 0, 0
+	completed, failed, cancelled, active, attempts := 0, 0, 0, 0, 0
 	var durationSum float64
 	for _, record := range tasks {
 		states[string(record.State)]++
-		if record.SlackEventID != "" {
-			slackEvents++
-		}
 		switch record.State {
 		case task.READY:
 			completed++
@@ -72,9 +69,9 @@ func (h metricsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"simpleswe_tasks_failed_total": float64(failed), "simpleswe_tasks_cancelled_total": float64(cancelled),
 		"simpleswe_active_tasks": float64(active), "simpleswe_task_duration_seconds": durationSum,
 		"simpleswe_jobs_created_total": float64(attempts), "simpleswe_worker_jobs_active": float64(active),
-		"simpleswe_worker_job_failures_total": float64(failed), "simpleswe_slack_events_total": float64(slackEvents),
+		"simpleswe_worker_job_failures_total": float64(failed),
 	}
-	for _, name := range []string{"simpleswe_job_creation_failures_total", "simpleswe_slack_errors_total", "simpleswe_slack_delivery_failures_total", "simpleswe_reconcile_total", "simpleswe_reconcile_errors_total", "simpleswe_reconciliation_errors_total"} {
+	for _, name := range []string{"simpleswe_job_creation_failures_total", "simpleswe_reconcile_total", "simpleswe_reconcile_errors_total", "simpleswe_reconciliation_errors_total"} {
 		values[name] = 0
 	}
 	names := make([]string, 0, len(values))

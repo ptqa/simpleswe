@@ -222,7 +222,7 @@ func TestRunningForgeEventDeterministicRecoveryFailuresAreTerminal(t *testing.T)
 			mutate: func(t *testing.T, fixture *fixture, _ store.Task, _, _ store.Attempt, _ string) *Controller {
 				cfg := fixture.config
 				cfg.Repositories = nil
-				control, err := New(fixture.store, fixture.kube, cfg, fixture.notifier, fixture.pullRequests)
+				control, err := New(fixture.store, fixture.kube, cfg, fixture.pullRequests)
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -183,6 +183,234 @@ func TestClientPropagatesContextCancellation(t *testing.T) {
 	}
 }
 
+func TestClientWaitTaskReturnsWhenPullRequestURLExists(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/tasks/task-1" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, waitTaskResponse("running", "https://bitbucket.example/acme/widget/pull-requests/1"))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	got, err := New(server.URL, server.Client()).WaitTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("WaitTask() error = %v", err)
+	}
+	if got.State != "running" || got.PullRequest.URL == "" {
+		t.Fatalf("WaitTask() = %#v, want non-terminal task with pull-request URL", got)
+	}
+	if calls != 1 {
+		t.Fatalf("WaitTask() ShowTask calls = %d, want 1", calls)
+	}
+}
+
+func TestClientWaitTaskReturnsForTerminalStates(t *testing.T) {
+	for _, state := range []string{"failed", "cancelled", "ready"} {
+		t.Run(state, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/tasks/task-1" {
+					http.NotFound(w, r)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, waitTaskResponse(state, ""))
+			}))
+			t.Cleanup(server.Close)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			got, err := New(server.URL, server.Client()).WaitTask(ctx, "task-1")
+			if err != nil {
+				t.Fatalf("WaitTask() error = %v", err)
+			}
+			if got.ID != "task-1" || got.State != state {
+				t.Fatalf("WaitTask() = %#v, want task-1 in %s state", got, state)
+			}
+			if calls != 1 {
+				t.Fatalf("WaitTask() ShowTask calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestClientWaitTaskRetriesTransientErrorsThenReturnsReady(t *testing.T) {
+	var calls int
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		switch calls {
+		case 1:
+			return nil, errors.New("connection reset")
+		case 2:
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Status:     "503 Service Unavailable",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("temporarily unavailable")),
+				Request:    request,
+			}, nil
+		default:
+			return waitTaskHTTPResponse(request, waitTaskResponse("ready", "")), nil
+		}
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	got, err := New("http://controller", httpClient).WaitTask(ctx, "task-1")
+	if err != nil || got.State != "ready" || calls != 3 {
+		t.Fatalf("WaitTask() = %#v, %v after %d calls; want ready after transport and HTTP 503 retries", got, err, calls)
+	}
+}
+
+func TestClientWaitTaskPropagatesAPI4xxImmediately(t *testing.T) {
+	var calls int
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Status:     "404 Not Found",
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"code":"not_found","message":"missing task"}}`)),
+			Request:    request,
+		}, nil
+	})}
+
+	_, err := New("http://controller", httpClient).WaitTask(context.Background(), "task-1")
+	var apiError *APIError
+	if !errors.As(err, &apiError) || apiError.Status != http.StatusNotFound || calls != 1 {
+		t.Fatalf("WaitTask() error = %#v after %d calls, want immediate 404 API error", err, calls)
+	}
+}
+
+func TestClientWaitTaskPropagatesContextCancellation(t *testing.T) {
+	t.Run("during ShowTask", func(t *testing.T) {
+		started := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(started)
+			<-r.Context().Done()
+		}))
+		t.Cleanup(server.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := New(server.URL, server.Client()).WaitTask(ctx, "task-1")
+			done <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("WaitTask() did not call ShowTask")
+		}
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait for task") {
+				t.Fatalf("WaitTask() error = %v, want wrapped context.Canceled", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("WaitTask() did not return after context cancellation")
+		}
+	})
+
+	t.Run("between polls", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		calls := 0
+		httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body: cancelOnCloseBody{
+					Reader: strings.NewReader(waitTaskResponse("queued", "")),
+					Cancel: cancel,
+				},
+				Request: request,
+			}, nil
+		})}
+
+		_, err := New("http://controller", httpClient).WaitTask(ctx, "task-1")
+		if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait for task") {
+			t.Fatalf("WaitTask() error = %v, want wrapped context.Canceled", err)
+		}
+		if calls != 1 {
+			t.Fatalf("WaitTask() ShowTask calls = %d, want one completed poll before cancellation", calls)
+		}
+	})
+}
+
+func TestClientWaitTaskUsesFixedIntervalWithoutBusyLooping(t *testing.T) {
+	const minimumPollInterval = 900 * time.Millisecond
+	var calls int
+	var pollTimes []time.Time
+	httpClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Path != "/v1/tasks/task-1" {
+			return nil, fmt.Errorf("request = %s %s", request.Method, request.URL.Path)
+		}
+		calls++
+		pollTimes = append(pollTimes, time.Now())
+		state := "queued"
+		if calls == 2 {
+			state = "ready"
+		}
+		return waitTaskHTTPResponse(request, waitTaskResponse(state, "")), nil
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	got, err := New("http://controller", httpClient).WaitTask(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("WaitTask() error = %v", err)
+	}
+	if got.State != "ready" || calls != 2 {
+		t.Fatalf("WaitTask() = %#v after %d polls, want ready after 2 polls", got, calls)
+	}
+	for i := 1; i < len(pollTimes); i++ {
+		if gap := pollTimes[i].Sub(pollTimes[i-1]); gap < minimumPollInterval {
+			t.Fatalf("poll interval = %v, want at least %v", gap, minimumPollInterval)
+		}
+	}
+}
+
+func waitTaskResponse(state, pullRequestURL string) string {
+	return fmt.Sprintf(`{"data":{"task_id":"task-1","state":%q,"pull_request":{"state":"not_created","url":%q}}}`, state, pullRequestURL)
+}
+
+func waitTaskHTTPResponse(request *http.Request, body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    request,
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type cancelOnCloseBody struct {
+	io.Reader
+	Cancel context.CancelFunc
+}
+
+func (b cancelOnCloseBody) Close() error {
+	b.Cancel()
+	return nil
+}
+
 func TestClientStreamsSSEIncrementally(t *testing.T) {
 	firstSeen := make(chan struct{})
 	release := make(chan struct{})

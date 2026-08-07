@@ -14,8 +14,6 @@ import (
 	"sync"
 	"time"
 
-	slackapi "github.com/slack-go/slack"
-	slacksocket "github.com/slack-go/slack/socketmode"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -28,12 +26,9 @@ import (
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
 	"github.com/simpleswe/simpleswe/internal/forge/github"
-	internalslack "github.com/simpleswe/simpleswe/internal/slack"
-	internalSocketMode "github.com/simpleswe/simpleswe/internal/slack/socketmode"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/tui"
 	"github.com/simpleswe/simpleswe/internal/worker"
-	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
 
 const (
@@ -57,6 +52,9 @@ func Dependencies() app.Dependencies {
 		},
 		ShowTask: func(ctx context.Context, address, id string) (client.Task, error) {
 			return client.New(address, nil).ShowTask(ctx, id)
+		},
+		WaitTask: func(ctx context.Context, address, id string) (client.Task, error) {
+			return client.New(address, nil).WaitTask(ctx, id)
 		},
 		CancelTask: func(ctx context.Context, address, id string) (client.Task, error) {
 			return client.New(address, nil).CancelTask(ctx, id)
@@ -164,19 +162,14 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 	}
 
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
-	slack, err := newSlackServices(cfg)
-	if err != nil {
-		return err
-	}
-	control, err := controller.New(db, kube, cfg, slack.notifier(db), pullRequests)
+	control, err := controller.New(db, kube, cfg, pullRequests)
 	if err != nil {
 		return err
 	}
 	backend := controllerruntime.NewBackend(db, control)
 	runtime, err := controllerruntime.NewRuntime(kube, db, control, backend, controllerruntime.Options{
 		Namespace: cfg.Controller.Namespace, SecretRetention: time.Hour, Logger: logger,
-		NotifyPendingPullRequests: control.NotifyPendingPullRequests,
-		ProcessForgeEvents:        control.ProcessForgeEvents,
+		ProcessForgeEvents: control.ProcessForgeEvents,
 	})
 	if err != nil {
 		return err
@@ -199,103 +192,7 @@ func RunController(ctx context.Context, configPath, databasePath string, stdout,
 		IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20,
 	}
 	logger.InfoContext(ctx, "controller starting", "address", cfg.Controller.ListenAddress, "webhook_address", cfg.Controller.WebhookListenAddress, "namespace", cfg.Controller.Namespace)
-	components := make([]func(context.Context) error, 1, 3)
-	components[0] = runtime.Run
-	components = append(components, slack.components(db, control, logger)...)
-	return runControllerComponents(ctx, server, webhookServer, components...)
-}
-
-type slackServices struct {
-	socket    *internalSocketMode.SDKSocket
-	messenger internalslack.Messenger
-}
-
-func newSlackServices(cfg config.Config) (slackServices, error) {
-	if cfg.Slack.Disabled {
-		return slackServices{}, nil
-	}
-	botToken, err := readSecret(cfg.Slack.BotToken, "SIMPLESWE_SLACK_BOT_TOKEN", "SIMPLESWE_SLACK_BOT_TOKEN_FILE", "/run/secrets/slack/bot-token", "Slack bot token")
-	if err != nil {
-		return slackServices{}, err
-	}
-	appToken, err := readSecret(cfg.Slack.AppToken, "SIMPLESWE_SLACK_APP_TOKEN", "SIMPLESWE_SLACK_APP_TOKEN_FILE", "/run/secrets/slack/app-token", "Slack app token")
-	if err != nil {
-		return slackServices{}, err
-	}
-	slackClient := slackapi.New(botToken, slackapi.OptionAppLevelToken(appToken))
-	return slackServices{
-		socket:    internalSocketMode.NewSDKSocket(slacksocket.New(slackClient)),
-		messenger: internalSocketMode.NewMessenger(internalSocketMode.SDKChatAPI{Client: slackClient}),
-	}, nil
-}
-
-func (s slackServices) notifier(db *store.Store) controller.Notifier {
-	if s.messenger == nil {
-		return discardNotifier{}
-	}
-	return &pullRequestNotifier{store: db, messenger: s.messenger}
-}
-
-func (s slackServices) components(db *store.Store, control *controller.Controller, logger *slog.Logger) []func(context.Context) error {
-	if s.socket == nil {
-		return nil
-	}
-	handler := internalslack.NewHandler(lifecycleAdapter{controller: control}, s.messenger)
-	transport := internalSocketMode.NewTransport(s.socket, db, handler, logger)
-	return []func(context.Context) error{s.socket.Run, transport.Run}
-}
-
-type discardNotifier struct{}
-
-func (discardNotifier) PostPullRequest(context.Context, string, string) error { return nil }
-
-type lifecycleAdapter struct{ controller *controller.Controller }
-
-func (a lifecycleAdapter) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
-	return a.controller.CreateTask(ctx, params)
-}
-func (a lifecycleAdapter) CreateTaskWithOrigin(ctx context.Context, params store.CreateTaskParams, origin protocol.SlackOrigin) (store.Task, error) {
-	return a.controller.CreateTaskWithOrigin(ctx, params, origin)
-}
-func (a lifecycleAdapter) GetTask(ctx context.Context, id string) (store.Task, error) {
-	return a.controller.GetTask(ctx, id)
-}
-func (a lifecycleAdapter) ListAttempts(ctx context.Context, id string) ([]store.Attempt, error) {
-	return a.controller.ListAttempts(ctx, id)
-}
-func (a lifecycleAdapter) RequestCancellation(ctx context.Context, id string) error {
-	current, err := a.controller.GetTask(ctx, id)
-	if err != nil {
-		return err
-	}
-	if cancellationAlreadyApplied(current) {
-		return nil
-	}
-	return a.controller.Cancel(ctx, id)
-}
-
-func cancellationAlreadyApplied(current store.Task) bool {
-	return current.CancellationRequested || current.State == "cancelled"
-}
-
-func (a lifecycleAdapter) RetryTaskWithKey(ctx context.Context, id, key string) (store.Attempt, error) {
-	return a.controller.RetryWithKey(ctx, id, key)
-}
-
-type pullRequestNotifier struct {
-	store     *store.Store
-	messenger internalslack.Messenger
-}
-
-func (n *pullRequestNotifier) PostPullRequest(ctx context.Context, taskID, url string) error {
-	task, err := n.store.GetTask(ctx, taskID)
-	if err != nil {
-		return err
-	}
-	if task.SlackOrigin.ChannelID == "" {
-		return nil
-	}
-	return n.messenger.PostMessage(ctx, task.SlackOrigin, "Pull request: "+url)
+	return runControllerComponents(ctx, server, webhookServer, runtime.Run)
 }
 
 func runControllerComponents(ctx context.Context, server, webhookServer *http.Server, components ...func(context.Context) error) error {

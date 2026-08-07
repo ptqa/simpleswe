@@ -10,6 +10,40 @@ image:
 imagePullSecrets:
   - name: ghcr-pull
 
+hermes:
+  enabled: true
+  image:
+    repository: ghcr.io/simpleswe/simpleswe-hermes
+    # Publish this release tag immutably; do not use latest.
+    tag: "v0.20.0-simpleswe.1"
+    digest: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+  config:
+    model: openai/gpt-5.6-luna
+  storage:
+    storageClass: gp3
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+  secrets:
+    slack:
+      name: simpleswe-hermes-slack
+      keys:
+        botToken: bot-token
+        appToken: app-token
+        allowedUser: allowed-user
+    modelProvider:
+      name: simpleswe-hermes-model
+      key: api-key
+      env: OPENAI_API_KEY
+
 storage:
   storageClass: gp3
   size: 20Gi
@@ -17,10 +51,6 @@ storage:
 nodeSelector:
   kubernetes.io/os: linux
   kubernetes.io/arch: amd64
-
-secrets:
-  slack:
-    name: simpleswe-slack
 
 config:
   controller:
@@ -34,11 +64,6 @@ config:
     command: opencode
     branch_prefix: simpleswe/
     deadline: 30m
-  slack:
-    bot_token:
-      file: /run/secrets/slack/bot-token
-    app_token:
-      file: /run/secrets/slack/app-token
   bitbucket:
     base_url: https://api.bitbucket.org
   repositories:
