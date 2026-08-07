@@ -194,6 +194,9 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 		if volume.Secret == nil || volume.Secret.SecretName != credential.Name {
 			t.Errorf("credential %q volume = %#v; want referenced Secret", credential.Name, volume)
 		}
+		if volume.Secret == nil || volume.Secret.DefaultMode == nil || *volume.Secret.DefaultMode != 0o400 {
+			t.Errorf("credential %q defaultMode = %#v; want 0400", credential.Name, volume.Secret)
+		}
 	}
 	workspaceMount, workspaceVolume := findNamedVolumeMount(t, worker, pod.Volumes, workspaceVolumeName)
 	if workspaceMount.MountPath != workspaceMountPath || workspaceMount.ReadOnly || workspaceVolume.EmptyDir == nil {

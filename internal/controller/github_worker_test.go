@@ -218,7 +218,7 @@ func TestGitHubWorkerDoesNotDuplicateGenericCredentialMountAndRetainsSSH(t *test
 	if sshPath != 1 {
 		t.Fatalf("SSH credential mounts = %d; want 1", sshPath)
 	}
-	assertGitHubEnv(t, jobConfig.Env, "GIT_SSH_COMMAND", "ssh -i /run/secrets/git/ssh-privatekey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new")
+	assertGitHubEnv(t, jobConfig.Env, "GIT_SSH_COMMAND", "ssh -i /run/secrets/git/ssh-privatekey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/workspace/known_hosts")
 }
 
 func assertGitHubEnv(t *testing.T, env []corev1.EnvVar, name, want string) {

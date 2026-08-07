@@ -688,7 +688,7 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 	}
 	if repository.Git.SSHSecret != "" {
 		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{Name: repository.Git.SSHSecret, MountPath: "/run/secrets/git"})
-		jobConfig.Env = append(jobConfig.Env, corev1.EnvVar{Name: "GIT_SSH_COMMAND", Value: "ssh -i /run/secrets/git/ssh-privatekey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"})
+		jobConfig.Env = append(jobConfig.Env, corev1.EnvVar{Name: "GIT_SSH_COMMAND", Value: "ssh -i /run/secrets/git/ssh-privatekey -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/workspace/known_hosts"})
 	}
 	if repository.OpenCode.ConfigSecret != "" {
 		jobConfig.CredentialSecrets = append(jobConfig.CredentialSecrets, jobs.SecretMount{Name: repository.OpenCode.ConfigSecret, MountPath: "/run/secrets/opencode"})

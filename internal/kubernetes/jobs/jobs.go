@@ -132,12 +132,14 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 		{Name: "task-secret", MountPath: taskMountPath, SubPath: "task.json", ReadOnly: true},
 		{Name: workspaceVolumeName, MountPath: workspaceMountPath},
 	}
+	credentialMode := int32(0o400)
 	for i, credential := range config.CredentialSecrets {
 		volumeName := "credential-" + strconv.Itoa(i)
 		volumes = append(volumes, corev1.Volume{
 			Name: volumeName,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-				SecretName: credential.Name,
+				SecretName:  credential.Name,
+				DefaultMode: &credentialMode,
 			}},
 		})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{
