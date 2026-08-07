@@ -174,6 +174,7 @@ type application struct {
 	help               bool
 	confirmCancel      bool
 	narrowDetail       bool
+	wrapLogs           bool
 	message            string
 	refreshing         bool
 	refreshGen         uint64

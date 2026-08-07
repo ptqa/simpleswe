@@ -129,9 +129,9 @@ func (a *application) drawFooter(win vaxis.Window) {
 	palette := a.colors()
 	fill(win, palette.header)
 	width, _ := win.Size()
-	keys := " n create  j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  ? help  q back"
+	keys := " n create  j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  w wrap  ? help  q back"
 	if width < 82 {
-		keys = " n create  j/k move  enter details  t themes  ? help  q back"
+		keys = " n create  j/k move  enter details  t themes  w wrap  ? help  q back"
 	}
 	statusMessage := a.message
 	if state := a.model.Connectivity(); state == ConnectivityLost || state == ConnectivityRestored {
@@ -321,15 +321,36 @@ func (a *application) drawLogs(win vaxis.Window) {
 	for col := 0; col < width; col++ {
 		win.SetCell(col, 0, vaxis.Cell{Character: vaxis.Character{Grapheme: "─", Width: 1}, Style: palette.border})
 	}
+	title := " LOGS "
+	info := fmt.Sprintf("%d buffered", len(a.model.Logs()))
+	if a.wrapLogs {
+		info += "  wrap: on"
+	}
 	win.PrintTruncate(0,
-		vaxis.Segment{Text: " LOGS ", Style: palette.title},
-		vaxis.Segment{Text: fmt.Sprintf("%d buffered", len(a.model.Logs())), Style: palette.dim},
+		vaxis.Segment{Text: title, Style: palette.title},
+		vaxis.Segment{Text: info, Style: palette.dim},
 	)
 	logs := a.model.Logs()
 	visible := max(0, height-1)
 	if len(logs) == 0 {
 		if height > 1 {
 			win.PrintTruncate(1, vaxis.Segment{Text: " Waiting for log stream…", Style: palette.dim})
+		}
+		return
+	}
+	if a.wrapLogs {
+		var flat [][]vaxis.Segment
+		for _, line := range logs {
+			rows := wrappedLogRows(line, palette.base, width)
+			flat = append(flat, rows...)
+		}
+		start := max(0, len(flat)-visible)
+		for index, segs := range flat[start:] {
+			row := index + 1
+			if row >= height {
+				break
+			}
+			win.PrintTruncate(row, segs...)
 		}
 		return
 	}
@@ -355,7 +376,8 @@ func (a *application) drawHelp(root vaxis.Window) {
 		"s       shell         r  retry",
 		"ctrl-d  cancel        R  refresh",
 		"t       choose theme  h  back",
-		"?       close help    q  back / quit",
+		"w       wrap logs     ?  help",
+		"q       back / quit",
 		"",
 		"Cancellation always asks for confirmation.",
 	}

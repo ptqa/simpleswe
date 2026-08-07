@@ -118,6 +118,13 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	case key.MatchString("p"):
 		a.mode = viewPod
 		a.narrowDetail = true
+	case key.MatchString("w"):
+		a.wrapLogs = !a.wrapLogs
+		if a.wrapLogs {
+			a.message = "wrap: on"
+		} else {
+			a.message = "wrap: off"
+		}
 	case key.MatchString("s"):
 		return false, a.shell()
 	case key.MatchString("r"):
