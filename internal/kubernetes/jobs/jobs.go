@@ -161,7 +161,6 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 	activeDeadline := int64(config.Deadline / time.Second)
 	terminationGracePeriod := int64(30)
 	automountServiceAccountToken := false
-	runAsNonRoot := true
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
 	env := append([]corev1.EnvVar(nil), config.Env...)
@@ -204,7 +203,6 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 		ImagePullSecrets:              imagePullSecrets(config.ImagePullSecrets),
 		Volumes:                       volumes,
 		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot:   &runAsNonRoot,
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
 	}

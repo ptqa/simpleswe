@@ -71,7 +71,7 @@ docker build \
   -t ghcr.io/example/widget-worker:0.1.0 .
 ```
 
-Repository-specific worker images should extend this target or reproduce its non-root runtime and add only the runtimes and tools required by that repository.
+Repository-specific worker images should extend this target and add only the runtimes and tools required by that repository.
 
 ## Local Kubernetes with kind
 

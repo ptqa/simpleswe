@@ -22,9 +22,7 @@ RUN apt-get update \
 COPY --from=build /out/simpleswe /usr/local/bin/simpleswe
 COPY ${OPENCODE_BINARY} /usr/local/bin/opencode
 RUN chmod 0755 /usr/local/bin/opencode \
-    && mkdir -p /workspace \
-    && chown 65532:65532 /workspace
-USER 65532:65532
+    && mkdir -p /workspace
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/simpleswe"]
 

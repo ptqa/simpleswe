@@ -118,8 +118,8 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
 		t.Errorf("automountServiceAccountToken = %v; want false", pod.AutomountServiceAccountToken)
 	}
-	if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot {
-		t.Errorf("pod runAsNonRoot = %#v; want true", pod.SecurityContext)
+	if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot != nil {
+		t.Errorf("pod runAsNonRoot = %#v; want unset", pod.SecurityContext)
 	}
 	if pod.SecurityContext == nil || pod.SecurityContext.SeccompProfile == nil || pod.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Errorf("pod seccompProfile = %#v; want RuntimeDefault", pod.SecurityContext)
