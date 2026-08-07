@@ -40,11 +40,11 @@ func TestParseWebhook(t *testing.T) {
 			name:        "pull request comment repository name fallback",
 			requestUUID: "request-comment-name",
 			eventKey:    "pullrequest:comment_created",
-			body:        `{"comment":{"id":502,"content":{"raw":"Please fix this"},"user":{"uuid":"{reviewer}","nickname":"reviewer"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/43/_/diff#comment-502"}}},"pullrequest":{"id":43,"title":"Fix test","reviewers":[{"uuid":"{reviewer}"}]},"repository":{"name":"service","workspace":{"slug":"acme"}}}`,
+			body:        `{"comment":{"id":502,"content":{"raw":"Please fix this"},"user":{"uuid":"{commenter}","nickname":"commenter"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/43/_/diff#comment-502"}}},"pullrequest":{"id":43,"title":"Fix test"},"repository":{"name":"service","workspace":{"slug":"acme"}}}`,
 			want: forge.Event{
 				DeliveryID: "bitbucket:request-comment-name", Provider: forge.ProviderBitbucket, Kind: "review_comment",
 				Owner: "acme", Repository: "service", PullRequestNumber: 43, CommentID: 502,
-				CommentKind: "comment", Title: "Fix test", Body: "Please fix this", Author: "reviewer",
+				CommentKind: "comment", Title: "Fix test", Body: "Please fix this", Author: "commenter",
 				URL: "https://bitbucket.org/acme/service/pull-requests/43/_/diff#comment-502",
 			},
 			wantOK: true,
@@ -207,36 +207,5 @@ func TestParseWebhookIgnoresGeneratedReplyMarkerFromAssignedReviewer(t *testing.
 	body := `{"comment":{"id":501,"content":{"raw":` + quotedJSON(forge.ReplyMarker("bitbucket:generated-marker")+" fixed") + `},"user":{"uuid":"{reviewer}","nickname":"reviewer"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42/_/diff#comment-501"}}},"pullrequest":{"id":42,"title":"Fix","reviewers":[{"uuid":"{reviewer}"}]},"repository":{"slug":"service","workspace":{"slug":"acme"}}}`
 	if _, actionable, err := ParseWebhook("generated-marker", "pullrequest:comment_created", []byte(body)); err != nil || actionable {
 		t.Fatalf("ParseWebhook() actionable=%t, err=%v; want ignored", actionable, err)
-	}
-}
-
-func TestParseWebhookReviewerAuthorization(t *testing.T) {
-	tests := []struct {
-		name   string
-		user   string
-		review string
-		wantOK bool
-	}{
-		{name: "assigned reviewer", user: `"uuid":"{reviewer}","nickname":"reviewer"`, review: `{"uuid":"{reviewer}"}`, wantOK: true},
-		{name: "same nickname but different uuid", user: `"uuid":"{external}","nickname":"reviewer"`, review: `{"uuid":"{reviewer}"}`},
-		{name: "missing user uuid", user: `"nickname":"reviewer"`, review: `{"uuid":"{reviewer}"}`},
-		{name: "no assigned reviewers", user: `"uuid":"{reviewer}","nickname":"reviewer"`},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reviewers := "[]"
-			if test.review != "" {
-				reviewers = "[" + test.review + "]"
-			}
-			body := `{"comment":{"id":501,"content":{"raw":"Please fix this"},"user":{` + test.user + `},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42/_/diff#comment-501"}}},"pullrequest":{"id":42,"title":"Fix flaky test","reviewers":` + reviewers + `,"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}},"repository":{"name":"Service Display Name","slug":"service","workspace":{"slug":"acme"}}}`
-			_, actionable, err := ParseWebhook("authorization", "pullrequest:comment_created", []byte(body))
-			if err != nil {
-				t.Fatalf("ParseWebhook: %v", err)
-			}
-			if actionable != test.wantOK {
-				t.Fatalf("actionable = %t, want %t", actionable, test.wantOK)
-			}
-		})
 	}
 }

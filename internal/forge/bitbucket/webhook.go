@@ -47,7 +47,7 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Author:            firstNonblank(payload.Comment.User.Nickname, payload.Comment.User.DisplayName),
 			URL:               payload.Comment.Links.HTML.Href,
 		}
-		return finishBitbucketEvent(event, true, assignedReviewer(payload.Comment.User.UUID, payload.PullRequest.Reviewers))
+		return finishBitbucketEvent(event, true)
 
 	case "pipeline:build:completed":
 		var payload bitbucketPipeline
@@ -70,7 +70,7 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Author:     firstNonblank(payload.Actor.DisplayName, payload.Actor.Nickname, "Bitbucket Pipelines"),
 			URL:        payload.Pipeline.Links.Self.Href,
 		}
-		return finishBitbucketEvent(event, false, true)
+		return finishBitbucketEvent(event, false)
 
 	case "repo:commit_status_created", "repo:commit_status_updated":
 		var payload bitbucketCommitStatus
@@ -99,18 +99,15 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 			Author:     firstNonblank(payload.Actor.DisplayName, payload.Actor.Nickname, "Bitbucket"),
 			URL:        firstNonblank(payload.CommitStatus.URL, payload.CommitStatus.Links.Self.Href),
 		}
-		return finishBitbucketEvent(event, false, true)
+		return finishBitbucketEvent(event, false)
 	default:
 		return forge.Event{}, false, nil
 	}
 }
 
-func finishBitbucketEvent(event forge.Event, comment, authorized bool) (forge.Event, bool, error) {
+func finishBitbucketEvent(event forge.Event, comment bool) (forge.Event, bool, error) {
 	if err := validateBitbucketEvent(event, comment); err != nil {
 		return forge.Event{}, false, err
-	}
-	if !authorized {
-		return forge.Event{}, false, nil
 	}
 	return event, true, nil
 }
@@ -243,25 +240,8 @@ type bitbucketComment struct {
 				Hash string `json:"hash"`
 			} `json:"commit"`
 		} `json:"source"`
-		Reviewers []struct {
-			UUID string `json:"uuid"`
-		} `json:"reviewers"`
 	} `json:"pullrequest"`
 	Repository bitbucketRepository `json:"repository"`
-}
-
-func assignedReviewer(userUUID string, reviewers []struct {
-	UUID string `json:"uuid"`
-}) bool {
-	if strings.TrimSpace(userUUID) == "" {
-		return false
-	}
-	for _, reviewer := range reviewers {
-		if reviewer.UUID == userUUID {
-			return true
-		}
-	}
-	return false
 }
 
 type bitbucketActor struct {
