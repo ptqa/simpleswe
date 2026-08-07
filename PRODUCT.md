@@ -4,24 +4,13 @@ This file is authoritative. Do not modify it unless the user explicitly asks to 
 
 ## Product
 
-simpleswe runs OpenCode in Kubernetes from a task created through the CLI or terminal UI and returns a GitHub/Bitbucket pull request. Slack users interact through Hermes Agent, which invokes the simpleswe CLI.
+simpleswe runs OpenCode in Kubernetes from tasks created through the CLI or terminal UI and returns a GitHub or Bitbucket pull request. The CLI is also the automation boundary for any external agent that can run commands.
 
-simpleswe owns the resulting pull request and addresses quality-gate failures and review comments. Hermes is a conversational ingress and notification layer; it does not execute software-engineering work or manage Kubernetes resources.
+simpleswe owns the resulting pull request and addresses quality-gate failures and review comments.
 
 ```text
-Slack
-  → Hermes Agent
-  → simpleswe CLI
-  → simpleswe controller
-  → Kubernetes Job
-  → OpenCode
-  → validation
-  → Git push
-  → PR
-  → Hermes Agent
-  → Slack thread
-
-CLI / TUI
+Human operator / external agent
+  → simpleswe CLI or TUI
   → simpleswe controller
   → Kubernetes Job
   → OpenCode
@@ -36,13 +25,14 @@ A K9s-style TUI is the primary operational interface for observing, inspecting, 
 
 * The simpleswe controller, worker, CLI, and TUI are written in Go.
 * K9s-style terminal interface built with Vaxis.
-* Hermes Agent owns Slack Socket Mode, user authorization, conversations, and thread replies.
-* Hermes runs as a sidecar container in the simpleswe controller Pod.
-* Hermes invokes the simpleswe CLI against the controller API on localhost.
-* The initial Hermes integration uses the existing CLI and does not require MCP or a custom Hermes plugin.
-* Tasks can be created through Slack, the CLI, or the terminal UI.
-* Slack-originated tasks are created by Hermes through the same CLI contract as other callers.
-* Hermes reports the accepted task ID immediately and observes the task until it can report the pull request or terminal failure in the originating Slack thread.
+* The CLI and terminal UI are the core product interfaces.
+* The CLI is the integration contract for external agents.
+* Tasks can be created through the CLI, terminal UI, or an external agent invoking the CLI.
+* Agent integrations own conversation, user authorization, and result presentation.
+* Agent integrations use generic idempotent task creation and task observation commands.
+* Hermes is the default bundled Helm example for an agent sidecar, but it is optional.
+* Other command-capable agents can use the same CLI contract without SimpleSWE changes.
+* When enabled, Hermes runs as a sidecar and invokes the CLI against the controller API on localhost.
 * Kubernetes-native controller.
 * One Kubernetes Job per task attempt.
 * OpenCode first.
@@ -57,11 +47,10 @@ A K9s-style TUI is the primary operational interface for observing, inspecting, 
 * Prebuilt repository-specific worker images.
 * Retrying creates a new Job and preserves previous attempts.
 * The controller owns task state, reconciliation, execution lifecycle, and PR creation.
-* Hermes owns Slack session state, conversational interpretation, and Slack delivery.
 * simpleswe remains the source of truth for task and attempt state.
 * Workers clone, edit, validate, commit, and push.
-* Hermes and workers do not manage Kubernetes resources directly.
-* Workers do not communicate with Slack.
+* External agents and workers do not manage Kubernetes resources directly.
+* External agents do not receive repository or forge credentials and do not modify repositories directly.
 
 ## Non-goals
 
@@ -70,12 +59,12 @@ A K9s-style TUI is the primary operational interface for observing, inspecting, 
 * Custom job queue.
 * Redis, RabbitMQ, Kafka, Temporal, or Argo Workflows.
 * Kubernetes CRDs or custom operators.
-* Multi-agent orchestration; Hermes is only Slack ingress and OpenCode remains the code-execution agent.
-* Building a custom Slack conversation, memory, authorization, or approval system inside simpleswe.
-* Reimplementing Hermes Agent capabilities inside simpleswe.
-* A custom Hermes MCP server or native plugin until direct CLI invocation proves insufficient.
-* Giving Hermes responsibility for Kubernetes Jobs, repository credentials, validation, Git operations, or pull-request creation.
-* Allowing Hermes to modify repositories directly; OpenCode workers remain the execution boundary.
+* Multi-agent orchestration; OpenCode remains the code-execution agent.
+* Building chat, conversation, memory, authorization, or approval systems inside simpleswe.
+* Requiring or reimplementing a specific external agent framework.
+* Agent-specific MCP servers, plugins, or SDKs while direct CLI invocation is sufficient.
+* Giving external agents responsibility for Kubernetes Jobs, repository credentials, validation, Git operations, or pull-request creation.
+* Allowing external agents to modify repositories directly; OpenCode workers remain the execution boundary.
 * Multi-tenancy.
 * Automatic PR merging.
 * AWS Lambda.
