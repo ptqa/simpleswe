@@ -27,8 +27,9 @@ type Runner struct {
 }
 
 const (
-	validationFixPromptLimit = 32 << 10
-	streamChunkBytes         = 8 << 10
+	validationFixPromptLimit  = 32 << 10
+	streamChunkBytes          = 8 << 10
+	agentWorkflowInstructions = "You may commit changes locally and must fix any pre-commit hook failures. Do not push commits or branches, and do not create or update pull requests; the outer SimpleSWE orchestrator handles those steps."
 )
 
 // Run clones the task repository, invokes OpenCode, validates its changes,
@@ -93,7 +94,7 @@ func (r Runner) Run(ctx context.Context) error {
 		return commandFailure(ctx, "check out task branch", err)
 	}
 
-	initialCommand := appendCommandArgument(manifest.OpenCodeCommand, manifest.Prompt)
+	initialCommand := appendCommandArgument(manifest.OpenCodeCommand, agentPrompt(manifest.Prompt))
 	if err := emitEvent(output, r.Secrets, protocol.Event{
 		Type:      protocol.EventAgentStarted,
 		TaskID:    manifest.TaskID,
@@ -111,7 +112,16 @@ func (r Runner) Run(ctx context.Context) error {
 		return err
 	}
 	if !changed {
-		return fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
+		head, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", "HEAD^{commit}"})
+		if err != nil {
+			return fmt.Errorf("resolve task branch after OpenCode: %w", err)
+		}
+		if head == baseCommit {
+			return fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
+		}
+	}
+	if _, err := run([]string{"git", "merge-base", "--is-ancestor", baseCommit, "HEAD"}); err != nil {
+		return commandFailure(ctx, "verify OpenCode commit ancestry", err)
 	}
 
 	commands := manifest.ValidationCommands
@@ -140,7 +150,7 @@ func (r Runner) Run(ctx context.Context) error {
 		}
 
 		fixPrompt := validationFixPrompt(failure.summary)
-		fixCommand := appendCommandArgument(manifest.OpenCodeCommand, fixPrompt)
+		fixCommand := appendCommandArgument(manifest.OpenCodeCommand, agentPrompt(fixPrompt))
 		if err := emitEvent(output, r.Secrets, protocol.Event{
 			Type:      protocol.EventAgentStarted,
 			TaskID:    manifest.TaskID,
@@ -169,9 +179,6 @@ func (r Runner) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("resolve task branch: %w", err)
 	}
-	if head != baseCommit {
-		return fmt.Errorf("task branch HEAD changed unexpectedly before worker commit: got %s, want %s", head, baseCommit)
-	}
 	if _, err := run([]string{"git", "merge-base", "--is-ancestor", baseCommit, "HEAD"}); err != nil {
 		return commandFailure(ctx, "verify task branch ancestry", err)
 	}
@@ -182,16 +189,18 @@ func (r Runner) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !staged {
+	if !staged && head == baseCommit {
 		return fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
 	}
-	commitMessage := "chore: complete SimpleSWE task " + manifest.TaskID
-	commitEnvironment := map[string]string{
-		"GIT_AUTHOR_NAME": "simpleswe", "GIT_AUTHOR_EMAIL": "simpleswe@localhost",
-		"GIT_COMMITTER_NAME": "simpleswe", "GIT_COMMITTER_EMAIL": "simpleswe@localhost",
-	}
-	if _, err := runWithEnvironment([]string{"git", "-c", "user.name=simpleswe", "-c", "user.email=simpleswe@localhost", "commit", "-m", commitMessage}, commitEnvironment); err != nil {
-		return commandFailure(ctx, "commit task changes", err)
+	if staged {
+		commitMessage := "chore: complete SimpleSWE task " + manifest.TaskID
+		commitEnvironment := map[string]string{
+			"GIT_AUTHOR_NAME": "simpleswe", "GIT_AUTHOR_EMAIL": "simpleswe@localhost",
+			"GIT_COMMITTER_NAME": "simpleswe", "GIT_COMMITTER_EMAIL": "simpleswe@localhost",
+		}
+		if _, err := runWithEnvironment([]string{"git", "-c", "user.name=simpleswe", "-c", "user.email=simpleswe@localhost", "commit", "-m", commitMessage}, commitEnvironment); err != nil {
+			return commandFailure(ctx, "commit task changes", err)
+		}
 	}
 	commit, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", "HEAD^{commit}"})
 	if err != nil {
@@ -368,6 +377,10 @@ func appendCommandArgument(command []string, argument string) []string {
 	argv := make([]string, len(command), len(command)+1)
 	copy(argv, command)
 	return append(argv, argument)
+}
+
+func agentPrompt(prompt string) string {
+	return prompt + "\n\nWorkflow constraints:\n" + agentWorkflowInstructions
 }
 
 func repositoryChanged(ctx context.Context, run func([]string) (CommandResult, error)) (bool, error) {

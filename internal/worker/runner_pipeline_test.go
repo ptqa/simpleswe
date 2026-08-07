@@ -86,7 +86,7 @@ test "$(cat base.txt)" = "expected base"
 		"cwd=<" + workspace + ">",
 		"argc=<2>",
 		"arg1=<--prompt>",
-		"arg2=<" + prompt + ">",
+		"arg2=<" + agentPrompt(prompt) + ">",
 	} {
 		if !strings.Contains(opencodeOutput, want) {
 			t.Errorf("OpenCode invocation missing %q:\n%s", want, opencodeOutput)
@@ -132,6 +132,33 @@ test "$(cat base.txt)" = "expected base"
 	push := events[pushIndex]
 	if push.Branch != runnerTaskBranch || push.CommitSHA != commit {
 		t.Errorf("branch_pushed event: got branch=%q commit=%q, want branch=%q commit=%q", push.Branch, push.CommitSHA, runnerTaskBranch, commit)
+	}
+}
+
+func TestRunnerAcceptsCommitCreatedByOpenCode(t *testing.T) {
+	fixture := newGitFixture(t)
+	tmp := t.TempDir()
+	opencode := writeExecutable(t, tmp, "fake-opencode-commit", `#!/bin/sh
+set -eu
+printf 'committed by fake OpenCode\n' > agent.txt
+git add agent.txt
+git commit -m 'fix: agent-owned change'
+`)
+	validation := writeExecutable(t, tmp, "validation", "#!/bin/sh\nset -eu\ntest -f agent.txt\n")
+	manifestPath := writeManifest(t, tmp, baseRunnerManifest(fixture.remote, opencode, validation))
+
+	var output bytes.Buffer
+	runner := Runner{ManifestPath: manifestPath, WorkspaceDir: filepath.Join(tmp, "workspace"), Output: &output}
+	if err := runner.Run(context.Background()); err != nil {
+		t.Fatalf("run worker pipeline: %v\noutput:\n%s", err, output.String())
+	}
+
+	commit := gitOutput(t, "--git-dir", fixture.remote, "rev-parse", "refs/heads/"+runnerTaskBranch)
+	if got, want := gitOutput(t, "--git-dir", fixture.remote, "show", "-s", "--format=%s", commit), "fix: agent-owned change"; got != want {
+		t.Errorf("task commit message: got %q, want %q", got, want)
+	}
+	if got := gitOutput(t, "--git-dir", fixture.remote, "rev-parse", commit+"^"); got != fixture.baseCommit {
+		t.Errorf("task commit parent: got %s, want %s", got, fixture.baseCommit)
 	}
 }
 
