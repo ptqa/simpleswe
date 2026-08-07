@@ -404,13 +404,13 @@ func TestValidateMountsRejectsInvalidAndOverlappingPaths(t *testing.T) {
 			return validateMounts(nil, []ConfigMapMount{{Name: "BAD_NAME", MountPath: "/etc/config"}}, nil)
 		}, want: "ConfigMap mount 0 is invalid"},
 		{name: "overlapping ConfigMap path", call: func() error {
-			return validateMounts(nil, []ConfigMapMount{{Name: "worker-config", MountPath: "/tmp/workspace/cache"}}, nil)
+			return validateMounts(nil, []ConfigMapMount{{Name: "worker-config", MountPath: "/workspace/cache"}}, nil)
 		}, want: "ConfigMap \"worker-config\" mount path overlaps"},
 		{name: "invalid emptyDir", call: func() error {
 			return validateMounts(nil, nil, []EmptyDirMount{{Name: "BAD_NAME", MountPath: "/var/cache"}})
 		}, want: "emptyDir mount 0 is invalid"},
 		{name: "overlapping emptyDir path", call: func() error {
-			return validateMounts(nil, nil, []EmptyDirMount{{Name: "cache", MountPath: "/tmp/workspace/cache"}})
+			return validateMounts(nil, nil, []EmptyDirMount{{Name: "cache", MountPath: "/workspace/cache"}})
 		}, want: "emptyDir \"cache\" mount path overlaps"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

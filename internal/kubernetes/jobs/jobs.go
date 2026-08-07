@@ -29,7 +29,7 @@ const (
 	managedBy              = "simpleswe"
 	workerContainerName    = "worker"
 	workspaceVolumeName    = "workspace"
-	workspaceMountPath     = "/tmp/workspace"
+	workspaceMountPath     = "/workspace"
 	secretEnvNamesVariable = protocol.SecretEnvNamesVariable
 )
 
