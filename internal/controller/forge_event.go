@@ -168,7 +168,7 @@ func verifyLivePullRequest(live forge.PullRequestState, durable store.PullReques
 	if err := verifyLivePullRequestIdentity(live, durable, target); err != nil {
 		return err
 	}
-	if !strings.EqualFold(live.HeadSHA, headSHA) {
+	if !providerCommitMatchesDurable(live.HeadSHA, headSHA) {
 		return forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q does not match durable pushed SHA %q", store.ErrConflict, live.HeadSHA, headSHA))
 	}
 	return nil
@@ -437,7 +437,7 @@ func (c *Controller) qualityEventMatchesOpenPullRequest(ctx context.Context, eve
 			continue
 		}
 		currentHasPushed = candidate.ID == current.ID
-		if strings.EqualFold(git.CommitSHA, event.CommitSHA) {
+		if providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
 			return forgeOwned, nil
 		}
 		break
@@ -462,7 +462,7 @@ func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeE
 	}
 	git, err := c.store.GetGitResult(ctx, attempt.ID)
 	if err == nil && git.State == "pushed" {
-		if branch != "" && git.Branch != branch || event.Branch != "" && git.Branch != event.Branch || event.CommitSHA != "" && !strings.EqualFold(git.CommitSHA, event.CommitSHA) {
+		if branch != "" && git.Branch != branch || event.Branch != "" && git.Branch != event.Branch || event.CommitSHA != "" && !providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
 			return forgeDefinitelyUnowned, nil
 		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -540,8 +540,8 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
 		return c.persistForgeEventFailure(ctx, event, "completion ownership", err)
 	}
-	if !strings.EqualFold(live.HeadSHA, git.CommitSHA) {
-		if strings.EqualFold(live.HeadSHA, priorGit.CommitSHA) {
+	if !providerCommitMatchesDurable(live.HeadSHA, git.CommitSHA) {
+		if providerCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
 			return c.persistForgeEventFailure(ctx, event, "completion ownership", fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA))
 		}
 		return c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
@@ -576,6 +576,21 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 	}
 	c.logger.InfoContext(ctx, "forge follow-up reply handled", "task", record.ID, "attempt", attempt.ID, "forge_event", event.ID, "already_exists", exists)
 	return nil
+}
+
+func providerCommitMatchesDurable(providerSHA, durableSHA string) bool {
+	if strings.EqualFold(providerSHA, durableSHA) {
+		return true
+	}
+	if len(providerSHA) < 7 || len(providerSHA) >= len(durableSHA) || len(durableSHA) != 40 && len(durableSHA) != 64 {
+		return false
+	}
+	for _, char := range providerSHA + durableSHA {
+		if char < '0' || char > '9' && char < 'A' || char > 'F' && char < 'a' || char > 'f' {
+			return false
+		}
+	}
+	return strings.HasPrefix(strings.ToLower(durableSHA), strings.ToLower(providerSHA))
 }
 
 func sameForgeCoordinates(event store.ForgeEvent, target forge.Target) bool {

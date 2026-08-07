@@ -372,6 +372,28 @@ func execFixtureSQL(t *testing.T, fixture *fixture, statement string, args ...an
 	}
 }
 
+func TestProviderCommitMatchesDurable(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		provider string
+		durable  string
+		want     bool
+	}{
+		{name: "full", provider: fullCommitSHA, durable: fullCommitSHA, want: true},
+		{name: "abbreviated", provider: fullCommitSHA[:12], durable: fullCommitSHA, want: true},
+		{name: "uppercase abbreviated", provider: strings.ToUpper(fullCommitSHA[:12]), durable: fullCommitSHA, want: true},
+		{name: "unrelated", provider: strings.Repeat("f", 12), durable: fullCommitSHA},
+		{name: "too short", provider: fullCommitSHA[:6], durable: fullCommitSHA},
+		{name: "non hex", provider: "not-a-commit", durable: fullCommitSHA},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := providerCommitMatchesDurable(test.provider, test.durable); got != test.want {
+				t.Fatalf("providerCommitMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
+			}
+		})
+	}
+}
+
 func recordPushedFollowUp(t *testing.T, fixture *fixture, attempt store.Attempt) {
 	t.Helper()
 	if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: attempt.ID, State: "pushed", Branch: attempt.TaskBranch, CommitSHA: fullCommitSHA}); err != nil {
