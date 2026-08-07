@@ -24,7 +24,7 @@ const (
 	usageWorker     = "usage: simpleswe worker [--manifest PATH]"
 	usageTUI        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
 	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
-	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] REPOSITORY PROMPT"
+	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
 	usageTaskList   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	usageTaskShow   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	usageTaskCancel = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"

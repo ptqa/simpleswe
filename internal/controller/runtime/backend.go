@@ -57,13 +57,14 @@ func (b *Backend) CreateTask(ctx context.Context, body []byte) ([]byte, error) {
 	var request struct {
 		Repository     string `json:"repository"`
 		Prompt         string `json:"prompt"`
+		PRTitle        string `json:"pr_title"`
 		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, api.ErrInvalid
 	}
 	created, err := b.controller.CreateTask(ctx, store.CreateTaskParams{
-		Repository: request.Repository, Prompt: request.Prompt, IdempotencyKey: request.IdempotencyKey,
+		Repository: request.Repository, Prompt: request.Prompt, PRTitle: request.PRTitle, IdempotencyKey: request.IdempotencyKey,
 	})
 	if err != nil {
 		return nil, mapCreateError(err)
@@ -236,6 +237,9 @@ func (b *Backend) taskModel(ctx context.Context, record store.Task) (map[string]
 		"current_attempt_id": record.CurrentAttemptID, "cancellation_requested": record.CancellationRequested,
 		"validation_runs": results.validation,
 		"git_result":      results.git, "pull_request": results.pullRequest,
+	}
+	if record.PRTitle != "" {
+		model["pr_title"] = record.PRTitle
 	}
 	job, pod, err := b.kubernetesModels(ctx, attempt.ID)
 	if err != nil {

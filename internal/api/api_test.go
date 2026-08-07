@@ -102,7 +102,7 @@ const taskJSON = `{"task_id":"task-1","repository":"https://bitbucket.example/ac
 
 func TestHandlerAcceptsAndForwardsIdempotencyKey(t *testing.T) {
 	dependency := new(fakeHandlerDependency)
-	body := `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":"` + strings.Repeat("k", 256) + `"}`
+	body := `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","pr_title":"Fix flaky test","idempotency_key":"` + strings.Repeat("k", 256) + `"}`
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
 
@@ -549,6 +549,10 @@ func TestHandlerRejectsInvalidQueriesAndCreateBodies(t *testing.T) {
 		{name: "inline credentials", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://user:pass@bitbucket.example/acme/widget","prompt":"fix"}`},
 		{name: "empty idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":""}`},
 		{name: "whitespace idempotency key", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","idempotency_key":" \t"}`},
+		{name: "null PR title", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","pr_title":null}`},
+		{name: "empty PR title", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","pr_title":""}`},
+		{name: "whitespace PR title", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","pr_title":" \t"}`},
+		{name: "long PR title", method: http.MethodPost, path: "/v1/tasks", body: `{"repository":"https://bitbucket.example/acme/widget","prompt":"fix","pr_title":"` + strings.Repeat("t", 257) + `"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

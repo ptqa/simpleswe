@@ -50,7 +50,7 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	controller := &backendErrorController{fakeController: newFakeController(db)}
 	backend := NewBackend(db, controller)
 
-	payload, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"work","idempotency_key":"generic-1"}`))
+	payload, err := backend.CreateTask(context.Background(), []byte(`{"repository":"repo","prompt":"work","pr_title":"Fix flaky test","idempotency_key":"generic-1"}`))
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -60,6 +60,9 @@ func TestBackendCreatePaginationAndErrorMapping(t *testing.T) {
 	}
 	if created["repository"] != "repo" {
 		t.Fatalf("created task = %#v", created)
+	}
+	if created["pr_title"] != "Fix flaky test" || controller.createParams.PRTitle != "Fix flaky test" {
+		t.Fatalf("created task PR title = %#v, params = %#v", created["pr_title"], controller.createParams)
 	}
 	if controller.createParams.IdempotencyKey != "generic-1" {
 		t.Fatalf("generic create params = %#v", controller.createParams)

@@ -105,6 +105,18 @@ func TestCreateTaskOnceRejectsInvalidIdempotencyKeysWithoutWrites(t *testing.T) 
 				Repository: "repo", Prompt: "prompt", IdempotencyKey: strings.Repeat("k", 257),
 			},
 		},
+		{
+			name: "whitespace-only PR title",
+			params: CreateTaskParams{
+				Repository: "repo", Prompt: "prompt", PRTitle: " \t\n",
+			},
+		},
+		{
+			name: "PR title over 256 characters",
+			params: CreateTaskParams{
+				Repository: "repo", Prompt: "prompt", PRTitle: strings.Repeat("t", 257),
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

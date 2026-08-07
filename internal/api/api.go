@@ -238,6 +238,7 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	var request struct {
 		Repository     string  `json:"repository"`
 		Prompt         string  `json:"prompt"`
+		PRTitle        *string `json:"pr_title"`
 		IdempotencyKey *string `json:"idempotency_key"`
 	}
 	if err := decoder.Decode(&request); err != nil {
@@ -255,6 +256,7 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 	idempotencyKeyJSON, idempotencyKeyPresent := properties["idempotency_key"]
+	prTitleJSON, prTitlePresent := properties["pr_title"]
 	if strings.TrimSpace(request.Repository) == "" || strings.TrimSpace(request.Prompt) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "repository and prompt are required")
 		return nil, false
@@ -273,6 +275,18 @@ func decodeCreateBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	}
 	if request.IdempotencyKey != nil && utf8.RuneCountInString(*request.IdempotencyKey) > 256 {
 		writeError(w, http.StatusBadRequest, "invalid_request", "idempotency_key must not exceed 256 characters")
+		return nil, false
+	}
+	if prTitlePresent && bytes.Equal(bytes.TrimSpace(prTitleJSON), []byte("null")) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "pr_title must not be null")
+		return nil, false
+	}
+	if request.PRTitle != nil && strings.TrimSpace(*request.PRTitle) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "pr_title must not be empty")
+		return nil, false
+	}
+	if request.PRTitle != nil && utf8.RuneCountInString(*request.PRTitle) > 256 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "pr_title must not exceed 256 characters")
 		return nil, false
 	}
 	return body, true

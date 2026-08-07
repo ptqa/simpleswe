@@ -261,7 +261,10 @@ create:
 	if err != nil {
 		return c.handlePullRequestError(ctx, record, attempt, forge.MarkPermanent(err))
 	}
-	title := strings.TrimSpace(record.Prompt)
+	title := strings.TrimSpace(record.PRTitle)
+	if title == "" {
+		title = strings.TrimSpace(record.Prompt)
+	}
 	_, err = c.store.ReservePullRequest(ctx, attempt.ID, title, git.Branch, manifest.BaseBranch)
 	if err != nil {
 		return err

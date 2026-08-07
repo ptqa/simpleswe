@@ -30,6 +30,7 @@ type Store struct {
 type CreateTaskParams struct {
 	Repository     string
 	Prompt         string
+	PRTitle        string
 	IdempotencyKey string
 }
 
@@ -37,6 +38,7 @@ type Task struct {
 	ID                    string
 	Repository            string
 	Prompt                string
+	PRTitle               string
 	State                 task.State
 	CreatedAt             time.Time
 	UpdatedAt             time.Time
@@ -135,6 +137,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     repository TEXT NOT NULL,
     prompt TEXT NOT NULL,
+    pr_title TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -410,6 +413,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		if err := tx.Commit(); err != nil {
 			return closeOnError(fmt.Errorf("commit SQLite schema initialization: %w", err))
 		}
+	} else {
+		if _, err := db.ExecContext(ctx, "ALTER TABLE tasks ADD COLUMN pr_title TEXT NOT NULL DEFAULT ''"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			return closeOnError(fmt.Errorf("migrate tasks pr_title column: %w", err))
+		}
 	}
 	return &Store{db: db}, nil
 }
@@ -440,6 +447,12 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 	}
 	if strings.TrimSpace(params.Prompt) == "" {
 		return Task{}, false, errors.New("prompt is empty")
+	}
+	if params.PRTitle != "" && strings.TrimSpace(params.PRTitle) == "" {
+		return Task{}, false, errors.New("pr_title is empty")
+	}
+	if utf8.RuneCountInString(params.PRTitle) > 256 {
+		return Task{}, false, errors.New("pr_title exceeds 256 characters")
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -479,9 +492,9 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO tasks
-			(id, repository, prompt, state, created_at, updated_at, current_attempt_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		taskID, params.Repository, params.Prompt, task.RECEIVED,
+			(id, repository, prompt, pr_title, state, created_at, updated_at, current_attempt_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		taskID, params.Repository, params.Prompt, params.PRTitle, task.RECEIVED,
 		stamp(now), stamp(now), attemptID,
 	); err != nil {
 		return Task{}, false, fmt.Errorf("insert task: %w", err)
@@ -505,6 +518,7 @@ func (s *Store) CreateTaskOnce(ctx context.Context, params CreateTaskParams) (Ta
 		ID:               taskID,
 		Repository:       params.Repository,
 		Prompt:           params.Prompt,
+		PRTitle:          params.PRTitle,
 		State:            task.RECEIVED,
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -522,7 +536,7 @@ func (s *Store) GetTaskByIdempotencyKey(ctx context.Context, idempotencyKey stri
 		return Task{}, errors.New("task create idempotency key exceeds 256 characters")
 	}
 	got, err := scanTask(s.db.QueryRowContext(ctx, `
-		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at,
+		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.pr_title, tasks.state, tasks.created_at,
 		       tasks.updated_at, tasks.current_attempt_id, tasks.cancellation_requested
 		FROM task_create_intents JOIN tasks ON tasks.id = task_create_intents.task_id
 		WHERE task_create_intents.idempotency_key = ?`, idempotencyKey))
@@ -549,7 +563,7 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, error) {
 // ListTasks returns durable tasks from newest to oldest.
 func (s *Store) ListTasks(ctx context.Context) (_ []Task, resultErr error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, repository, prompt, state, created_at, updated_at,
+		SELECT id, repository, prompt, pr_title, state, created_at, updated_at,
 		       current_attempt_id, cancellation_requested
 		FROM tasks ORDER BY created_at DESC, rowid DESC`)
 	if err != nil {
@@ -575,7 +589,7 @@ func (s *Store) ListTasks(ctx context.Context) (_ []Task, resultErr error) {
 // whose durable log barrier still needs recovery.
 func (s *Store) ListActiveTasks(ctx context.Context) (_ []Task, resultErr error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.state, tasks.created_at, tasks.updated_at,
+		SELECT tasks.id, tasks.repository, tasks.prompt, tasks.pr_title, tasks.state, tasks.created_at, tasks.updated_at,
 		       tasks.current_attempt_id, tasks.cancellation_requested
 		FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
 		WHERE tasks.state NOT IN (?, ?, ?) OR task_attempts.logs_exhausted = 0
@@ -1619,7 +1633,7 @@ func (s *Store) Pragmas(ctx context.Context) (SQLitePragmas, error) {
 }
 
 const taskSelect = `
-	SELECT id, repository, prompt, state, created_at, updated_at,
+	SELECT id, repository, prompt, pr_title, state, created_at, updated_at,
 	       current_attempt_id, cancellation_requested
 	FROM tasks WHERE id = ?`
 
@@ -1632,7 +1646,7 @@ func scanTask(row scanner) (Task, error) {
 	var state, createdAt, updatedAt string
 	var cancellationRequested int
 	if err := row.Scan(
-		&result.ID, &result.Repository, &result.Prompt, &state, &createdAt, &updatedAt,
+		&result.ID, &result.Repository, &result.Prompt, &result.PRTitle, &state, &createdAt, &updatedAt,
 		&result.CurrentAttemptID, &cancellationRequested,
 	); err != nil {
 		return Task{}, err

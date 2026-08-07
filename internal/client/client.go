@@ -48,6 +48,7 @@ type ListOptions struct {
 type CreateTaskRequest struct {
 	Repository     string `json:"repository"`
 	Prompt         string `json:"prompt"`
+	PRTitle        string `json:"pr_title,omitempty"`
 	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
@@ -70,6 +71,7 @@ type Task struct {
 	ID                    string          `json:"task_id"`
 	Repository            string          `json:"repository"`
 	Prompt                string          `json:"prompt"`
+	PRTitle               string          `json:"pr_title,omitempty"`
 	State                 string          `json:"state"`
 	CreatedAt             time.Time       `json:"created_at"`
 	UpdatedAt             time.Time       `json:"updated_at"`

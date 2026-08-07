@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/simpleswe/simpleswe/internal/client"
 )
@@ -21,7 +22,7 @@ const (
 	workerUsage     = "usage: simpleswe worker [--manifest PATH]"
 	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
 	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
-	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] REPOSITORY PROMPT"
+	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
 	taskListUsage   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
 	taskShowUsage   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskWaitUsage   = "usage: simpleswe task wait [--context NAME] [--namespace NAME] [--address URL] ID"
@@ -160,6 +161,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		result, err := deps.CreateTask(ctx, address, client.CreateTaskRequest{
 			Repository:     positional[0],
 			Prompt:         positional[1],
+			PRTitle:        flags.prTitle,
 			IdempotencyKey: flags.idempotencyKey,
 		})
 		if err != nil {
@@ -214,6 +216,7 @@ type runtimeFlags struct {
 	kubeContext    string
 	namespace      string
 	address        string
+	prTitle        string
 	idempotencyKey string
 }
 
@@ -221,6 +224,7 @@ type runtimeFlagState struct {
 	contextSet        bool
 	namespaceSet      bool
 	addressSet        bool
+	prTitleSet        bool
 	idempotencyKeySet bool
 }
 
@@ -285,6 +289,12 @@ func (state *runtimeFlagState) parse(args []string, index int, flags *runtimeFla
 		}
 		flags.idempotencyKey = value
 		state.idempotencyKeySet = true
+	case "--pr-title":
+		if !allowIdempotencyKey || state.prTitleSet || strings.TrimSpace(value) == "" || utf8.RuneCountInString(value) > 256 {
+			return index, false
+		}
+		flags.prTitle = value
+		state.prTitleSet = true
 	default:
 		return index, false
 	}

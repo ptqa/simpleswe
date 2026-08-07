@@ -479,6 +479,12 @@ components:
           maxLength: 256
           pattern: .*\S.*
           description: Optional generic, caller-generated opaque key used to deduplicate task-creation retries.
+        pr_title:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: .*\S.*
+          description: Optional pull request title. When provided, it is used as the PR title instead of the prompt.
 
     WebhookPayload:
       type: object
@@ -614,6 +620,10 @@ components:
           type: string
           minLength: 1
           readOnly: true
+        pr_title:
+          type: string
+          readOnly: true
+          description: Optional pull request title provided at creation.
         state:
           $ref: '#/components/schemas/TaskState'
         created_at:
