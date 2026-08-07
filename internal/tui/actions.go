@@ -414,7 +414,10 @@ func boundedLine(line string) string {
 		if r == '\t' {
 			return ' '
 		}
-		if r < ' ' || r == 0x7f {
+		if r == '\x1b' {
+			return r
+		}
+		if r < ' ' || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
 			return -1
 		}
 		return r
@@ -423,7 +426,14 @@ func boundedLine(line string) string {
 		return line
 	}
 	line = line[:maxLogLineBytes]
-	return strings.ToValidUTF8(line, "") + "…"
+	line = strings.ToValidUTF8(line, "")
+	if idx := strings.LastIndex(line, "\x1b"); idx != -1 {
+		if !strings.Contains(line[idx:], "m") {
+			line = line[:idx]
+			line = strings.ToValidUTF8(line, "")
+		}
+	}
+	return line + "…"
 }
 
 func shortError(err error) string {

@@ -37,6 +37,7 @@ components:
 deps:
   store:
     mayDependOn:
+      - forge
       - task
       - workerProtocol
 

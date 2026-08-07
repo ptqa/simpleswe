@@ -339,7 +339,8 @@ func (a *application) drawLogs(win vaxis.Window) {
 		if row >= height {
 			break
 		}
-		win.PrintTruncate(row, vaxis.Segment{Text: " " + line, Style: palette.base})
+		segments := ansiSegments(line, palette.base)
+		win.PrintTruncate(row, segments...)
 	}
 }
 
