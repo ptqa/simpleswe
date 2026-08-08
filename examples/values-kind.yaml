@@ -45,6 +45,10 @@ config:
             secret:
               name: opencode-provider
               key: OPENAI_API_KEY
+          - name: GH_TOKEN
+            secret:
+              name: github-simpleswe
+              key: token
       opencode:
         command: [opencode, run, --model, openai/gpt-5.6-luna]
       validation:

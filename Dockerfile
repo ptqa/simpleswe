@@ -17,7 +17,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 FROM debian:bookworm-slim AS worker
 ARG OPENCODE_BINARY=_prebuilt_opencode_binary_must_be_provided
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates git openssh-client \
+    && apt-get install --no-install-recommends -y ca-certificates gh git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/simpleswe /usr/local/bin/simpleswe
 COPY ${OPENCODE_BINARY} /usr/local/bin/opencode

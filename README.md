@@ -42,7 +42,7 @@ The initial vertical slice supports:
 - a default or configured `ReadWriteOnce` StorageClass suitable for SQLite WAL locking;
 - Bitbucket or GitHub credentials for each configured repository;
 - a webhook signing secret for each configured forge provider;
-- a repository-specific worker image containing `simpleswe`, OpenCode, Git, SSH, language runtimes, and validation tools;
+- a repository-specific worker image containing `simpleswe`, OpenCode, Git, GitHub CLI, SSH, language runtimes, and validation tools;
 - Go 1.26.5 when building locally;
 - `kubectl` locally for automatic port-forwarding and TUI shell access.
 
@@ -121,6 +121,8 @@ For GitHub, create a repository-scoped fine-grained token. `github.credentials_s
 kubectl -n simpleswe create secret generic github-widget \
   --from-literal=token='github_pat_...'
 ```
+
+GitHub review follow-ups use `gh`. Expose the worker token as `GH_TOKEN`, as shown in [`examples/values-kind.yaml`](examples/values-kind.yaml); the local example reuses the repository-scoped `github-simpleswe` Secret rather than duplicating the PAT.
 
 For SSH Git access, create a worker Secret whose private key is named `ssh-privatekey`:
 
