@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -357,123 +356,6 @@ func TestStartForgeEventAttemptRejectsBatchSlidAfterPlanning(t *testing.T) {
 	attempts, err := db.ListAttempts(t.Context(), record.ID)
 	if err != nil || len(attempts) != 1 || attempts[0].ID != original.ID {
 		t.Fatalf("attempts after refused start = %#v, %v", attempts, err)
-	}
-}
-
-func TestForgeEventReplyDraftsPersistAcrossReopenAndLeaveMissingFallbackEmpty(t *testing.T) {
-	ctx := t.Context()
-	path := filepath.Join(t.TempDir(), "tasks.sqlite")
-	db, err := Open(ctx, path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	record, original, _ := createOpenPullRequestTask(t, db)
-	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
-		t.Fatalf("mark original logs exhausted: %v", err)
-	}
-
-	first := testForgeEvent("reply-draft-first", "review_comment")
-	second := first
-	second.ID = "reply-draft-second"
-	second.CommentID = 502
-	second.Body = "Please include a regression test"
-	second.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-502"
-	for _, event := range []ForgeEvent{first, second} {
-		if _, err := db.PutForgeEventAfter(ctx, event, 0); err != nil {
-			t.Fatalf("put reply event %q: %v", event.ID, err)
-		}
-	}
-	attempt, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, "reply to review feedback")
-	if err != nil {
-		t.Fatalf("start reply follow-up: %v", err)
-	}
-	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "I pushed the parser fix."}); err != nil {
-		t.Fatalf("record reply drafts: %v", err)
-	}
-	assertForgeEventReplyDrafts(t, db, attempt.ID, first.ID, second.ID)
-
-	if err := db.Close(); err != nil {
-		t.Fatalf("close store: %v", err)
-	}
-	db, err = Open(ctx, path)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	assertForgeEventReplyDrafts(t, db, attempt.ID, first.ID, second.ID)
-}
-
-func TestForgeEventReplyDraftsIgnoreAmbiguousCommentIDsAcrossKinds(t *testing.T) {
-	db := openTestStore(t)
-	ctx := t.Context()
-	record, original, _ := createOpenPullRequestTask(t, db)
-	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
-		t.Fatal(err)
-	}
-
-	first := testForgeEvent("ambiguous-reply-issue", "review_comment")
-	first.Provider, first.CommentKind = "github", "issue_comment"
-	second := first
-	second.ID, second.CommentKind = "ambiguous-reply-inline", "review_comment"
-	for _, event := range []ForgeEvent{first, second} {
-		if _, err := db.PutForgeEvent(ctx, event); err != nil {
-			t.Fatalf("put ambiguous reply event %q: %v", event.ID, err)
-		}
-	}
-	attempt, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, "reply to ambiguous review feedback")
-	if err != nil {
-		t.Fatalf("start ambiguous reply follow-up: %v", err)
-	}
-	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "Generated draft"}); err != nil {
-		t.Fatalf("record ambiguous reply draft: %v", err)
-	}
-	events, err := db.ListForgeEventsByAttempt(ctx, attempt.ID)
-	if err != nil {
-		t.Fatalf("list ambiguous reply events: %v", err)
-	}
-	if len(events) != 2 || events[0].ReplyDraft != "" || events[1].ReplyDraft != "" {
-		t.Fatalf("ambiguous reply events = %#v; want both drafts empty", events)
-	}
-
-	if err := db.MarkForgeEventHandled(ctx, first.ID); err != nil {
-		t.Fatalf("mark one ambiguous reply handled: %v", err)
-	}
-	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "Generated draft"}); err != nil {
-		t.Fatalf("replay ambiguous reply draft: %v", err)
-	}
-	first, err = db.GetForgeEvent(ctx, first.ID)
-	if err != nil {
-		t.Fatalf("get handled ambiguous reply event: %v", err)
-	}
-	second, err = db.GetForgeEvent(ctx, second.ID)
-	if err != nil {
-		t.Fatalf("get running ambiguous reply event: %v", err)
-	}
-	if first.Status != ForgeEventHandled || first.ReplyDraft != "" || second.Status != ForgeEventRunning || second.ReplyDraft != "" {
-		t.Fatalf("ambiguous reply events after replay = %#v, %#v; want handled and running drafts empty", first, second)
-	}
-}
-
-func assertForgeEventReplyDrafts(t *testing.T, db *Store, attemptID, firstID, secondID string) {
-	t.Helper()
-	events, err := db.ListForgeEventsByAttempt(t.Context(), attemptID)
-	if err != nil {
-		t.Fatalf("list reply draft events: %v", err)
-	}
-	byID := make(map[string]ForgeEvent, len(events))
-	for _, event := range events {
-		byID[event.ID] = event
-	}
-	if len(byID) != 2 {
-		t.Fatalf("reply draft events = %#v; want both associated events", events)
-	}
-	first, ok := byID[firstID]
-	if !ok || first.ReplyDraft != "I pushed the parser fix." {
-		t.Fatalf("first reply draft = %#v; want persisted draft", first)
-	}
-	second, ok := byID[secondID]
-	if !ok || second.ReplyDraft != "" {
-		t.Fatalf("missing second reply draft = %#v; want empty fallback", second)
 	}
 }
 
@@ -859,7 +741,7 @@ func TestStartForgeEventAttemptRejectsStateOutsideMachineReset(t *testing.T) {
 	}
 }
 
-func TestRetryTaskOnceRebindsRunningForgeEventBatchAndClearsDrafts(t *testing.T) {
+func TestRetryTaskOnceRebindsRunningForgeEventBatch(t *testing.T) {
 	db := openTestStore(t)
 	ctx := context.Background()
 	record, originalAttempt, originalPR := createOpenPullRequestTask(t, db)
@@ -878,9 +760,6 @@ func TestRetryTaskOnceRebindsRunningForgeEventBatchAndClearsDrafts(t *testing.T)
 	failed, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, prompt)
 	if err != nil {
 		t.Fatalf("start forge follow-up: %v", err)
-	}
-	if err := db.RecordForgeEventReplies(ctx, failed.ID, map[int]string{first.CommentID: "first draft", second.CommentID: "second draft"}); err != nil {
-		t.Fatalf("record pre-retry drafts: %v", err)
 	}
 	if err := db.Transition(ctx, record.ID, task.QUEUED, task.FAILED, TransitionParams{Reason: "follow-up failed", Trigger: "kubernetes"}); err != nil {
 		t.Fatalf("fail follow-up: %v", err)
@@ -908,8 +787,8 @@ func TestRetryTaskOnceRebindsRunningForgeEventBatchAndClearsDrafts(t *testing.T)
 		t.Fatalf("rebound forge events = %#v, %v", associated, err)
 	}
 	for _, event := range associated {
-		if event.Status != ForgeEventRunning || event.AttemptID != retry.ID || event.TaskID != record.ID || event.ReplyDraft != "" {
-			t.Fatalf("rebound forge event = %#v; want running with cleared draft", event)
+		if event.Status != ForgeEventRunning || event.AttemptID != retry.ID || event.TaskID != record.ID {
+			t.Fatalf("rebound forge event = %#v; want running on retry", event)
 		}
 	}
 	if old, err := db.ListForgeEventsByAttempt(ctx, failed.ID); err != nil || len(old) != 0 {

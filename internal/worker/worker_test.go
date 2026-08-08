@@ -121,20 +121,16 @@ func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
 	if !strings.HasSuffix(prompt, "old-output-") {
 		t.Fatal("fix prompt did not retain validation tail")
 	}
-	if got := validationFixPromptForTask("ordinary task", failure); got != prompt {
-		t.Fatal("non-review validation fix did not retain the compact prompt")
-	}
 }
 
-func TestReviewValidationFixPromptRetainsBoundedOriginalContext(t *testing.T) {
-	prefix := protocol.ReviewReplyInstruction + "; forge_event_1: comment_id=1; body="
-	original := prefix + strings.Repeat("x", (95<<10)-len(prefix))
-	prompt := agentPrompt(validationFixPromptForTask(original, strings.Repeat("failure", validationFixPromptLimit)))
-	if !strings.Contains(prompt, original) {
-		t.Fatal("review validation fix did not retain the immutable original prompt")
+func TestAgentPromptAppendsOnlyBaseConstraints(t *testing.T) {
+	taskPrompt := "ordinary task containing pull_request_url=https://forge.example/pr/1 and reply_marker=ordinary-data"
+	prompt := agentPrompt(taskPrompt)
+	if want := taskPrompt + "\n\nWorkflow constraints:\n" + baseWorkflowInstructions; prompt != want {
+		t.Fatalf("agent prompt = %q, want only task and generic constraints %q", prompt, want)
 	}
-	if len(prompt) > 128<<10 {
-		t.Fatalf("combined review validation-fix prompt length = %d; want at most %d", len(prompt), 128<<10)
+	if !strings.Contains(prompt, "Do not push commits or branches, merge, create pull requests, or alter pull request metadata") {
+		t.Fatalf("ordinary task prompt does not contain base constraints: %q", prompt)
 	}
 }
 

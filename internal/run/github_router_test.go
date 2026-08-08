@@ -17,54 +17,31 @@ import (
 	"github.com/simpleswe/simpleswe/internal/forge"
 )
 
-type replyLookupClient struct {
-	owner, repository, marker string
-	request                   forge.ReplyRequest
-	getNumber                 int
+type pullRequestInspectionClient struct {
+	owner, repository string
+	getNumber         int
 }
 
-func (*replyLookupClient) CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
+func (*pullRequestInspectionClient) CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
 	return forge.PullRequest{}, nil
 }
-func (*replyLookupClient) FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error) {
+func (*pullRequestInspectionClient) FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error) {
 	return forge.PullRequest{}, false, nil
 }
-func (c *replyLookupClient) GetPullRequest(_ context.Context, owner, repository string, number int) (forge.PullRequestState, error) {
+func (c *pullRequestInspectionClient) GetPullRequest(_ context.Context, owner, repository string, number int) (forge.PullRequestState, error) {
 	c.owner, c.repository, c.getNumber = owner, repository, number
 	return forge.PullRequestState{Number: number, State: "open"}, nil
 }
 
 func TestForgeRouterRoutesPullRequestInspection(t *testing.T) {
 	target := forge.Target{Provider: forge.ProviderGitHub, BaseURL: "https://api.github.com", Owner: "Acme", Repository: "Widget", CredentialsSecret: "widget-github"}
-	client := new(replyLookupClient)
+	client := new(pullRequestInspectionClient)
 	router := forgeRouter{forgeRoute(target): client}
 	got, err := router.GetPullRequest(context.Background(), target, 42)
 	if err != nil || got.Number != 42 || client.owner != target.Owner || client.repository != target.Repository || client.getNumber != 42 {
 		t.Fatalf("GetPullRequest = %#v, %v; routed client = %#v", got, err, client)
 	}
 }
-func (c *replyLookupClient) PullRequestReplyExists(_ context.Context, owner, repository string, request forge.ReplyRequest, marker string) (bool, error) {
-	c.owner, c.repository, c.request, c.marker = owner, repository, request, marker
-	return true, nil
-}
-func (*replyLookupClient) ReplyToPullRequest(context.Context, string, string, forge.ReplyRequest) error {
-	return nil
-}
-
-func TestForgeRouterRoutesReplyExistenceCheck(t *testing.T) {
-	target := forge.Target{Provider: forge.ProviderGitHub, BaseURL: "https://api.github.com", Owner: "Acme", Repository: "Widget", CredentialsSecret: "widget-github"}
-	client := new(replyLookupClient)
-	router := forgeRouter{forgeRoute(target): client}
-	request := forge.ReplyRequest{PullRequestNumber: 42, CommentKind: "review"}
-	found, err := router.PullRequestReplyExists(context.Background(), target, request, "<!-- simpleswe:123 -->")
-	if err != nil || !found {
-		t.Fatalf("PullRequestReplyExists = %t, %v", found, err)
-	}
-	if client.owner != target.Owner || client.repository != target.Repository || client.request != request || client.marker != "<!-- simpleswe:123 -->" {
-		t.Fatalf("routed reply lookup = %#v", client)
-	}
-}
-
 func TestForgeRouterRoutesGitHubFindAndCreateByCaseInsensitiveOwnerAndRepository(t *testing.T) {
 	type testRepository struct {
 		owner, repository, token string

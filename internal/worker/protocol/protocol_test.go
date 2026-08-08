@@ -85,7 +85,6 @@ func TestEventRoundTrip(t *testing.T) {
 		Type:    EventBranchPushed,
 		TaskID:  "task-1",
 		Message: "stdout contained a quoted \"value\"",
-		Replies: map[int]string{101: "fixed the requested line", 202: "updated the test"},
 	}
 
 	line, err := EncodeEvent(want)
@@ -107,13 +106,6 @@ func TestEventRoundTrip(t *testing.T) {
 		t.Errorf("round trip mismatch: got %#v, want %#v", *parsed.Event, want)
 	}
 
-	withoutReplies, err := EncodeEvent(Event{Type: EventBranchPushed})
-	if err != nil {
-		t.Fatalf("encode event without replies: %v", err)
-	}
-	if strings.Contains(withoutReplies, `"replies"`) {
-		t.Fatalf("empty replies were not omitted: %q", withoutReplies)
-	}
 }
 
 func TestValidateBranchPushedRequiresExpectedBranchAndFullCommitSHA(t *testing.T) {
@@ -141,38 +133,5 @@ func TestValidateBranchPushedRequiresExpectedBranchAndFullCommitSHA(t *testing.T
 	nonHexSHA.CommitSHA = strings.Repeat("z", 40)
 	if err := ValidateEvent(nonHexSHA, valid.Branch); err == nil {
 		t.Fatal("branch_pushed with a non-hex commit SHA was accepted")
-	}
-}
-
-func TestValidateBranchPushedReplies(t *testing.T) {
-	valid := Event{
-		Type:      EventBranchPushed,
-		TaskID:    "task-1",
-		Branch:    "simpleswe/task-1",
-		CommitSHA: strings.Repeat("a", 40),
-	}
-	for _, test := range []struct {
-		name    string
-		replies map[int]string
-		wantErr bool
-	}{
-		{name: "absent fallback"},
-		{name: "partial fallback", replies: map[int]string{101: "one reply"}},
-		{name: "zero comment id", replies: map[int]string{0: "reply"}, wantErr: true},
-		{name: "negative comment id", replies: map[int]string{-1: "reply"}, wantErr: true},
-		{name: "empty draft", replies: map[int]string{101: ""}, wantErr: true},
-		{name: "blank draft", replies: map[int]string{101: " \t"}, wantErr: true},
-		{name: "draft over 2 KiB", replies: map[int]string{101: strings.Repeat("x", 2<<10+1)}, wantErr: true},
-		{name: "ASCII control", replies: map[int]string{101: "line\nfeed"}, wantErr: true},
-		{name: "Unicode control", replies: map[int]string{101: "draft\u0085text"}, wantErr: true},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			event := valid
-			event.Replies = test.replies
-			err := ValidateEvent(event, valid.Branch)
-			if (err != nil) != test.wantErr {
-				t.Fatalf("ValidateEvent replies error = %v, want error %t", err, test.wantErr)
-			}
-		})
 	}
 }

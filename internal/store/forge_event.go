@@ -17,7 +17,7 @@ const (
 	ForgeEventRunning = "running"
 	ForgeEventHandled = "handled"
 	ForgeEventFailed  = "failed"
-	// forgeEventBatchSize bounds each review follow-up and its reply mapping.
+	// forgeEventBatchSize bounds each review follow-up.
 	forgeEventBatchSize = 32
 )
 
@@ -41,7 +41,6 @@ type ForgeEvent struct {
 	URL               string
 	TaskID            string
 	AttemptID         string
-	ReplyDraft        string
 	Status            string
 	Attempts          int
 	LastError         string
@@ -55,7 +54,7 @@ type ForgeEvent struct {
 const forgeEventSelect = `
 	SELECT id, provider, kind, owner, repository, pull_request_number, commit_sha,
 	       branch, comment_id, comment_kind, title, body, author, url, task_id,
-	       attempt_id, reply_draft, status, attempts, last_error, created_at, updated_at, handled_at, failed_at, next_attempt_at
+	       attempt_id, status, attempts, last_error, created_at, updated_at, handled_at, failed_at, next_attempt_at
 	FROM forge_events`
 
 // PutForgeEvent inserts normalized content once. A duplicate ID never replaces
@@ -368,42 +367,6 @@ func (s *Store) MarkForgeEventFailed(ctx context.Context, id string, cause error
 	return nil
 }
 
-// RecordForgeEventReplies replaces the durable drafts for running review
-// events on an attempt. Attempts without forge events are a safe no-op.
-func (s *Store) RecordForgeEventReplies(ctx context.Context, attemptID string, replies map[int]string) error {
-	if strings.TrimSpace(attemptID) == "" {
-		return errors.New("forge event attempt ID is empty")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin forge event replies: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE forge_events SET reply_draft = '', updated_at = ?
-		WHERE attempt_id = ? AND status = 'running' AND kind = 'review_comment'`,
-		stamp(time.Now().UTC()), attemptID); err != nil {
-		return fmt.Errorf("clear forge event replies for attempt %q: %w", attemptID, err)
-	}
-	for commentID, draft := range replies {
-		if commentID <= 0 || strings.TrimSpace(draft) == "" || len(draft) > 2<<10 {
-			return fmt.Errorf("invalid forge event reply for comment %d", commentID)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE forge_events SET reply_draft = ?, updated_at = ?
-			WHERE attempt_id = ? AND status = 'running' AND kind = 'review_comment' AND comment_id = ?
-			  AND (SELECT COUNT(*) FROM forge_events
-			       WHERE attempt_id = ? AND kind = 'review_comment' AND comment_id = ?) = 1`,
-			draft, stamp(time.Now().UTC()), attemptID, commentID, attemptID, commentID); err != nil {
-			return fmt.Errorf("record forge event reply for comment %d: %w", commentID, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit forge event replies for attempt %q: %w", attemptID, err)
-	}
-	return nil
-}
-
 // ForgeEventAttemptPlan reserves no durable state. It supplies the identity
 // needed to build immutable worker resources before the start transaction.
 type ForgeEventAttemptPlan struct {
@@ -594,7 +557,7 @@ func readForgeFollowUpTask(ctx context.Context, tx *sql.Tx, taskID string) (forg
 
 func validateForgeFollowUpTask(ctx context.Context, tx *sql.Tx, taskID string, current forgeFollowUpTask, previousAttemptID, baseBranch, taskBranch string) error {
 	pullRequest := current.pullRequest
-	if pullRequest.State != "open" || pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.URL) == "" || strings.TrimSpace(pullRequest.HeadBranch) == "" {
+	if pullRequest.State != "open" || pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.HeadBranch) == "" {
 		return fmt.Errorf("%w: task %q current attempt has no open pull request", ErrConflict, taskID)
 	}
 	if current.attemptID != previousAttemptID || baseBranch != pullRequest.HeadBranch || taskBranch != pullRequest.HeadBranch {
@@ -817,7 +780,7 @@ func scanForgeEvent(row scanner) (ForgeEvent, error) {
 		&event.ID, &event.Provider, &event.Kind, &event.Owner, &event.Repository,
 		&event.PullRequestNumber, &event.CommitSHA, &event.Branch, &event.CommentID,
 		&event.CommentKind, &event.Title, &event.Body, &event.Author, &event.URL,
-		&taskID, &attemptID, &event.ReplyDraft, &event.Status, &event.Attempts, &event.LastError,
+		&taskID, &attemptID, &event.Status, &event.Attempts, &event.LastError,
 		&createdAt, &updatedAt, &handledAt, &failedAt, &nextAttemptAt,
 	); err != nil {
 		return ForgeEvent{}, err

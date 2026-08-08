@@ -181,9 +181,6 @@ func (c *Controller) handleBranchPushedLocked(ctx context.Context, record store.
 	if err := protocol.ValidateEvent(event, manifest.TaskBranch); err != nil {
 		return err
 	}
-	if err := c.store.RecordForgeEventReplies(ctx, attempt.ID, event.Replies); err != nil {
-		return fmt.Errorf("record forge event replies for attempt %q: %w", attempt.ID, err)
-	}
 	if stateAtOrAfter(record.State, task.PR_OPEN) {
 		return c.completeForgeEventLocked(ctx, record, attempt)
 	}

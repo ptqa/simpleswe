@@ -114,31 +114,20 @@ type pullRequestCall struct {
 }
 
 type fakePullRequestCreator struct {
-	mu                 sync.Mutex
-	calls              []pullRequestCall
-	replyTargets       []forge.Target
-	replies            []forge.ReplyRequest
-	replyExistTargets  []forge.Target
-	replyExistRequests []forge.ReplyRequest
-	replyMarkers       []string
-	replyExists        bool
-	replyExistsInPosts bool
-	replyExistsErr     error
-	replyExistsErrByID map[int]error
-	replyErr           error
-	replyErrByID       map[int]error
-	found              *forge.PullRequest
-	findCalls          int
-	findTargets        []forge.Target
-	failFind           int
-	findErr            error
-	getResult          *forge.PullRequestState
-	getErr             error
-	getCalls           int
-	getTargets         []forge.Target
-	getNumbers         []int
-	blocked            chan struct{}
-	release            chan struct{}
+	mu          sync.Mutex
+	calls       []pullRequestCall
+	found       *forge.PullRequest
+	findCalls   int
+	findTargets []forge.Target
+	failFind    int
+	findErr     error
+	getResult   *forge.PullRequestState
+	getErr      error
+	getCalls    int
+	getTargets  []forge.Target
+	getNumbers  []int
+	blocked     chan struct{}
+	release     chan struct{}
 }
 
 func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
@@ -196,36 +185,6 @@ func (f *fakePullRequestCreator) GetPullRequest(_ context.Context, target forge.
 		result.DestinationBranch = f.calls[len(f.calls)-1].input.DestinationBranch
 	}
 	return result, nil
-}
-
-func (f *fakePullRequestCreator) ReplyToPullRequest(_ context.Context, target forge.Target, input forge.ReplyRequest) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.replyTargets = append(f.replyTargets, target)
-	f.replies = append(f.replies, input)
-	if err := f.replyErrByID[input.CommentID]; err != nil {
-		return err
-	}
-	return f.replyErr
-}
-
-func (f *fakePullRequestCreator) PullRequestReplyExists(_ context.Context, target forge.Target, input forge.ReplyRequest, marker string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.replyExistTargets = append(f.replyExistTargets, target)
-	f.replyExistRequests = append(f.replyExistRequests, input)
-	f.replyMarkers = append(f.replyMarkers, marker)
-	if err := f.replyExistsErrByID[input.CommentID]; err != nil {
-		return false, err
-	}
-	if f.replyExistsInPosts {
-		for _, reply := range f.replies {
-			if strings.Contains(reply.Body, marker) {
-				return true, nil
-			}
-		}
-	}
-	return f.replyExists, f.replyExistsErr
 }
 
 var _ PullRequestCreator = (*fakePullRequestCreator)(nil)

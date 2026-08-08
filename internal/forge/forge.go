@@ -128,14 +128,6 @@ type Event struct {
 	URL               string
 }
 
-// ReplyRequest describes a comment or general pull-request reply.
-type ReplyRequest struct {
-	PullRequestNumber int
-	CommentID         int
-	CommentKind       string
-	Body              string
-}
-
 // ReplyMarker identifies one event's provider reply across process crashes.
 func ReplyMarker(eventID string) string {
 	digest := sha256.Sum256([]byte(eventID))
@@ -178,14 +170,6 @@ func ValidateNormalizedIdentity(name, value string, required bool) error {
 		return fmt.Errorf("%s contains control characters", name)
 	}
 	return nil
-}
-
-// ValidateReplyRequest checks the provider-neutral reply fields.
-func ValidateReplyRequest(request ReplyRequest) error {
-	if request.PullRequestNumber <= 0 {
-		return errors.New("reply pull request number must be positive")
-	}
-	return ValidateNormalizedText("reply body", request.Body, true)
 }
 
 type statusCoder interface {

@@ -977,7 +977,7 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 			return Attempt{}, false, fmt.Errorf("%w: running forge event batch has no open pull request", ErrConflict)
 		}
 		result, err = tx.ExecContext(ctx, `
-			UPDATE forge_events SET attempt_id = ?, reply_draft = '', updated_at = ?
+			UPDATE forge_events SET attempt_id = ?, updated_at = ?
 			WHERE task_id = ? AND attempt_id = ? AND status = 'running'`,
 			attempt.ID, stamp(now), taskID, currentAttemptID)
 		if err != nil {

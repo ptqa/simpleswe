@@ -33,8 +33,6 @@ type PullRequestCreator interface {
 	CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error)
 	FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error)
 	GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error)
-	PullRequestReplyExists(context.Context, forge.Target, forge.ReplyRequest, string) (bool, error)
-	ReplyToPullRequest(context.Context, forge.Target, forge.ReplyRequest) error
 }
 
 type Controller struct {

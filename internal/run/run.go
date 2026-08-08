@@ -324,8 +324,6 @@ type pullRequestClient interface {
 	CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error)
 	FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error)
 	GetPullRequest(context.Context, string, string, int) (forge.PullRequestState, error)
-	PullRequestReplyExists(context.Context, string, string, forge.ReplyRequest, string) (bool, error)
-	ReplyToPullRequest(context.Context, string, string, forge.ReplyRequest) error
 }
 
 type forgeRouter map[forge.Target]pullRequestClient
@@ -442,29 +440,6 @@ func (r forgeRouter) GetPullRequest(ctx context.Context, target forge.Target, nu
 		return forge.PullRequestState{}, fmt.Errorf("get pull request for %s/%s: %w", target.Owner, target.Repository, err)
 	}
 	return pullRequest, nil
-}
-
-func (r forgeRouter) ReplyToPullRequest(ctx context.Context, target forge.Target, input forge.ReplyRequest) error {
-	client, err := r.client(target)
-	if err != nil {
-		return err
-	}
-	if err := client.ReplyToPullRequest(ctx, target.Owner, target.Repository, input); err != nil {
-		return fmt.Errorf("reply to pull request for %s/%s: %w", target.Owner, target.Repository, err)
-	}
-	return nil
-}
-
-func (r forgeRouter) PullRequestReplyExists(ctx context.Context, target forge.Target, input forge.ReplyRequest, marker string) (bool, error) {
-	client, err := r.client(target)
-	if err != nil {
-		return false, err
-	}
-	found, err := client.PullRequestReplyExists(ctx, target.Owner, target.Repository, input, marker)
-	if err != nil {
-		return false, fmt.Errorf("find pull request reply for %s/%s: %w", target.Owner, target.Repository, err)
-	}
-	return found, nil
 }
 
 func (r forgeRouter) client(target forge.Target) (pullRequestClient, error) {
