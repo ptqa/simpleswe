@@ -60,14 +60,11 @@ Build the controller image:
 docker build --target controller -t ghcr.io/example/simpleswe:0.1.0 .
 ```
 
-The worker target expects a prebuilt OpenCode executable inside the Docker build context:
+The worker target extends the pinned official OpenCode image:
 
 ```sh
-mkdir -p bin
-cp /path/to/opencode bin/opencode
 docker build \
   --target worker \
-  --build-arg OPENCODE_BINARY=bin/opencode \
   -t ghcr.io/example/widget-worker:0.1.0 .
 ```
 
@@ -93,9 +90,7 @@ Inspect the controller:
 The placeholders are only for startup and observation. Before executing tasks, replace or provide real GitHub, webhook, and OpenAI credentials, then build and load a worker image:
 
 ```sh
-mkdir -p bin
-cp /path/to/opencode bin/opencode
-docker build --target worker --build-arg OPENCODE_BINARY=bin/opencode -t simpleswe-worker:kind .
+docker build --target worker -t simpleswe-worker:kind .
 kind load docker-image --name simpleswe simpleswe-worker:kind
 ```
 

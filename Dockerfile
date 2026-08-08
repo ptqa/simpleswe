@@ -11,18 +11,10 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags='-s -w' -o /out/simpleswe ./cmd/simpleswe
 
-# OPENCODE_BINARY must name a prebuilt binary inside the build context.
-# docker build --target worker --build-arg OPENCODE_BINARY=bin/opencode \
-#   -t simpleswe-worker .
-FROM debian:bookworm-slim AS worker
-ARG OPENCODE_BINARY=_prebuilt_opencode_binary_must_be_provided
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates gh git openssh-client \
-    && rm -rf /var/lib/apt/lists/*
+FROM ghcr.io/anomalyco/opencode:1.18.15@sha256:59b2582fb5a10b7022d8b3347a9d9c60710d526ad6bfd02eb17a2c8582b35809 AS worker
+RUN apk add --no-cache ca-certificates github-cli git openssh-client
 COPY --from=build /out/simpleswe /usr/local/bin/simpleswe
-COPY ${OPENCODE_BINARY} /usr/local/bin/opencode
-RUN chmod 0755 /usr/local/bin/opencode \
-    && mkdir -p /workspace
+RUN mkdir -p /workspace
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/simpleswe"]
 
