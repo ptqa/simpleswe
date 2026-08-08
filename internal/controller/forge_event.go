@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
+	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
 
 type forgeMatch uint8
@@ -33,17 +35,50 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 		return err
 	}
 	var persistenceErrors []error
+	processed := make(map[string]bool, len(events))
 	for _, event := range events {
+		if processed[event.ID] {
+			continue
+		}
 		if ctx.Err() != nil {
 			return errors.Join(errors.Join(persistenceErrors...), ctx.Err())
 		}
 		if event.Status == store.ForgeEventRunning {
+			associated := []store.ForgeEvent{event}
+			if event.AttemptID != "" {
+				var listErr error
+				associated, listErr = c.store.ListForgeEventsByAttempt(ctx, event.AttemptID)
+				if listErr != nil {
+					persistenceErrors = append(persistenceErrors, listErr)
+					continue
+				}
+			}
+			for _, sibling := range associated {
+				processed[sibling.ID] = true
+			}
 			if err := c.recoverRunningForgeEvent(ctx, event); err != nil {
-				if persistErr := c.persistForgeEventFailure(ctx, event, "recover", err); persistErr != nil {
-					persistenceErrors = append(persistenceErrors, persistErr)
+				for _, sibling := range associated {
+					if sibling.Status != store.ForgeEventRunning || sibling.NextAttemptAt != nil && sibling.NextAttemptAt.After(time.Now().UTC()) {
+						continue
+					}
+					if persistErr := c.persistForgeEventFailure(ctx, sibling, "recover", err); persistErr != nil {
+						persistenceErrors = append(persistenceErrors, persistErr)
+					}
 				}
 			}
 			continue
+		}
+
+		batchCandidates := []store.ForgeEvent{event}
+		if event.Kind == "review_comment" {
+			batchCandidates, err = c.store.ListDueForgeEventBatch(ctx, event)
+			if err != nil {
+				persistenceErrors = append(persistenceErrors, err)
+				continue
+			}
+			if len(batchCandidates) == 0 {
+				continue
+			}
 		}
 
 		record, repository, match, err := c.matchForgeEvent(ctx, event)
@@ -63,9 +98,18 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 			continue
 		}
 
-		if err := c.startForgeEvent(ctx, event, record, repository); err != nil {
-			if persistErr := c.persistForgeEventFailure(ctx, event, "start", err); persistErr != nil {
-				persistenceErrors = append(persistenceErrors, persistErr)
+		batch := batchCandidates
+		for _, selected := range batch {
+			processed[selected.ID] = true
+		}
+		if err := c.startForgeEvent(ctx, batch, record, repository); err != nil {
+			if errors.Is(err, store.ErrForgeEventNotDue) {
+				continue
+			}
+			for _, selected := range batch {
+				if persistErr := c.persistForgeEventFailure(ctx, selected, "start", err); persistErr != nil {
+					persistenceErrors = append(persistenceErrors, persistErr)
+				}
 			}
 		}
 	}
@@ -73,6 +117,14 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 }
 
 func (c *Controller) persistForgeEventFailure(ctx context.Context, event store.ForgeEvent, operation string, cause error) error {
+	return c.persistForgeEventFailureWithCancellation(ctx, event, operation, cause, true)
+}
+
+func (c *Controller) persistForgeEventReplyFailure(ctx context.Context, event store.ForgeEvent, operation string, cause error) error {
+	return c.persistForgeEventFailureWithCancellation(ctx, event, operation, cause, false)
+}
+
+func (c *Controller) persistForgeEventFailureWithCancellation(ctx context.Context, event store.ForgeEvent, operation string, cause error, cancelPermanent bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -83,8 +135,10 @@ func (c *Controller) persistForgeEventFailure(ctx context.Context, event store.F
 	permanent := forge.IsPermanent(cause)
 	var err error
 	if permanent {
-		if _, err := c.store.RequestForgeEventCancellation(ctx, event.ID); err != nil {
-			return forgeEventPersistenceError{fmt.Errorf("persist forge event %q %s cancellation: %w", event.ID, operation, errors.Join(cause, err))}
+		if cancelPermanent {
+			if _, err := c.store.RequestForgeEventCancellation(ctx, event.ID); err != nil {
+				return forgeEventPersistenceError{fmt.Errorf("persist forge event %q %s cancellation: %w", event.ID, operation, errors.Join(cause, err))}
+			}
 		}
 		err = c.store.MarkForgeEventFailed(ctx, event.ID, cause)
 	} else {
@@ -101,7 +155,10 @@ func (c *Controller) persistForgeEventFailure(ctx context.Context, event store.F
 	return nil
 }
 
-func (c *Controller) startForgeEvent(ctx context.Context, event store.ForgeEvent, record store.Task, repository config.RepositoryConfig) error {
+func (c *Controller) startForgeEvent(ctx context.Context, events []store.ForgeEvent, record store.Task, repository config.RepositoryConfig) error {
+	if len(events) == 0 {
+		return errors.New("forge event batch is empty")
+	}
 	unlock, err := c.locks.lock(ctx, record.ID)
 	if err != nil {
 		return err
@@ -114,13 +171,15 @@ func (c *Controller) startForgeEvent(ctx context.Context, event store.ForgeEvent
 		}
 		return err
 	}
-	match, err := c.forgeEventMatchesTask(ctx, event, current)
-	if err != nil || match != forgeOwned {
-		unlock()
-		if err != nil {
-			return err
+	for _, event := range events {
+		match, err := c.forgeEventMatchesTask(ctx, event, current)
+		if err != nil || match != forgeOwned {
+			unlock()
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%w: task %q no longer owns forge event", store.ErrConflict, record.ID)
 		}
-		return fmt.Errorf("%w: task %q no longer owns forge event", store.ErrConflict, record.ID)
 	}
 	currentAttempt, err := c.store.CurrentAttempt(ctx, current.ID)
 	if err != nil {
@@ -134,7 +193,11 @@ func (c *Controller) startForgeEvent(ctx context.Context, event store.ForgeEvent
 		unlock()
 		return err
 	}
-	plan, err := c.store.PlanForgeEventAttempt(ctx, event.ID, current.ID, forgeFollowUpPrompt(current.Prompt, event))
+	eventIDs := make([]string, len(events))
+	for i := range events {
+		eventIDs[i] = events[i].ID
+	}
+	plan, err := c.store.PlanForgeEventAttempt(ctx, eventIDs, current.ID, forgeFollowUpPrompt(current.Prompt, events))
 	if err != nil {
 		unlock()
 		if errors.Is(err, store.ErrNotFound) {
@@ -149,7 +212,7 @@ func (c *Controller) startForgeEvent(ctx context.Context, event store.ForgeEvent
 			return err
 		}
 	}
-	attempt, _, err := c.store.StartForgeEventAttempt(ctx, event.ID, plan)
+	attempt, _, err := c.store.StartForgeEventAttempt(ctx, plan)
 	unlock()
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -481,18 +544,29 @@ func forgeOwnershipMaySettle(state task.State) bool {
 }
 
 func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.Task, attempt store.Attempt) error {
-	event, err := c.store.GetForgeEventByAttempt(ctx, attempt.ID)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil
-	}
+	events, err := c.store.ListForgeEventsByAttempt(ctx, attempt.ID)
 	if err != nil {
 		return err
 	}
-	if event.Status == store.ForgeEventHandled || event.Status == store.ForgeEventFailed {
+	now := time.Now().UTC()
+	due := make([]store.ForgeEvent, 0, len(events))
+	for _, event := range events {
+		if event.Status == store.ForgeEventRunning && (event.NextAttemptAt == nil || !event.NextAttemptAt.After(now)) {
+			due = append(due, event)
+		}
+	}
+	if len(due) == 0 {
 		return nil
 	}
-	if event.Status != store.ForgeEventRunning || event.TaskID != record.ID {
-		return forge.MarkPermanent(fmt.Errorf("%w: forge event %q is not running for task %q", store.ErrConflict, event.ID, record.ID))
+	persistAll := func(cause error) error {
+		const operation = "completion ownership"
+		var persistenceErrors []error
+		for _, event := range due {
+			if persistErr := c.persistForgeEventFailure(ctx, event, operation, cause); persistErr != nil {
+				persistenceErrors = append(persistenceErrors, persistErr)
+			}
+		}
+		return errors.Join(persistenceErrors...)
 	}
 	git, err := c.store.GetGitResult(ctx, attempt.ID)
 	if errors.Is(err, store.ErrNotFound) {
@@ -504,7 +578,7 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 	pullRequest, err := c.store.GetPullRequest(ctx, attempt.ID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return forge.MarkPermanent(fmt.Errorf("running forge event durable pull request: %w", err))
+			return persistAll(forge.MarkPermanent(fmt.Errorf("running forge event durable pull request: %w", err)))
 		}
 		return err
 	}
@@ -512,70 +586,87 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 		return nil
 	}
 	if pullRequest.State != "open" || pullRequest.Number <= 0 || pullRequest.HeadBranch != git.Branch {
-		return forge.MarkPermanent(fmt.Errorf("%w: forge event durable pull request does not match pushed Git result", store.ErrConflict))
-	}
-	if event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number {
-		return forge.MarkPermanent(fmt.Errorf("%w: forge event pull request %d does not match durable pull request %d", store.ErrConflict, event.PullRequestNumber, pullRequest.Number))
+		return persistAll(forge.MarkPermanent(fmt.Errorf("%w: forge event durable pull request does not match pushed Git result", store.ErrConflict)))
 	}
 	target, err := c.attemptForgeTarget(record, attempt)
 	if err != nil {
-		return err
-	}
-	if !sameForgeCoordinates(event, target) {
-		return forge.MarkPermanent(fmt.Errorf("%w: forge event repository does not match immutable forge target", store.ErrConflict))
+		return persistAll(err)
 	}
 	priorGit, err := c.latestPushedPullRequestGitResult(ctx, record.ID, pullRequest, attempt.ID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			err = forge.MarkPermanent(err)
 		}
-		return c.persistForgeEventFailure(ctx, event, "completion ownership", err)
+		return persistAll(err)
 	}
 	providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
 	live, err := c.pullRequests.GetPullRequest(providerCtx, target, pullRequest.Number)
 	cancel()
 	if err != nil {
-		return c.persistForgeEventFailure(ctx, event, "completion ownership", fmt.Errorf("inspect completed pull request: %w", err))
+		return persistAll(fmt.Errorf("inspect completed pull request: %w", err))
 	}
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
-		return c.persistForgeEventFailure(ctx, event, "completion ownership", err)
+		return persistAll(err)
 	}
 	if !providerCommitMatchesDurable(live.HeadSHA, git.CommitSHA) {
 		if providerCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
-			return c.persistForgeEventFailure(ctx, event, "completion ownership", fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA))
+			return persistAll(fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA))
 		}
-		return c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
+		return persistAll(forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
 	}
-	marker := forge.ReplyMarker(event.ID)
-	reply := forge.ReplyRequest{
-		PullRequestNumber: pullRequest.Number,
-		Body:              marker + " A fix was pushed in durable commit " + git.CommitSHA + "; quality gates are rerunning.",
-	}
-	if event.Kind == "review_comment" && event.CommentID > 0 {
-		reply.CommentID = event.CommentID
-		reply.CommentKind = event.CommentKind
-	}
-	providerCtx, cancel = context.WithTimeout(ctx, c.providerTimeout)
-	exists, err := c.pullRequests.PullRequestReplyExists(providerCtx, target, reply, marker)
-	cancel()
-	if err != nil {
-		return c.persistForgeEventFailure(ctx, event, "reply check", fmt.Errorf("check provider reply marker: %w", err))
-	}
-	if !exists {
+	var persistenceErrors []error
+	for _, event := range due {
+		if event.TaskID != record.ID {
+			if err := c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q is not running for task %q", store.ErrConflict, event.ID, record.ID))); err != nil {
+				persistenceErrors = append(persistenceErrors, err)
+			}
+			continue
+		}
+		if event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number || !sameForgeCoordinates(event, target) {
+			if err := c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q does not match durable pull request ownership", store.ErrConflict, event.ID))); err != nil {
+				persistenceErrors = append(persistenceErrors, err)
+			}
+			continue
+		}
+		marker := forge.ReplyMarker(event.ID)
+		body := "A fix was pushed in durable commit " + git.CommitSHA + "; quality gates are rerunning."
+		if strings.TrimSpace(event.ReplyDraft) != "" && !forge.ContainsReplyMarker(event.ReplyDraft) {
+			body = event.ReplyDraft
+		}
+		reply := forge.ReplyRequest{PullRequestNumber: pullRequest.Number, Body: marker + " " + body}
+		if event.Kind == "review_comment" && event.CommentID > 0 {
+			reply.CommentID = event.CommentID
+			reply.CommentKind = event.CommentKind
+		}
 		providerCtx, cancel = context.WithTimeout(ctx, c.providerTimeout)
-		err = c.pullRequests.ReplyToPullRequest(providerCtx, target, reply)
+		exists, replyErr := c.pullRequests.PullRequestReplyExists(providerCtx, target, reply, marker)
 		cancel()
-		if err != nil {
-			return c.persistForgeEventFailure(ctx, event, "reply post", fmt.Errorf("post provider reply: %w", err))
+		if replyErr != nil {
+			if err := c.persistForgeEventReplyFailure(ctx, event, "reply check", fmt.Errorf("check provider reply marker: %w", replyErr)); err != nil {
+				persistenceErrors = append(persistenceErrors, err)
+			}
+			continue
 		}
-		// A provider with eventually consistent comment reads can still expose a
-		// duplicate only if the process dies here and the marker is not yet visible.
+		if !exists {
+			providerCtx, cancel = context.WithTimeout(ctx, c.providerTimeout)
+			replyErr = c.pullRequests.ReplyToPullRequest(providerCtx, target, reply)
+			cancel()
+			if replyErr != nil {
+				if err := c.persistForgeEventReplyFailure(ctx, event, "reply post", fmt.Errorf("post provider reply: %w", replyErr)); err != nil {
+					persistenceErrors = append(persistenceErrors, err)
+				}
+				continue
+			}
+			// A provider with eventually consistent comment reads can still expose a
+			// duplicate only if the process dies here and the marker is not yet visible.
+		}
+		if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
+			persistenceErrors = append(persistenceErrors, forgeEventPersistenceError{err})
+			continue
+		}
+		c.logger.InfoContext(ctx, "forge follow-up reply handled", "task", record.ID, "attempt", attempt.ID, "forge_event", event.ID, "already_exists", exists)
 	}
-	if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
-		return forgeEventPersistenceError{err}
-	}
-	c.logger.InfoContext(ctx, "forge follow-up reply handled", "task", record.ID, "attempt", attempt.ID, "forge_event", event.ID, "already_exists", exists)
-	return nil
+	return errors.Join(persistenceErrors...)
 }
 
 func providerCommitMatchesDurable(providerSHA, durableSHA string) bool {
@@ -598,30 +689,53 @@ func sameForgeCoordinates(event store.ForgeEvent, target forge.Target) bool {
 		strings.EqualFold(event.Owner, target.Owner) && strings.EqualFold(event.Repository, target.Repository)
 }
 
-func forgeFollowUpPrompt(original string, event store.ForgeEvent) string {
-	parts := []string{
-		"Original task: " + boundedForgeText(original, 16<<10),
-		"provider=" + boundedForgeText(event.Provider, 8<<10),
-		"kind=" + boundedForgeText(event.Kind, 8<<10),
-		"title=" + boundedForgeText(event.Title, 8<<10),
-		"body=" + boundedForgeText(event.Body, 32<<10),
-		"author=" + boundedForgeText(event.Author, 8<<10),
-		"url=" + boundedForgeText(event.URL, 8<<10),
+// Leave room below the 96 KiB target for the worker's fixed workflow suffix.
+const forgeFollowUpPromptMaxBytes = 95 << 10
+
+func forgeFollowUpPrompt(original string, events []store.ForgeEvent) string {
+	parts := []string{"Original task: " + boundedForgeText(original, 12<<10)}
+	if len(events) > 0 && events[0].Kind == "review_comment" {
+		parts = append(parts, protocol.ReviewReplyInstruction)
 	}
-	if event.PullRequestNumber > 0 {
-		parts = append(parts, "pull_request="+strconv.Itoa(event.PullRequestNumber))
+
+	fixed := make([]string, len(events))
+	used := len(strings.Join(parts, "; "))
+	for i, event := range events {
+		fields := make([]string, 0, 12)
+		if event.Kind == "review_comment" {
+			fields = append(fields, "comment_id="+strconv.Itoa(event.CommentID))
+		}
+		fields = append(fields,
+			"event_id="+boundedForgeText(event.ID, 128),
+			"provider="+boundedForgeText(event.Provider, 32),
+			"kind="+boundedForgeText(event.Kind, 32),
+		)
+		if event.PullRequestNumber > 0 {
+			fields = append(fields, "pull_request="+strconv.Itoa(event.PullRequestNumber))
+		}
+		if event.CommentKind != "" {
+			fields = append(fields, "comment_kind="+boundedForgeText(event.CommentKind, 32))
+		}
+		if event.CommitSHA != "" {
+			fields = append(fields, "commit="+boundedForgeText(event.CommitSHA, 128))
+		}
+		if event.Branch != "" {
+			fields = append(fields, "branch="+boundedForgeText(event.Branch, 256))
+		}
+		fields = append(fields,
+			"author="+boundedForgeText(event.Author, 256),
+			"url="+boundedForgeText(event.URL, 512),
+			"title="+boundedForgeText(event.Title, 512),
+		)
+		fixed[i] = fmt.Sprintf("forge_event_%d: %s; body=", i+1, strings.Join(fields, "; "))
+		used += len("; ") + len(fixed[i])
 	}
-	if event.CommentID > 0 {
-		parts = append(parts, "comment_id="+strconv.Itoa(event.CommentID))
+	bodyBudget := 0
+	if len(events) > 0 && used < forgeFollowUpPromptMaxBytes {
+		bodyBudget = (forgeFollowUpPromptMaxBytes - used) / len(events)
 	}
-	if event.CommentKind != "" {
-		parts = append(parts, "comment_kind="+boundedForgeText(event.CommentKind, 8<<10))
-	}
-	if event.CommitSHA != "" {
-		parts = append(parts, "commit="+boundedForgeText(event.CommitSHA, 8<<10))
-	}
-	if event.Branch != "" {
-		parts = append(parts, "branch="+boundedForgeText(event.Branch, 8<<10))
+	for i, event := range events {
+		parts = append(parts, fixed[i]+boundedForgeText(event.Body, bodyBudget))
 	}
 	return strings.Join(parts, "; ")
 }

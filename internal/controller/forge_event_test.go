@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -456,6 +457,13 @@ func TestProcessForgeEventsStartsOneOwnedFollowUpWithCurrentPRContext(t *testing
 					t.Errorf("follow-up prompt %q does not contain %q", followUp.Prompt, value)
 				}
 			}
+			mappingInstruction := "JSON object mapping each comment_id"
+			if test.kind == "quality_gate_failed" && strings.Contains(followUp.Prompt, mappingInstruction) {
+				t.Fatalf("quality-gate prompt contains impossible reply mapping instruction: %q", followUp.Prompt)
+			}
+			if test.kind == "review_comment" && !strings.Contains(followUp.Prompt, mappingInstruction) {
+				t.Fatalf("review prompt missing reply mapping instruction: %q", followUp.Prompt)
+			}
 			manifest := followUpManifest(t, fixture, record.ID, followUp)
 			if manifest.BaseBranch != branch || manifest.TaskBranch != branch || manifest.Prompt != followUp.Prompt {
 				t.Fatalf("follow-up manifest = %#v; want current PR branch and immutable attempt prompt", manifest)
@@ -894,6 +902,308 @@ func TestForgeFollowUpBranchPushReusesPullRequestAndRepliesOnce(t *testing.T) {
 	}
 }
 
+func TestProcessForgeEventsBatchesDueReviewComments(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	first := controllerForgeEvent("batch-first", "review_comment", 42)
+	first.Branch = branch
+	first.Title = "First parser issue"
+	first.Body = "Preserve quoted commas in the first parser path"
+	first.Author = "Ada"
+	second := controllerForgeEvent("batch-second", "review_comment", 42)
+	second.Branch = branch
+	second.CommentID = 502
+	second.Title = "Second parser issue"
+	second.Body = "Handle escaped quotes in the second parser path"
+	second.Author = "Grace"
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatalf("put forge event: %v", err)
+		}
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("ProcessForgeEvents(): %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatalf("current follow-up attempt: %v", err)
+	}
+	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
+	if err != nil || len(attempts) != 2 || attempts[1].ID != followUp.ID {
+		t.Fatalf("attempts after comment batch = %#v, %v; want one follow-up attempt", attempts, err)
+	}
+	jobsList, err := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
+	if err != nil || len(jobsList.Items) != 2 {
+		t.Fatalf("Jobs after comment batch = %d, %v; want original plus one follow-up", len(jobsList.Items), err)
+	}
+	for _, event := range []store.ForgeEvent{first, second} {
+		stored, getErr := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if getErr != nil || stored.Status != store.ForgeEventRunning || stored.TaskID != record.ID || stored.AttemptID != followUp.ID {
+			t.Fatalf("batched event = %#v, %v; want shared running attempt %q", stored, getErr, followUp.ID)
+		}
+	}
+	for _, value := range []string{
+		"comment_id=501", first.Body, first.Author, first.Title,
+		"comment_id=502", second.Body, second.Author, second.Title,
+		"final assistant answer exactly a JSON object mapping each comment_id to a concise reply",
+	} {
+		if !strings.Contains(followUp.Prompt, value) {
+			t.Errorf("batched follow-up prompt %q does not contain %q", followUp.Prompt, value)
+		}
+	}
+
+	third := controllerForgeEvent("batch-third", "review_comment", 42)
+	third.Branch = branch
+	third.CommentID = 503
+	third.Title = "Third parser issue"
+	third.Body = "Do not attach this comment to the running batch"
+	third.Author = "Linus"
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, third); err != nil {
+		t.Fatalf("put post-claim forge event: %v", err)
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("ProcessForgeEvents() after batch claim: %v", err)
+	}
+	stored, err := fixture.store.GetForgeEvent(fixture.ctx, third.ID)
+	if err != nil || stored.Status != store.ForgeEventPending || stored.TaskID != "" || stored.AttemptID != "" {
+		t.Fatalf("post-claim event = %#v, %v; want pending and unattached", stored, err)
+	}
+	attempts, err = fixture.store.ListAttempts(fixture.ctx, record.ID)
+	jobsList, jobsErr := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
+	if err != nil || jobsErr != nil || len(attempts) != 2 || len(jobsList.Items) != 2 {
+		t.Fatalf("post-claim event created work: attempts=%#v Jobs=%d errors=%v/%v", attempts, len(jobsList.Items), err, jobsErr)
+	}
+}
+
+func TestForgeFollowUpPromptBoundsMaxBatchAndKeepsCommentContext(t *testing.T) {
+	events := make([]store.ForgeEvent, 32)
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("large-prompt-%02d", i), "review_comment", 42)
+		events[i].CommentID = 1000 + i
+		events[i].Title = strings.Repeat("title", 5000)
+		events[i].Body = fmt.Sprintf("context-%02d %s", i, strings.Repeat("body", 40<<10))
+		events[i].Author = strings.Repeat("author", 5000)
+		events[i].URL = "https://example.invalid/" + strings.Repeat("path", 5000)
+	}
+	prompt := forgeFollowUpPrompt(strings.Repeat("original", 40<<10), events)
+	if len(prompt) > forgeFollowUpPromptMaxBytes {
+		t.Fatalf("follow-up prompt is %d bytes, want at most %d", len(prompt), forgeFollowUpPromptMaxBytes)
+	}
+	for i, event := range events {
+		for _, want := range []string{"comment_id=" + fmt.Sprint(event.CommentID), fmt.Sprintf("context-%02d", i)} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("bounded prompt omitted %q for event %d", want, i)
+			}
+		}
+	}
+}
+
+func TestProcessForgeEventsExpandsBatchBeyondGlobalSeedWindow(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	for i := range 31 {
+		event := controllerForgeEvent(fmt.Sprintf("window-other-%02d", i), "review_comment", 777)
+		event.CommentID = 2000 + i
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := controllerForgeEvent("window-owned-first", "review_comment", 42)
+	first.Branch, first.CommentID = branch, 3001
+	second := first
+	second.ID, second.CommentID = "window-owned-second", 3002
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("ProcessForgeEvents(): %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []store.ForgeEvent{first, second} {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventRunning || stored.AttemptID != followUp.ID {
+			t.Fatalf("expanded batch event = %#v, %v; want shared attempt %q", stored, err, followUp.ID)
+		}
+	}
+}
+
+func TestForgeBatchCompletionUsesRepliesAndFallback(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	first := controllerForgeEvent("completion-first", "review_comment", 42)
+	first.Branch = branch
+	first.CommentID = 601
+	first.Title = "Generated reply"
+	first.Body = "Use the generated draft for this thread"
+	second := controllerForgeEvent("completion-second", "review_comment", 42)
+	second.Branch = branch
+	second.CommentID = 602
+	second.Title = "Fallback reply"
+	second.Body = "Use the commit fallback for this thread"
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatalf("put forge event: %v", err)
+		}
+	}
+
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("start comment batch: %v", err)
+	}
+	followUp := startCurrentAttemptWorker(t, fixture, record.ID)
+	jobName, podName := jobs.Name(record.ID, followUp.Number), "worker-pod-a2"
+	for _, workerEvent := range []protocol.Event{
+		{Type: "agent_started", TaskID: record.ID},
+		{Type: "validation_started", TaskID: record.ID},
+		{Type: "validation_result", TaskID: record.ID},
+		{Type: "validation_succeeded", TaskID: record.ID},
+	} {
+		handleEvent(t, fixture, jobName, podName, workerEvent)
+	}
+	generated := "The parser now preserves the quoted value."
+	branchPushed := protocol.Event{
+		Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA,
+		Replies: map[int]string{first.CommentID: generated},
+	}
+	handleEvent(t, fixture, jobName, podName, branchPushed)
+
+	if len(fixture.pullRequests.replies) != 2 {
+		t.Fatalf("batch completion replies = %d; want one per comment", len(fixture.pullRequests.replies))
+	}
+	replies := make(map[int]forge.ReplyRequest, len(fixture.pullRequests.replies))
+	for _, reply := range fixture.pullRequests.replies {
+		replies[reply.CommentID] = reply
+	}
+	generatedReply, ok := replies[first.CommentID]
+	if !ok || !strings.Contains(generatedReply.Body, generated) || !strings.Contains(generatedReply.Body, forge.ReplyMarker(first.ID)) {
+		t.Fatalf("generated thread reply = %#v; want generated draft and marker", generatedReply)
+	}
+	fallbackReply, ok := replies[second.CommentID]
+	wantFallback := "A fix was pushed in durable commit " + fullCommitSHA + "; quality gates are rerunning."
+	if !ok || !strings.Contains(fallbackReply.Body, wantFallback) || !strings.Contains(fallbackReply.Body, forge.ReplyMarker(second.ID)) {
+		t.Fatalf("fallback thread reply = %#v; want commit fallback and marker", fallbackReply)
+	}
+	for _, event := range []store.ForgeEvent{first, second} {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventHandled || stored.AttemptID != followUp.ID || stored.HandledAt == nil {
+			t.Fatalf("completed batch event = %#v, %v; want handled on attempt %q", stored, err, followUp.ID)
+		}
+	}
+
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET status = 'running', handled_at = NULL WHERE attempt_id = ?`, followUp.ID)
+	fixture.pullRequests.replyExists = true
+	beforeReplay := len(fixture.pullRequests.replies)
+	replay := branchPushed
+	replay.Replies = nil
+	handleEvent(t, fixture, jobName, podName, replay)
+	if len(fixture.pullRequests.replies) != beforeReplay {
+		t.Fatalf("marker-idempotent replay posted %d additional replies", len(fixture.pullRequests.replies)-beforeReplay)
+	}
+	for _, event := range []store.ForgeEvent{first, second} {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventHandled {
+			t.Fatalf("replayed batch event = %#v, %v; want handled", stored, err)
+		}
+	}
+}
+
+func TestForgeBatchCompletionRejectsGeneratedSiblingMarker(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	first := controllerForgeEvent("marker-injection-first", "review_comment", 42)
+	first.Branch, first.CommentID = branch, 651
+	second := first
+	second.ID, second.CommentID = "marker-injection-second", 652
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.RecordForgeEventReplies(fixture.ctx, followUp.ID, map[int]string{
+		first.CommentID: "Generated text containing " + forge.ReplyMarker(second.ID),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recordPushedFollowUp(t, fixture, followUp)
+	fixture.pullRequests.replyExistsInPosts = true
+	if err := control.completeForgeEventLocked(fixture.ctx, getTask(t, fixture, record.ID), followUp); err != nil {
+		t.Fatalf("complete marker-injection batch: %v", err)
+	}
+
+	if len(fixture.pullRequests.replies) != 2 {
+		t.Fatalf("batch replies = %#v; want a real reply for both events", fixture.pullRequests.replies)
+	}
+	wantFallback := "A fix was pushed in durable commit " + fullCommitSHA + "; quality gates are rerunning."
+	for i, event := range []store.ForgeEvent{first, second} {
+		reply := fixture.pullRequests.replies[i]
+		if reply.CommentID != event.CommentID || !strings.HasPrefix(reply.Body, forge.ReplyMarker(event.ID)+" ") || !strings.Contains(reply.Body, wantFallback) {
+			t.Fatalf("reply %d = %#v; want event-owned marker and durable fallback", i, reply)
+		}
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventHandled {
+			t.Fatalf("event %q = %#v, %v; want handled after its own reply", event.ID, stored, err)
+		}
+	}
+	if strings.Contains(fixture.pullRequests.replies[0].Body, forge.ReplyMarker(second.ID)) {
+		t.Fatal("generated sibling marker reached the first provider reply")
+	}
+}
+
+func TestForgeBatchCompletionIsolatesPermanentReplyFailure(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	first := controllerForgeEvent("mixed-reply-failed", "review_comment", 42)
+	first.Branch, first.CommentID = branch, 701
+	second := first
+	second.ID, second.CommentID = "mixed-reply-handled", 702
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordPushedFollowUp(t, fixture, followUp)
+	fixture.pullRequests.replyErrByID = map[int]error{first.CommentID: forge.MarkPermanent(errors.New("provider rejected thread"))}
+	if err := control.completeForgeEventLocked(fixture.ctx, getTask(t, fixture, record.ID), followUp); err != nil {
+		t.Fatalf("complete mixed reply batch: %v", err)
+	}
+	failed, failedErr := fixture.store.GetForgeEvent(fixture.ctx, first.ID)
+	handled, handledErr := fixture.store.GetForgeEvent(fixture.ctx, second.ID)
+	current := getTask(t, fixture, record.ID)
+	if failedErr != nil || failed.Status != store.ForgeEventFailed || failed.FailedAt == nil {
+		t.Fatalf("permanent reply event = %#v, %v", failed, failedErr)
+	}
+	if handledErr != nil || handled.Status != store.ForgeEventHandled || handled.HandledAt == nil {
+		t.Fatalf("successful sibling = %#v, %v", handled, handledErr)
+	}
+	if current.CancellationRequested {
+		t.Fatalf("permanent reply failure requested task cancellation: %#v", current)
+	}
+}
+
 func TestForgeFollowUpChangesRequestRepliesGenerallyOnce(t *testing.T) {
 	fixture := newFixture(t)
 	record, _, branch := createOwnedOpenPullRequest(t, fixture)
@@ -1052,9 +1362,9 @@ func TestForgeReplyProviderFailuresAreIsolatedAndRecoveryContinues(t *testing.T)
 			current, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
 			if test.wantStatus == store.ForgeEventFailed {
 				taskRecord := getTask(t, fixture, record.ID)
-				pending, getErr := fixture.store.GetForgeEvent(fixture.ctx, next.ID)
-				if err != nil || getErr != nil || current.ID != followUp.ID || !taskRecord.CancellationRequested || pending.Status != store.ForgeEventPending {
-					t.Fatalf("next event after permanent failure escaped cancellation: current=%#v task=%#v event=%#v errors=%v/%v", current, taskRecord, pending, err, getErr)
+				started, getErr := fixture.store.GetForgeEvent(fixture.ctx, next.ID)
+				if err != nil || getErr != nil || current.ID == followUp.ID || taskRecord.CancellationRequested || started.Status != store.ForgeEventRunning || started.AttemptID != current.ID {
+					t.Fatalf("next event after isolated permanent reply failure: current=%#v task=%#v event=%#v errors=%v/%v", current, taskRecord, started, err, getErr)
 				}
 			} else if err != nil || current.ID != followUp.ID {
 				t.Fatalf("transient failure allowed next same-task event: %#v, %v", current, err)
@@ -1090,6 +1400,7 @@ func TestRunningForgeEventRecoversMarkedReplyWithoutSecondPost(t *testing.T) {
 	}
 	fixture.pullRequests.replyErr = nil
 	fixture.pullRequests.replyExists = true
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), event.ID)
 	running, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	if err != nil {
 		t.Fatal(err)

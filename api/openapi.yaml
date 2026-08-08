@@ -405,7 +405,15 @@ components:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
     WebhookAccepted:
-      description: Valid delivery accepted for asynchronous processing, including deliveries for irrelevant event kinds.
+      description: |
+        Valid delivery is durably accepted immediately for asynchronous processing,
+        including deliveries for irrelevant event kinds. Actionable review_comment
+        deliveries may wait in a sliding 30-minute quiet-period batch; each matching
+        new comment resets the quiet period. Review batches contain at most 32 comments;
+        larger quiet-period groups are handled in consecutive oldest-first batches.
+        Provider comments without a head SHA are delayed individually and never batched.
+        quality_gate_failed deliveries are not batched and remain immediately eligible.
+        After one follow-up attempt, replies are posted to each original review thread.
     WebhookBadRequest:
       description: Webhook headers or JSON payload are malformed.
       content:

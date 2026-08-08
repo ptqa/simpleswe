@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,9 +22,20 @@ import (
 
 const runnerTaskBranch = "simpleswe/task-42"
 
+var gitRepositoryEnvironmentVariables = [...]string{
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+	"GIT_COMMON_DIR",
+	"GIT_PREFIX",
+}
+
 func TestRunnerCompletesWorkerPipeline(t *testing.T) {
 	fixture := newGitFixture(t)
 	tmp := t.TempDir()
+	const replySecret = "reply-secret"
 	workspace := filepath.Join(tmp, "workspace")
 	opencodeLog := filepath.Join(tmp, "opencode.log")
 	validationLog := filepath.Join(tmp, "validation.log")
@@ -31,7 +43,7 @@ func TestRunnerCompletesWorkerPipeline(t *testing.T) {
 	t.Setenv("OPENCODE_LOG", opencodeLog)
 	t.Setenv("VALIDATION_LOG", validationLog)
 
-	opencode := writeExecutable(t, tmp, "fake-opencode", `#!/bin/sh
+	opencode := writeExecutable(t, tmp, "opencode", `#!/bin/sh
 set -eu
 {
   printf 'cwd=<%s>\n' "$PWD"
@@ -44,6 +56,7 @@ set -eu
 } >> "$OPENCODE_LOG"
 test -f base.txt
 test ! -e wrong-base.txt
+printf '%s\n' '{"type":"text","timestamp":"2026-01-01T00:00:00Z","sessionID":"fake","part":{"type":"text","text":"{\"101\":\"draft with reply-secret\",\"202\":\"second draft\"}"}}'
 printf 'change made by fake OpenCode\n' > agent.txt
 `)
 	validationOne := writeExecutable(t, tmp, "validate-one", `#!/bin/sh
@@ -63,7 +76,7 @@ test "$(cat base.txt)" = "expected base"
 		BaseBranch:         "release",
 		TaskBranch:         runnerTaskBranch,
 		Prompt:             prompt,
-		OpenCodeCommand:    []string{opencode, "--prompt"},
+		OpenCodeCommand:    []string{opencode, "run", "--prompt"},
 		ValidationCommands: [][]string{{validationOne, "alpha beta"}, {validationTwo, "gamma;delta"}},
 		MaxFixAttempts:     2,
 	})
@@ -73,6 +86,7 @@ test "$(cat base.txt)" = "expected base"
 		ManifestPath: manifestPath,
 		WorkspaceDir: workspace,
 		Output:       &output,
+		Secrets:      []string{replySecret},
 	}
 	if err := runner.Run(context.Background()); err != nil {
 		t.Fatalf("run worker pipeline: %v\noutput:\n%s", err, output.String())
@@ -84,9 +98,12 @@ test "$(cat base.txt)" = "expected base"
 	opencodeOutput := readFile(t, opencodeLog)
 	for _, want := range []string{
 		"cwd=<" + workspace + ">",
-		"argc=<2>",
-		"arg1=<--prompt>",
-		"arg2=<" + agentPrompt(prompt) + ">",
+		"argc=<5>",
+		"arg1=<run>",
+		"arg2=<--prompt>",
+		"arg3=<--format>",
+		"arg4=<json>",
+		"arg5=<" + agentPrompt(prompt) + ">",
 	} {
 		if !strings.Contains(opencodeOutput, want) {
 			t.Errorf("OpenCode invocation missing %q:\n%s", want, opencodeOutput)
@@ -133,13 +150,21 @@ test "$(cat base.txt)" = "expected base"
 	if push.Branch != runnerTaskBranch || push.CommitSHA != commit {
 		t.Errorf("branch_pushed event: got branch=%q commit=%q, want branch=%q commit=%q", push.Branch, push.CommitSHA, runnerTaskBranch, commit)
 	}
+	wantReplies := map[int]string{101: "draft with " + redaction.Placeholder, 202: "second draft"}
+	if len(push.Replies) != len(wantReplies) || push.Replies[101] != wantReplies[101] || push.Replies[202] != wantReplies[202] {
+		t.Errorf("branch_pushed replies: got %#v, want %#v", push.Replies, wantReplies)
+	}
+	if strings.Contains(output.String(), replySecret) {
+		t.Fatalf("worker output leaked reply secret:\n%s", output.String())
+	}
 }
 
-func TestRunnerAcceptsCommitCreatedByOpenCode(t *testing.T) {
+func TestRunnerCapturesMalformedOutputFallback(t *testing.T) {
 	fixture := newGitFixture(t)
 	tmp := t.TempDir()
 	opencode := writeExecutable(t, tmp, "fake-opencode-commit", `#!/bin/sh
 set -eu
+printf '%s\n' '{"type":"text","part":{"type":"text","text":"not an object"}}'
 printf 'committed by fake OpenCode\n' > agent.txt
 git add agent.txt
 git commit -m 'fix: agent-owned change'
@@ -159,6 +184,182 @@ git commit -m 'fix: agent-owned change'
 	}
 	if got := gitOutput(t, "--git-dir", fixture.remote, "rev-parse", commit+"^"); got != fixture.baseCommit {
 		t.Errorf("task commit parent: got %s, want %s", got, fixture.baseCommit)
+	}
+	events := runnerEvents(t, output.String())
+	pushIndex := eventIndex(events, protocol.EventBranchPushed)
+	if pushIndex < 0 {
+		t.Fatalf("branch_pushed event missing: %#v", eventTypes(events))
+	}
+	if events[pushIndex].Replies != nil {
+		t.Fatalf("malformed OpenCode output produced replies: %#v", events[pushIndex].Replies)
+	}
+}
+
+func TestRunnerClearsInitialRepliesWhenValidationFixHasNoValidMapping(t *testing.T) {
+	fixture := newGitFixture(t)
+	tmp := t.TempDir()
+	opencodeCount := filepath.Join(tmp, "opencode-count")
+	validationCount := filepath.Join(tmp, "validation-count")
+	t.Setenv("OPENCODE_COUNT", opencodeCount)
+	t.Setenv("VALIDATION_COUNT", validationCount)
+	opencode := writeExecutable(t, tmp, "fake-opencode-stale-replies", `#!/bin/sh
+set -eu
+count=0
+if test -f "$OPENCODE_COUNT"; then count=$(cat "$OPENCODE_COUNT"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$OPENCODE_COUNT"
+if test "$count" -eq 1; then
+  printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"101\":\"stale draft\"}"}}'
+  printf 'initial change\n' > agent.txt
+else
+  printf '%s\n' '{"type":"text","part":{"type":"text","text":"validation fixed without reply JSON"}}'
+fi
+`)
+	validation := writeExecutable(t, tmp, "validate-after-fix", `#!/bin/sh
+set -eu
+count=0
+if test -f "$VALIDATION_COUNT"; then count=$(cat "$VALIDATION_COUNT"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$VALIDATION_COUNT"
+test "$count" -gt 1
+`)
+	manifest := baseRunnerManifest(fixture.remote, opencode, validation)
+	manifest.MaxFixAttempts = 1
+	manifestPath := writeManifest(t, tmp, manifest)
+	var output bytes.Buffer
+	if err := (Runner{ManifestPath: manifestPath, WorkspaceDir: filepath.Join(tmp, "workspace"), Output: &output}).Run(context.Background()); err != nil {
+		t.Fatalf("run validation-fix pipeline: %v\n%s", err, output.String())
+	}
+	events := runnerEvents(t, output.String())
+	push := events[eventIndex(events, protocol.EventBranchPushed)]
+	if push.Replies != nil {
+		t.Fatalf("validation fix retained stale replies: %#v", push.Replies)
+	}
+}
+
+func TestRunnerValidationFixRetainsForgeReviewPromptAndReplacesReplies(t *testing.T) {
+	fixture := newGitFixture(t)
+	tmp := t.TempDir()
+	opencodeCount := filepath.Join(tmp, "opencode-count")
+	validationCount := filepath.Join(tmp, "validation-count")
+	t.Setenv("OPENCODE_COUNT", opencodeCount)
+	t.Setenv("VALIDATION_COUNT", validationCount)
+	t.Setenv("REVIEW_INSTRUCTION", protocol.ReviewReplyInstruction)
+	opencode := writeExecutable(t, tmp, "opencode", `#!/bin/sh
+set -eu
+count=0
+if test -f "$OPENCODE_COUNT"; then count=$(cat "$OPENCODE_COUNT"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$OPENCODE_COUNT"
+prompt=
+for arg do prompt=$arg; done
+if test "$count" -eq 1; then
+  printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"101\":\"stale draft\"}"}}'
+  printf 'initial review fix\n' > agent.txt
+else
+  case "$prompt" in *"comment_id=101"*) ;; *) exit 21 ;; esac
+  case "$prompt" in *"comment_id=202"*) ;; *) exit 22 ;; esac
+  case "$prompt" in *"first exact review context"*) ;; *) exit 23 ;; esac
+  case "$prompt" in *"second exact review context"*) ;; *) exit 24 ;; esac
+  case "$prompt" in *"$REVIEW_INSTRUCTION"*) ;; *) exit 25 ;; esac
+  case "$prompt" in *"bounded validation failure"*) ;; *) exit 26 ;; esac
+  printf '%s\n' '{"type":"text","part":{"type":"text","text":"{\"101\":\"fresh first reply\",\"202\":\"fresh second reply\"}"}}'
+fi
+`)
+	validation := writeExecutable(t, tmp, "validate-after-review-fix", `#!/bin/sh
+set -eu
+count=0
+if test -f "$VALIDATION_COUNT"; then count=$(cat "$VALIDATION_COUNT"); fi
+count=$((count + 1))
+printf '%s' "$count" > "$VALIDATION_COUNT"
+if test "$count" -eq 1; then
+  printf '%s\n' 'bounded validation failure' >&2
+  exit 1
+fi
+`)
+	reviewPrompt := "Original task: fix the parser; " + protocol.ReviewReplyInstruction +
+		"; forge_event_1: comment_id=101; body=first exact review context" +
+		"; forge_event_2: comment_id=202; body=second exact review context"
+	manifest := baseRunnerManifest(fixture.remote, opencode, validation)
+	manifest.Prompt = reviewPrompt
+	manifest.OpenCodeCommand = []string{opencode, "run", "--prompt"}
+	manifest.MaxFixAttempts = 1
+	manifestPath := writeManifest(t, tmp, manifest)
+	var output bytes.Buffer
+	if err := (Runner{ManifestPath: manifestPath, WorkspaceDir: filepath.Join(tmp, "workspace"), Output: &output}).Run(context.Background()); err != nil {
+		t.Fatalf("run review validation-fix pipeline: %v\n%s", err, output.String())
+	}
+	events := runnerEvents(t, output.String())
+	push := events[eventIndex(events, protocol.EventBranchPushed)]
+	want := map[int]string{101: "fresh first reply", 202: "fresh second reply"}
+	if !reflect.DeepEqual(push.Replies, want) {
+		t.Fatalf("validation-fix replies = %#v; want %#v", push.Replies, want)
+	}
+}
+
+func TestOpenCodeCommandInjectsJSONOnlyForRunInvocation(t *testing.T) {
+	prompt := "prompt"
+	for _, test := range []struct {
+		name    string
+		command []string
+		want    []string
+	}{
+		{name: "OpenCode run", command: []string{"opencode", "run", "--model", "test"}, want: []string{"opencode", "run", "--model", "test", "--format", "json", prompt}},
+		{name: "existing split format", command: []string{"opencode", "run", "--format", "text"}, want: []string{"opencode", "run", "--format", "text", prompt}},
+		{name: "existing equals format", command: []string{"opencode", "run", "--format=json"}, want: []string{"opencode", "run", "--format=json", prompt}},
+		{name: "custom wrapper", command: []string{"custom-wrapper", "--task"}, want: []string{"custom-wrapper", "--task", prompt}},
+		{name: "wrapper with literal run", command: []string{"company-wrapper", "run", "--model", "test"}, want: []string{"company-wrapper", "run", "--model", "test", prompt}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := openCodeCommand(test.command, prompt); fmt.Sprint(got) != fmt.Sprint(test.want) {
+				t.Fatalf("openCodeCommand() = %#v, want %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestParseOpenCodeRepliesAcceptsNearMaximumMappingAndRejectsControls(t *testing.T) {
+	drafts := make(map[int]string, 32)
+	for i := 1; i <= 32; i++ {
+		drafts[i] = strings.Repeat(`\`, 2<<10)
+	}
+	mapping, err := json.Marshal(drafts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := json.Marshal(map[string]any{"type": "text", "part": map[string]any{"type": "text", "text": string(mapping)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line) <= DefaultCommandOutputLimit || len(line) >= openCodeOutputLimit {
+		t.Fatalf("near-maximum OpenCode event size = %d, want between %d and %d", len(line), DefaultCommandOutputLimit, openCodeOutputLimit)
+	}
+	got := parseOpenCodeReplies(string(line))
+	if len(got) != len(drafts) || got[32] != drafts[32] {
+		t.Fatalf("near-maximum replies parsed as %d entries", len(got))
+	}
+	for _, draft := range []string{"line\nfeed", "unicode\u0085control"} {
+		controlled, err := json.Marshal(map[int]string{1: draft})
+		if err != nil {
+			t.Fatal(err)
+		}
+		event, err := json.Marshal(map[string]any{"type": "text", "part": map[string]any{"type": "text", "text": string(controlled)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replies := parseOpenCodeReplies(string(event)); replies != nil {
+			t.Fatalf("control-containing draft was parsed: %#v", replies)
+		}
+	}
+}
+
+func TestNewBranchPushedEventFallsBackWhenRedactionGrowsDraft(t *testing.T) {
+	event, err := newBranchPushedEvent("task", runnerTaskBranch, strings.Repeat("a", 40), map[int]string{1: strings.Repeat("x", 2<<10)}, []string{"x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.Replies != nil {
+		t.Fatalf("oversized redacted replies were emitted: %#v", event.Replies)
 	}
 }
 
@@ -476,11 +677,26 @@ func newGitFixture(t *testing.T) gitFixture {
 
 func configureGitEnvironment(t *testing.T) {
 	t.Helper()
+	for _, name := range gitRepositoryEnvironmentVariables {
+		value, present := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("unset %s: %v", name, err)
+		}
+		t.Cleanup(func() {
+			if present {
+				_ = os.Setenv(name, value)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
 	t.Setenv("GIT_AUTHOR_NAME", "SimpleSWE Worker")
 	t.Setenv("GIT_AUTHOR_EMAIL", "worker@simpleswe.invalid")
 	t.Setenv("GIT_COMMITTER_NAME", "SimpleSWE Worker")
 	t.Setenv("GIT_COMMITTER_EMAIL", "worker@simpleswe.invalid")
 	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+	// Fixture repositories have no pre-commit config; allow their child commits without disabling the outer hook.
+	t.Setenv("PRE_COMMIT_ALLOW_NO_CONFIG", "1")
 	// A push without an explicit refspec must fail, so a passing pipeline proves
 	// it selected the task branch rather than relying on Git's push default.
 	t.Setenv("GIT_CONFIG_COUNT", "1")
@@ -568,11 +784,30 @@ func gitCommand(t *testing.T, dir string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	environment := os.Environ()
+	filtered := environment[:0]
+	for _, value := range environment {
+		name, _, _ := strings.Cut(value, "=")
+		if isGitRepositoryEnvironmentVariable(name) {
+			continue
+		}
+		filtered = append(filtered, value)
+	}
+	cmd.Env = filtered
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func isGitRepositoryEnvironmentVariable(name string) bool {
+	for _, variable := range gitRepositoryEnvironmentVariables {
+		if name == variable {
+			return true
+		}
+	}
+	return false
 }
 
 func gitOutput(t *testing.T, args ...string) string {

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/simpleswe/simpleswe/internal/redaction"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -28,6 +29,7 @@ type Runner struct {
 
 const (
 	validationFixPromptLimit  = 32 << 10
+	openCodeOutputLimit       = 512 << 10
 	streamChunkBytes          = 8 << 10
 	agentWorkflowInstructions = "You may commit changes locally and must fix any pre-commit hook failures. Do not push commits or branches, and do not create or update pull requests; the outer SimpleSWE orchestrator handles those steps."
 )
@@ -68,6 +70,9 @@ func (r Runner) Run(ctx context.Context) error {
 	run := func(argv []string) (CommandResult, error) {
 		return runStreamingCommand(ctx, r.WorkspaceDir, argv, output, r.Secrets, r.OutputTailBytes)
 	}
+	runOpenCode := func(argv []string) (CommandResult, error) {
+		return runStreamingCommand(ctx, r.WorkspaceDir, argv, output, r.Secrets, max(r.OutputTailBytes, openCodeOutputLimit))
+	}
 	runOutsideWorkspace := func(argv []string) (CommandResult, error) {
 		return runStreamingCommand(ctx, "", argv, output, r.Secrets, r.OutputTailBytes)
 	}
@@ -94,7 +99,7 @@ func (r Runner) Run(ctx context.Context) error {
 		return commandFailure(ctx, "check out task branch", err)
 	}
 
-	initialCommand := appendCommandArgument(manifest.OpenCodeCommand, agentPrompt(manifest.Prompt))
+	initialCommand := openCodeCommand(manifest.OpenCodeCommand, agentPrompt(manifest.Prompt))
 	if err := emitEvent(output, r.Secrets, protocol.Event{
 		Type:      protocol.EventAgentStarted,
 		TaskID:    manifest.TaskID,
@@ -104,9 +109,11 @@ func (r Runner) Run(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
-	if _, err := run(initialCommand); err != nil {
+	initialResult, err := runOpenCode(initialCommand)
+	if err != nil {
 		return commandFailure(ctx, "run OpenCode", err)
 	}
+	replies := parseOpenCodeReplies(initialResult.Stdout)
 	changed, err := repositoryChanged(ctx, run)
 	if err != nil {
 		return err
@@ -149,8 +156,8 @@ func (r Runner) Run(ctx context.Context) error {
 			break
 		}
 
-		fixPrompt := validationFixPrompt(failure.summary)
-		fixCommand := appendCommandArgument(manifest.OpenCodeCommand, agentPrompt(fixPrompt))
+		fixPrompt := validationFixPromptForTask(manifest.Prompt, failure.summary)
+		fixCommand := openCodeCommand(manifest.OpenCodeCommand, agentPrompt(fixPrompt))
 		if err := emitEvent(output, r.Secrets, protocol.Event{
 			Type:      protocol.EventAgentStarted,
 			TaskID:    manifest.TaskID,
@@ -160,9 +167,11 @@ func (r Runner) Run(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
-		if _, err := run(fixCommand); err != nil {
+		fixResult, err := runOpenCode(fixCommand)
+		if err != nil {
 			return commandFailure(ctx, "run OpenCode validation fix", err)
 		}
+		replies = parseOpenCodeReplies(fixResult.Stdout)
 	}
 	if lastFailure != nil {
 		if err := emitEvent(output, r.Secrets, protocol.Event{
@@ -215,14 +224,8 @@ func (r Runner) Run(ctx context.Context) error {
 	if _, err := run([]string{"git", "push", "origin", "HEAD:refs/heads/" + manifest.TaskBranch}); err != nil {
 		return commandFailure(ctx, "push task branch", err)
 	}
-	branchEvent := protocol.Event{
-		Type:      protocol.EventBranchPushed,
-		TaskID:    manifest.TaskID,
-		Timestamp: time.Now().UTC(),
-		Branch:    manifest.TaskBranch,
-		CommitSHA: commit,
-	}
-	if err := protocol.ValidateEvent(branchEvent, manifest.TaskBranch); err != nil {
+	branchEvent, err := newBranchPushedEvent(manifest.TaskID, manifest.TaskBranch, commit, replies, r.Secrets)
+	if err != nil {
 		return err
 	}
 	return emitEvent(output, r.Secrets, branchEvent)
@@ -316,6 +319,14 @@ func validationFixPrompt(failure string) string {
 	return header + tail.String()
 }
 
+func validationFixPromptForTask(originalPrompt, failure string) string {
+	fixPrompt := validationFixPrompt(failure)
+	if strings.Contains(originalPrompt, protocol.ReviewReplyInstruction) && strings.Contains(originalPrompt, "forge_event_1: comment_id=") {
+		return originalPrompt + "\n\n" + fixPrompt
+	}
+	return fixPrompt
+}
+
 func readManifest(path string) (protocol.TaskManifest, error) {
 	// #nosec G304 -- path is the explicit manifest path supplied to the worker.
 	data, err := os.ReadFile(path)
@@ -373,10 +384,69 @@ func requireFreshWorkspace(path string) error {
 	return nil
 }
 
-func appendCommandArgument(command []string, argument string) []string {
-	argv := make([]string, len(command), len(command)+1)
+func openCodeCommand(command []string, prompt string) []string {
+	argv := make([]string, len(command), len(command)+3)
 	copy(argv, command)
-	return append(argv, argument)
+	hasRun, hasFormat := false, false
+	for i, arg := range command {
+		hasRun = hasRun || i > 0 && arg == "run"
+		hasFormat = hasFormat || arg == "--format" || strings.HasPrefix(arg, "--format=")
+	}
+	if len(command) > 0 && filepath.Base(command[0]) == "opencode" && hasRun && !hasFormat {
+		argv = append(argv, "--format", "json")
+	}
+	return append(argv, prompt)
+}
+
+func parseOpenCodeReplies(stdout string) map[int]string {
+	var finalText *string
+	for line := range strings.SplitSeq(stdout, "\n") {
+		var event struct {
+			Type string `json:"type"`
+			Part struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"part"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && event.Type == "text" && event.Part.Type == "text" {
+			text := event.Part.Text
+			finalText = &text
+		}
+	}
+	if finalText == nil || !strings.HasPrefix(strings.TrimSpace(*finalText), "{") {
+		return nil
+	}
+	var drafts map[int]string
+	if err := json.Unmarshal([]byte(*finalText), &drafts); err != nil || drafts == nil || len(drafts) > 32 {
+		return nil
+	}
+	for commentID, draft := range drafts {
+		if commentID <= 0 || strings.TrimSpace(draft) == "" || len(draft) > 2<<10 || strings.IndexFunc(draft, unicode.IsControl) >= 0 {
+			return nil
+		}
+	}
+	return drafts
+}
+
+func newBranchPushedEvent(taskID, branch, commit string, replies map[int]string, secrets []string) (protocol.Event, error) {
+	redacted := make(map[int]string, len(replies))
+	for commentID, draft := range replies {
+		redacted[commentID] = redaction.Redact(draft, secrets)
+	}
+	if replies == nil {
+		redacted = nil
+	}
+	event := protocol.Event{
+		Type: protocol.EventBranchPushed, TaskID: taskID, Timestamp: time.Now().UTC(),
+		Branch: branch, CommitSHA: commit, Replies: redacted,
+	}
+	if err := protocol.ValidateEvent(event, branch); err != nil {
+		event.Replies = nil
+		if fallbackErr := protocol.ValidateEvent(event, branch); fallbackErr != nil {
+			return protocol.Event{}, fmt.Errorf("validate fallback branch_pushed event: %w", fallbackErr)
+		}
+	}
+	return event, nil
 }
 
 func agentPrompt(prompt string) string {

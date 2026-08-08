@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -109,7 +110,8 @@ func TestLoadSecretsIncludesNamedEnvironmentValuesAndMultilineParts(t *testing.T
 }
 
 func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
-	prompt := validationFixPrompt(strings.Repeat("old-output-", validationFixPromptLimit))
+	failure := strings.Repeat("old-output-", validationFixPromptLimit)
+	prompt := validationFixPrompt(failure)
 	if len(prompt) > validationFixPromptLimit {
 		t.Fatalf("fix prompt length = %d; want at most %d", len(prompt), validationFixPromptLimit)
 	}
@@ -118,6 +120,21 @@ func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
 	}
 	if !strings.HasSuffix(prompt, "old-output-") {
 		t.Fatal("fix prompt did not retain validation tail")
+	}
+	if got := validationFixPromptForTask("ordinary task", failure); got != prompt {
+		t.Fatal("non-review validation fix did not retain the compact prompt")
+	}
+}
+
+func TestReviewValidationFixPromptRetainsBoundedOriginalContext(t *testing.T) {
+	prefix := protocol.ReviewReplyInstruction + "; forge_event_1: comment_id=1; body="
+	original := prefix + strings.Repeat("x", (95<<10)-len(prefix))
+	prompt := agentPrompt(validationFixPromptForTask(original, strings.Repeat("failure", validationFixPromptLimit)))
+	if !strings.Contains(prompt, original) {
+		t.Fatal("review validation fix did not retain the immutable original prompt")
+	}
+	if len(prompt) > 128<<10 {
+		t.Fatalf("combined review validation-fix prompt length = %d; want at most %d", len(prompt), 128<<10)
 	}
 }
 
@@ -141,6 +158,62 @@ func TestReadableStreamRedactsSecretSplitAcrossBoundedChunks(t *testing.T) {
 	}
 	if strings.Contains(output.String(), secret) || !strings.Contains(output.String(), redaction.Placeholder) {
 		t.Fatalf("split secret was not redacted: %q", output.String())
+	}
+}
+
+func TestReadableStreamRedactsJSONEscapedSecretAcrossChunkBoundary(t *testing.T) {
+	const secret = "quoted=\"value\" path=C:\\private & <token>\nsecond=\"line\"\\end"
+	secrets := redaction.ExpandSecrets([]string{secret})
+
+	encode := func(text string) string {
+		t.Helper()
+		var output bytes.Buffer
+		encoder := json.NewEncoder(&output)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(map[string]any{
+			"type": "text",
+			"part": map[string]string{"type": "text", "text": text},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return output.String()
+	}
+	var encodedSecret bytes.Buffer
+	secretEncoder := json.NewEncoder(&encodedSecret)
+	secretEncoder.SetEscapeHTML(false)
+	if err := secretEncoder.Encode(secret); err != nil {
+		t.Fatal(err)
+	}
+	escapedSecret := strings.TrimSuffix(encodedSecret.String(), "\n")
+	escapedSecret = escapedSecret[1 : len(escapedSecret)-1]
+	base := encode(secret + strings.Repeat("y", streamChunkBytes))
+	secretStart := strings.Index(base, escapedSecret)
+	filler := strings.Repeat("x", streamChunkBytes-5-secretStart)
+	line := encode(filler + secret + strings.Repeat("y", streamChunkBytes))
+	secretStart = strings.Index(line, escapedSecret)
+	if secretStart != streamChunkBytes-5 {
+		t.Fatalf("escaped secret starts at %d; want %d", secretStart, streamChunkBytes-5)
+	}
+
+	var output bytes.Buffer
+	stream := &readableStream{output: &output, name: "stdout", secrets: secrets}
+	split := secretStart + len(escapedSecret)/2
+	if _, err := stream.Write([]byte(line[:split])); err != nil {
+		t.Fatalf("write first stream chunk: %v", err)
+	}
+	if _, err := stream.Write([]byte(line[split:])); err != nil {
+		t.Fatalf("write second stream chunk: %v", err)
+	}
+	if err := stream.flush(); err != nil {
+		t.Fatalf("flush stream: %v", err)
+	}
+	if !strings.Contains(output.String(), redaction.Placeholder) {
+		t.Fatalf("JSON-escaped secret was not redacted: %q", output.String())
+	}
+	for _, leaked := range secrets {
+		if strings.Contains(output.String(), leaked) {
+			t.Fatalf("expanded secret %q remains in streamed output", leaked)
+		}
 	}
 }
 

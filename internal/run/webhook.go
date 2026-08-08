@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/simpleswe/simpleswe/internal/config"
@@ -20,7 +21,10 @@ import (
 	"github.com/simpleswe/simpleswe/internal/store"
 )
 
-const maxWebhookBodyBytes = 1 << 20
+const (
+	maxWebhookBodyBytes    = 1 << 20
+	forgeReviewQuietWindow = 30 * time.Minute
+)
 
 type webhookHandler struct {
 	store   *store.Store
@@ -138,13 +142,13 @@ func (h webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if actionable {
-		if _, err := h.store.PutForgeEvent(r.Context(), store.ForgeEvent{
+		if _, err := h.store.PutForgeEventAfter(r.Context(), store.ForgeEvent{
 			ID: event.DeliveryID, Provider: string(event.Provider), Kind: event.Kind,
 			Owner: event.Owner, Repository: event.Repository, PullRequestNumber: event.PullRequestNumber,
 			CommitSHA: event.CommitSHA, Branch: event.Branch, CommentID: event.CommentID,
 			CommentKind: event.CommentKind, Title: event.Title, Body: event.Body,
 			Author: event.Author, URL: event.URL,
-		}); err != nil {
+		}, forgeReviewQuietWindow); err != nil {
 			writeWebhookError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}

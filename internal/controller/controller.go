@@ -226,7 +226,7 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 		unlock()
 		return plan.Attempt, nil
 	}
-	if event, eventErr := c.store.GetForgeEventByAttempt(ctx, plan.PreviousAttemptID); eventErr == nil && event.Status == store.ForgeEventRunning {
+	if events, eventErr := c.store.ListForgeEventsByAttempt(ctx, plan.PreviousAttemptID); eventErr == nil && hasRunningForgeEvent(events) {
 		previous, getErr := c.store.GetAttempt(ctx, taskID, plan.PreviousAttemptID)
 		if getErr == nil {
 			getErr = c.verifyAttemptProviderOwnership(ctx, current, previous, "")
@@ -235,7 +235,7 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 			unlock()
 			return store.Attempt{}, getErr
 		}
-	} else if eventErr != nil && !errors.Is(eventErr, store.ErrNotFound) {
+	} else if eventErr != nil {
 		unlock()
 		return store.Attempt{}, eventErr
 	}
@@ -514,9 +514,9 @@ func (c *Controller) prepareAttemptSnapshot(ctx context.Context, taskRecord stor
 		}
 		return snapshot.Job.DeepCopy(), snapshot.Secret.DeepCopy(), nil
 	}
-	if _, err := c.store.GetForgeEventByAttempt(ctx, attempt.ID); err == nil {
+	if events, err := c.store.ListForgeEventsByAttempt(ctx, attempt.ID); err == nil && len(events) > 0 {
 		return nil, nil, forge.MarkPermanent(fmt.Errorf("%w: forge follow-up attempt %q has no immutable snapshot", store.ErrConflict, attempt.ID))
-	} else if !errors.Is(err, store.ErrNotFound) {
+	} else if err != nil {
 		return nil, nil, err
 	}
 	snapshotted, job, secret, err := c.buildAttemptSnapshot(taskRecord, attempt, repository)
@@ -527,6 +527,15 @@ func (c *Controller) prepareAttemptSnapshot(ctx context.Context, taskRecord stor
 		return nil, nil, err
 	}
 	return job, secret, nil
+}
+
+func hasRunningForgeEvent(events []store.ForgeEvent) bool {
+	for _, event := range events {
+		if event.Status == store.ForgeEventRunning {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) buildAttemptSnapshot(taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (store.Attempt, *batchv1.Job, *corev1.Secret, error) {
