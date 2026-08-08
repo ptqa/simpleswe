@@ -53,12 +53,26 @@ func (a *application) draw() {
 	}
 
 	contentRows := height - 2
+	if a.mode == viewLogs {
+		a.drawLogs(root.New(0, 1, width, contentRows))
+		if a.help {
+			a.drawHelp(root)
+		}
+		if a.themePicker {
+			a.drawThemeSwitcher(root)
+		}
+		if a.confirmCancel {
+			a.drawCancelConfirmation(root)
+		}
+		if a.createModal {
+			a.drawCreateTask(root)
+		}
+		a.vx.Render()
+		return
+	}
 	logRows := 0
 	if contentRows >= 10 {
 		logRows = max(4, min(10, contentRows/3))
-		if a.mode == viewLogs {
-			logRows = max(logRows, contentRows/2)
-		}
 	}
 	bodyRows := contentRows - logRows
 	body := root.New(0, 1, width, bodyRows)
@@ -322,6 +336,9 @@ func (a *application) drawLogs(win vaxis.Window) {
 		win.SetCell(col, 0, vaxis.Cell{Character: vaxis.Character{Grapheme: "─", Width: 1}, Style: palette.border})
 	}
 	title := " LOGS "
+	if a.mode == viewLogs {
+		title = " LOG STREAM "
+	}
 	info := fmt.Sprintf("%d buffered", len(a.model.Logs()))
 	if a.wrapLogs {
 		info += "  wrap: on"
