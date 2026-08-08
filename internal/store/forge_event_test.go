@@ -492,6 +492,19 @@ func TestForgeEventQualityIdentityMayBeCommitOnly(t *testing.T) {
 	}
 }
 
+func TestForgeEventAcceptsBitbucketChangesRequestSubtype(t *testing.T) {
+	db := openTestStore(t)
+	event := testForgeEvent("bitbucket:request-changes", "review_comment")
+	event.CommentID, event.CommentKind = 0, "changes_request"
+	stored, err := db.PutForgeEvent(t.Context(), event)
+	if err != nil {
+		t.Fatalf("put Bitbucket changes-request event: %v", err)
+	}
+	if stored.CommentID != 0 || stored.CommentKind != "changes_request" {
+		t.Fatalf("stored Bitbucket changes-request comment identity = %d/%q; want 0/changes_request", stored.CommentID, stored.CommentKind)
+	}
+}
+
 func TestPutForgeEventRejectsMalformedDurableEvents(t *testing.T) {
 	db := openTestStore(t)
 	tests := map[string]func(*ForgeEvent){
@@ -499,7 +512,19 @@ func TestPutForgeEventRejectsMalformedDurableEvents(t *testing.T) {
 		"unsupported kind":              func(event *ForgeEvent) { event.Kind = "push" },
 		"GitHub Bitbucket comment kind": func(event *ForgeEvent) { event.Provider, event.CommentKind = "github", "comment" },
 		"Bitbucket GitHub comment kind": func(event *ForgeEvent) { event.CommentKind = "issue_comment" },
-		"review without comment ID":     func(event *ForgeEvent) { event.CommentID = 0 },
+		"Bitbucket empty review subtype": func(event *ForgeEvent) {
+			event.CommentID, event.CommentKind = 0, ""
+		},
+		"Bitbucket comment subtype without ID": func(event *ForgeEvent) {
+			event.CommentID, event.CommentKind = 0, "comment"
+		},
+		"Bitbucket comment ID without subtype": func(event *ForgeEvent) { event.CommentKind = "" },
+		"Bitbucket changes request with comment ID": func(event *ForgeEvent) {
+			event.CommentKind = "changes_request"
+		},
+		"GitHub Bitbucket changes request": func(event *ForgeEvent) {
+			event.Provider, event.CommentID, event.CommentKind = "github", 0, "changes_request"
+		},
 		"quality with comment identity": func(event *ForgeEvent) { event.Kind = "quality_gate_failed" },
 		"quality without SHA": func(event *ForgeEvent) {
 			event.Kind, event.CommentID, event.CommentKind, event.CommitSHA = "quality_gate_failed", 0, "", ""

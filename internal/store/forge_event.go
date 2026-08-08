@@ -157,10 +157,13 @@ func validateForgeEvent(event ForgeEvent) error {
 		}
 		return nil
 	}
-	if event.PullRequestNumber <= 0 || event.CommentID <= 0 {
+	if event.PullRequestNumber <= 0 {
 		return errors.New("forge review event pull request and comment IDs must be positive")
 	}
 	if event.Provider == string(forge.ProviderGitHub) {
+		if event.CommentID <= 0 {
+			return errors.New("forge review event pull request and comment IDs must be positive")
+		}
 		switch event.CommentKind {
 		case "issue_comment", "review_comment", "review":
 			return nil
@@ -168,10 +171,10 @@ func validateForgeEvent(event ForgeEvent) error {
 			return fmt.Errorf("forge GitHub comment kind %q is not supported", event.CommentKind)
 		}
 	}
-	if event.CommentKind != "comment" {
-		return fmt.Errorf("forge Bitbucket comment kind %q is not supported", event.CommentKind)
+	if event.CommentID > 0 && event.CommentKind == "comment" || event.CommentID == 0 && event.CommentKind == "changes_request" {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("forge Bitbucket comment identity %d/%q is not supported", event.CommentID, event.CommentKind)
 }
 
 func (s *Store) GetForgeEvent(ctx context.Context, id string) (ForgeEvent, error) {

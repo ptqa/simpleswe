@@ -73,6 +73,12 @@ func TestWebhookHTTPReception(t *testing.T) {
 			method: http.MethodPost, signature: "valid", wantStatus: http.StatusAccepted, wantEvent: true,
 		},
 		{
+			name:     "signed actionable Bitbucket changes request",
+			provider: "bitbucket", path: "/v1/webhooks/bitbucket", secret: bitbucketWebhookSecret,
+			delivery: "bitbucket-changes-request-1", event: "pullrequest:changes_request_created", body: []byte(bitbucketChangesRequestPayload),
+			method: http.MethodPost, signature: "valid", wantStatus: http.StatusAccepted, wantEvent: true,
+		},
+		{
 			name:     "invalid signature is checked before JSON",
 			provider: "github", path: "/v1/webhooks/github", secret: githubWebhookSecret,
 			delivery: "github-invalid-signature", event: "issue_comment", body: []byte(`{"action":`),
@@ -529,3 +535,5 @@ const githubActionablePayload = `{"action":"created","issue":{"number":42,"title
 const bitbucketActionablePayload = `{"comment":{"id":501,"content":{"raw":"Please fix this"},"user":{"uuid":"reviewer-uuid","nickname":"reviewer","display_name":"reviewer"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42/_/diff#comment-501"}}},"pullrequest":{"id":42,"title":"Fix flaky test","reviewers":[{"uuid":"reviewer-uuid"}],"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42"}},"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}},"repository":{"name":"service","slug":"service","workspace":{"slug":"acme"}}}`
 
 const bitbucketQualityGatePayload = `{"actor":{"display_name":"Bitbucket Pipelines"},"repository":{"name":"service","slug":"service","workspace":{"slug":"acme"}},"pipeline":{"uuid":"{pipeline-uuid}","build_number":404,"state":{"name":"COMPLETED","result":{"name":"FAILED"}},"target":{"ref_name":"feature/fix","commit":{"hash":"abc123"}},"links":{"self":{"href":"https://api.bitbucket.org/2.0/repositories/acme/service/pipelines/{pipeline-uuid}"}}}}`
+
+const bitbucketChangesRequestPayload = `{"actor":{"nickname":"reviewer","display_name":"Reviewer Display Name"},"repository":{"name":"Service Display Name","slug":"service","workspace":{"slug":"acme"}},"pullrequest":{"id":42,"title":"Fix flaky test","links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42"}},"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}},"changes_request":{"date":"2015-04-06T16:34:59.195330+00:00","user":{"nickname":"reviewer"}}}`

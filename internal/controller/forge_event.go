@@ -614,7 +614,6 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 		}
 		return persistAll(forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
 	}
-
 	var persistenceErrors []error
 	for _, event := range due {
 		if event.TaskID != record.ID {
@@ -635,7 +634,7 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 			body = event.ReplyDraft
 		}
 		reply := forge.ReplyRequest{PullRequestNumber: pullRequest.Number, Body: marker + " " + body}
-		if event.Kind == "review_comment" {
+		if event.Kind == "review_comment" && event.CommentID > 0 {
 			reply.CommentID = event.CommentID
 			reply.CommentKind = event.CommentKind
 		}

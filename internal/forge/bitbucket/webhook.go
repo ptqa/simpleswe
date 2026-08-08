@@ -49,6 +49,32 @@ func ParseWebhook(deliveryID, eventKey string, body []byte) (forge.Event, bool, 
 		}
 		return finishBitbucketEvent(event, true)
 
+	case "pullrequest:changes_request_created":
+		var payload bitbucketChangesRequest
+		if err := decodeWebhook(body, &payload); err != nil {
+			return forge.Event{}, false, err
+		}
+		if payload.ChangesRequest == nil {
+			return forge.Event{}, false, errors.New("Bitbucket pull request changes request is incomplete")
+		}
+		event := forge.Event{
+			DeliveryID:        bitbucketDeliveryID(deliveryID),
+			Provider:          forge.ProviderBitbucket,
+			Kind:              "review_comment",
+			Owner:             payload.Repository.Workspace.Slug,
+			Repository:        firstNonblank(payload.Repository.Slug, payload.Repository.Name),
+			PullRequestNumber: payload.PullRequest.ID,
+			CommitSHA:         payload.PullRequest.Source.Commit.Hash,
+			Branch:            payload.PullRequest.Source.Branch.Name,
+			CommentID:         0,
+			CommentKind:       "changes_request",
+			Title:             payload.PullRequest.Title,
+			Body:              "Changes requested",
+			Author:            firstNonblank(payload.Actor.Nickname, payload.Actor.DisplayName),
+			URL:               payload.PullRequest.Links.HTML.Href,
+		}
+		return finishBitbucketEvent(event, true)
+
 	case "pipeline:build:completed":
 		var payload bitbucketPipeline
 		if err := decodeWebhook(body, &payload); err != nil {
@@ -140,7 +166,9 @@ func validateBitbucketEvent(event forge.Event, comment bool) error {
 	if event.PullRequestNumber < 0 {
 		return errors.New("Bitbucket webhook pull request number is invalid")
 	}
-	if comment && (event.PullRequestNumber <= 0 || event.CommentID <= 0 || event.CommentKind != "comment") {
+	validCommentIdentity := event.CommentID > 0 && event.CommentKind == "comment" ||
+		event.CommentID == 0 && event.CommentKind == "changes_request"
+	if comment && (event.PullRequestNumber <= 0 || !validCommentIdentity) {
 		return errors.New("Bitbucket webhook comment identity is incomplete")
 	}
 	if event.URL == "" && !comment {
@@ -229,19 +257,33 @@ type bitbucketComment struct {
 			} `json:"html"`
 		} `json:"links"`
 	} `json:"comment"`
-	PullRequest struct {
-		ID     int    `json:"id"`
-		Title  string `json:"title"`
-		Source struct {
-			Branch struct {
-				Name string `json:"name"`
-			} `json:"branch"`
-			Commit struct {
-				Hash string `json:"hash"`
-			} `json:"commit"`
-		} `json:"source"`
-	} `json:"pullrequest"`
-	Repository bitbucketRepository `json:"repository"`
+	PullRequest bitbucketPullRequest `json:"pullrequest"`
+	Repository  bitbucketRepository  `json:"repository"`
+}
+
+type bitbucketChangesRequest struct {
+	Actor          bitbucketActor       `json:"actor"`
+	Repository     bitbucketRepository  `json:"repository"`
+	PullRequest    bitbucketPullRequest `json:"pullrequest"`
+	ChangesRequest *struct{}            `json:"changes_request"`
+}
+
+type bitbucketPullRequest struct {
+	ID     int    `json:"id"`
+	Title  string `json:"title"`
+	Source struct {
+		Branch struct {
+			Name string `json:"name"`
+		} `json:"branch"`
+		Commit struct {
+			Hash string `json:"hash"`
+		} `json:"commit"`
+	} `json:"source"`
+	Links struct {
+		HTML struct {
+			Href string `json:"href"`
+		} `json:"html"`
+	} `json:"links"`
 }
 
 type bitbucketActor struct {

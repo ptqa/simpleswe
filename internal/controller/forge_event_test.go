@@ -921,7 +921,6 @@ func TestProcessForgeEventsBatchesDueReviewComments(t *testing.T) {
 			t.Fatalf("put forge event: %v", err)
 		}
 	}
-
 	control := fixture.controller.(*Controller)
 	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
 		t.Fatalf("ProcessForgeEvents(): %v", err)
@@ -1202,6 +1201,55 @@ func TestForgeBatchCompletionIsolatesPermanentReplyFailure(t *testing.T) {
 	}
 	if current.CancellationRequested {
 		t.Fatalf("permanent reply failure requested task cancellation: %#v", current)
+	}
+}
+
+func TestForgeFollowUpChangesRequestRepliesGenerallyOnce(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	event := controllerForgeEvent("changes-request-reply", "review_comment", 42)
+	event.Branch = branch
+	event.CommentID, event.CommentKind = 0, "changes_request"
+	event.URL = "https://bitbucket.example/acme/widget/pull-requests/42"
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatalf("put changes-request event: %v", err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("ProcessForgeEvents(): %v", err)
+	}
+	followUp := startCurrentAttemptWorker(t, fixture, record.ID)
+	jobName, podName := jobs.Name(record.ID, followUp.Number), "worker-pod-a2"
+	for _, workerEvent := range []protocol.Event{
+		{Type: "agent_started", TaskID: record.ID},
+		{Type: "validation_started", TaskID: record.ID},
+		{Type: "validation_result", TaskID: record.ID},
+		{Type: "validation_succeeded", TaskID: record.ID},
+	} {
+		handleEvent(t, fixture, jobName, podName, workerEvent)
+	}
+	branchPushed := protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA}
+	handleEvent(t, fixture, jobName, podName, branchPushed)
+
+	if len(fixture.pullRequests.replyExistRequests) != 1 || len(fixture.pullRequests.replies) != 1 {
+		t.Fatalf("changes-request reply checks/posts = %d/%d; want 1/1", len(fixture.pullRequests.replyExistRequests), len(fixture.pullRequests.replies))
+	}
+	for _, reply := range []forge.ReplyRequest{fixture.pullRequests.replyExistRequests[0], fixture.pullRequests.replies[0]} {
+		if reply.PullRequestNumber != 42 || reply.CommentID != 0 || reply.CommentKind != "" || strings.TrimSpace(reply.Body) == "" {
+			t.Fatalf("changes-request reply = %#v; want an unparented PR reply with a body", reply)
+		}
+	}
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled || handled.HandledAt == nil {
+		t.Fatalf("handled changes-request event = %#v, %v", handled, err)
+	}
+
+	handleEvent(t, fixture, jobName, podName, branchPushed)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("replay handled changes-request event: %v", err)
+	}
+	if len(fixture.pullRequests.replies) != 1 {
+		t.Fatalf("changes-request replies after replay = %d; want 1", len(fixture.pullRequests.replies))
 	}
 }
 
