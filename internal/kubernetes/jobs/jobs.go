@@ -167,6 +167,7 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 	automountServiceAccountToken := false
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
+	runAsRoot := int64(0)
 	env := append([]corev1.EnvVar(nil), config.Env...)
 	env = append(env,
 		corev1.EnvVar{Name: "TMPDIR", Value: workspaceMountPath},
@@ -191,6 +192,8 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 			ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
+			RunAsUser:                &runAsRoot,
+			RunAsGroup:               &runAsRoot,
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 	}

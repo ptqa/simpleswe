@@ -166,6 +166,9 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 	if worker.SecurityContext == nil || worker.SecurityContext.ReadOnlyRootFilesystem == nil || !*worker.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("readOnlyRootFilesystem = %#v; want true", worker.SecurityContext)
 	}
+	if worker.SecurityContext == nil || worker.SecurityContext.RunAsUser == nil || *worker.SecurityContext.RunAsUser != 0 || worker.SecurityContext.RunAsGroup == nil || *worker.SecurityContext.RunAsGroup != 0 {
+		t.Errorf("runAsUser/runAsGroup = %#v; want 0/0", worker.SecurityContext)
+	}
 	if worker.SecurityContext == nil || worker.SecurityContext.Capabilities == nil || !reflect.DeepEqual(worker.SecurityContext.Capabilities.Drop, []corev1.Capability{"ALL"}) {
 		t.Errorf("dropped capabilities = %#v; want ALL", worker.SecurityContext)
 	}
