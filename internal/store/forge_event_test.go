@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -62,6 +63,417 @@ func TestForgeEventInboxPersistsAcceptedOrderAndDeduplicatesByID(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, stored) {
 		t.Fatalf("get forge event = %#v; want %#v", got, stored)
+	}
+}
+
+func TestForgeEventBatchSchedulingUsesSlidingQuietPeriod(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	const quietPeriod = 30 * time.Minute
+
+	first := testForgeEvent("batch-first", "review_comment")
+	started := time.Now().UTC()
+	stored, err := db.PutForgeEventAfter(ctx, first, quietPeriod)
+	if err != nil {
+		t.Fatalf("put first review event: %v", err)
+	}
+	assertForgeEventDeadline(t, stored, started.Add(quietPeriod))
+	initialDeadline := *stored.NextAttemptAt
+
+	matching := first
+	matching.ID = "batch-matching"
+	matching.CommentID = 502
+	matching.Body = "Also preserve escaped commas"
+	matching.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-502"
+	matchingStored, err := db.PutForgeEventAfter(ctx, matching, quietPeriod)
+	if err != nil {
+		t.Fatalf("put matching review event: %v", err)
+	}
+	refreshed, err := db.GetForgeEvent(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("reload first review event: %v", err)
+	}
+	if refreshed.NextAttemptAt == nil || !refreshed.NextAttemptAt.After(initialDeadline) {
+		t.Fatalf("first review deadline = %v; want sliding deadline after %v", refreshed.NextAttemptAt, initialDeadline)
+	}
+	if matchingStored.NextAttemptAt == nil || !matchingStored.NextAttemptAt.Equal(*refreshed.NextAttemptAt) {
+		t.Fatalf("matching review deadline = %v; want %v", matchingStored.NextAttemptAt, refreshed.NextAttemptAt)
+	}
+	assertForgeEventDeadline(t, refreshed, time.Now().UTC().Add(quietPeriod))
+
+	differentSHA := first
+	differentSHA.ID = "batch-different-sha"
+	differentSHA.CommitSHA = "fedcba9876543210fedcba9876543210fedcba98"
+	differentSHA.CommentID = 503
+	differentSHA.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-503"
+	if _, err := db.PutForgeEventAfter(ctx, differentSHA, quietPeriod); err != nil {
+		t.Fatalf("put different-SHA review event: %v", err)
+	}
+	unchanged, err := db.GetForgeEvent(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("reload first review event after different SHA: %v", err)
+	}
+	if unchanged.NextAttemptAt == nil || !unchanged.NextAttemptAt.Equal(*refreshed.NextAttemptAt) {
+		t.Fatalf("different SHA moved first deadline from %v to %v", refreshed.NextAttemptAt, unchanged.NextAttemptAt)
+	}
+
+	if _, err := db.PutForgeEventAfter(ctx, first, quietPeriod); err != nil {
+		t.Fatalf("put duplicate review event: %v", err)
+	}
+	unchanged, err = db.GetForgeEvent(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("reload first review event after duplicate: %v", err)
+	}
+	if unchanged.NextAttemptAt == nil || !unchanged.NextAttemptAt.Equal(*refreshed.NextAttemptAt) {
+		t.Fatalf("duplicate moved first deadline from %v to %v", refreshed.NextAttemptAt, unchanged.NextAttemptAt)
+	}
+
+	quality := testForgeEvent("batch-quality", "quality_gate_failed")
+	qualityStored, err := db.PutForgeEventAfter(ctx, quality, quietPeriod)
+	if err != nil {
+		t.Fatalf("put quality-gate event: %v", err)
+	}
+	if qualityStored.NextAttemptAt != nil && qualityStored.NextAttemptAt.After(time.Now().UTC().Add(100*time.Millisecond)) {
+		t.Fatalf("quality-gate deadline = %v; want immediate", qualityStored.NextAttemptAt)
+	}
+	due, err := db.ListIncompleteForgeEvents(ctx)
+	if err != nil {
+		t.Fatalf("list immediately due events: %v", err)
+	}
+	for _, event := range due {
+		if event.ID == first.ID {
+			t.Fatalf("sliding review event is immediately due: %#v", event)
+		}
+	}
+}
+
+func TestSHALessReviewEventsKeepIndependentDeadlinesAndBatches(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	const quietPeriod = 30 * time.Minute
+
+	first := testForgeEvent("sha-less-first", "review_comment")
+	first.Provider, first.CommentKind, first.CommitSHA, first.Branch = "github", "issue_comment", "", ""
+	first.URL = "https://github.example/acme/widget/issues/42#issuecomment-501"
+	if _, err := db.PutForgeEventAfter(ctx, first, quietPeriod); err != nil {
+		t.Fatal(err)
+	}
+	firstDeadline := time.Now().UTC().Add(10 * time.Minute)
+	if _, err := db.db.ExecContext(ctx, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, stamp(firstDeadline), first.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	second := first
+	second.ID, second.CommentID = "sha-less-second", 502
+	second.URL = "https://github.example/acme/widget/issues/42#issuecomment-502"
+	secondStored, err := db.PutForgeEventAfter(ctx, second, quietPeriod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstStored, err := db.GetForgeEvent(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstStored.NextAttemptAt == nil || !firstStored.NextAttemptAt.Equal(firstDeadline) {
+		t.Fatalf("first SHA-less deadline = %v; want unchanged %v", firstStored.NextAttemptAt, firstDeadline)
+	}
+	assertForgeEventDeadline(t, secondStored, time.Now().UTC().Add(quietPeriod))
+
+	for i, event := range []ForgeEvent{first, second} {
+		if _, err := db.db.ExecContext(ctx, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, stamp(time.Now().UTC().Add(-time.Duration(i+1)*time.Minute)), event.ID); err != nil {
+			t.Fatal(err)
+		}
+		seed, err := db.GetForgeEvent(ctx, event.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch, err := db.ListDueForgeEventBatch(ctx, seed)
+		if err != nil || len(batch) != 1 || batch[0].ID != event.ID {
+			t.Fatalf("SHA-less batch for %q = %#v, %v; want only its seed", event.ID, batch, err)
+		}
+	}
+	if _, err := db.PlanForgeEventAttempt(ctx, []string{first.ID, second.ID}, record.ID, "must not combine SHA-less comments"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("combined SHA-less batch error = %v; want ErrConflict", err)
+	}
+	if _, err := db.PlanForgeEventAttempt(ctx, []string{first.ID}, record.ID, "process one SHA-less comment"); err != nil {
+		t.Fatalf("single SHA-less batch plan: %v", err)
+	}
+}
+
+func TestForgeEventBatchAssociatesManyEventsAndLeavesLaterCommentPending(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatalf("mark original logs exhausted: %v", err)
+	}
+
+	first := testForgeEvent("batch-claim-first", "review_comment")
+	second := first
+	second.ID = "batch-claim-second"
+	second.CommentID = 502
+	second.Body = "Please also cover the empty input"
+	second.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-502"
+	for _, event := range []ForgeEvent{first, second} {
+		stored, err := db.PutForgeEventAfter(ctx, event, 0)
+		if err != nil {
+			t.Fatalf("put due review event %q: %v", event.ID, err)
+		}
+		if stored.NextAttemptAt != nil && stored.NextAttemptAt.After(time.Now().UTC().Add(100*time.Millisecond)) {
+			t.Fatalf("due review event %q deadline = %v", event.ID, stored.NextAttemptAt)
+		}
+	}
+
+	attempt, inserted, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, "fix all review feedback")
+	if err != nil {
+		t.Fatalf("start batched forge follow-up: %v", err)
+	}
+	if !inserted {
+		t.Fatal("batched forge follow-up was reported as a replay")
+	}
+	associated, err := db.ListForgeEventsByAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatalf("list batched forge events: %v", err)
+	}
+	if len(associated) != 2 {
+		t.Fatalf("batched forge events = %#v; want two events", associated)
+	}
+	for _, event := range associated {
+		if event.Status != ForgeEventRunning || event.TaskID != record.ID || event.AttemptID != attempt.ID || event.Attempts != 1 {
+			t.Fatalf("associated forge event = %#v; want running on one attempt", event)
+		}
+	}
+
+	third := first
+	third.ID = "batch-claim-later"
+	third.CommentID = 503
+	third.Body = "A comment after the claim"
+	third.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-503"
+	if _, err := db.PutForgeEventAfter(ctx, third, 0); err != nil {
+		t.Fatalf("put post-claim review event: %v", err)
+	}
+	pending, err := db.GetForgeEvent(ctx, third.ID)
+	if err != nil {
+		t.Fatalf("get post-claim review event: %v", err)
+	}
+	if pending.Status != ForgeEventPending || pending.TaskID != "" || pending.AttemptID != "" {
+		t.Fatalf("post-claim review event = %#v; want unclaimed pending event", pending)
+	}
+	associated, err = db.ListForgeEventsByAttempt(ctx, attempt.ID)
+	if err != nil || len(associated) != 2 {
+		t.Fatalf("batched forge events after later comment = %#v, %v; want original two", associated, err)
+	}
+	attempts, err := db.ListAttempts(ctx, record.ID)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("task attempts after batched claim = %#v, %v; want one follow-up attempt", attempts, err)
+	}
+}
+
+func TestForgeEventBatchClaimsOldest32AndLeaves33rdPending(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatalf("mark original logs exhausted: %v", err)
+	}
+
+	eventIDs := make([]string, 33)
+	for i := range eventIDs {
+		event := testForgeEvent(fmt.Sprintf("batch-limit-%02d", i+1), "review_comment")
+		event.CommentID = 501 + i
+		event.URL = fmt.Sprintf("https://bitbucket.example/acme/widget/pull-requests/42#comment-%d", event.CommentID)
+		if _, err := db.PutForgeEventAfter(ctx, event, 0); err != nil {
+			t.Fatalf("put review event %d: %v", i+1, err)
+		}
+		eventIDs[i] = event.ID
+	}
+
+	seed, err := db.GetForgeEvent(ctx, eventIDs[0])
+	if err != nil {
+		t.Fatalf("get batch seed: %v", err)
+	}
+	batch, err := db.ListDueForgeEventBatch(ctx, seed)
+	if err != nil {
+		t.Fatalf("list due review batch: %v", err)
+	}
+	if len(batch) != 32 {
+		t.Fatalf("due review batch size = %d; want 32", len(batch))
+	}
+	claimedIDs := make([]string, len(batch))
+	for i, event := range batch {
+		claimedIDs[i] = event.ID
+	}
+	if !reflect.DeepEqual(claimedIDs, eventIDs[:32]) {
+		t.Fatalf("claimed event IDs = %#v; want oldest %#v", claimedIDs, eventIDs[:32])
+	}
+	if _, _, err := startForgeEventBatchForTest(ctx, db, claimedIDs, record.ID, "fix the oldest review batch"); err != nil {
+		t.Fatalf("claim oldest review batch: %v", err)
+	}
+	remaining, err := db.GetForgeEvent(ctx, eventIDs[32])
+	if err != nil {
+		t.Fatalf("get remaining review event: %v", err)
+	}
+	if remaining.Status != ForgeEventPending || remaining.TaskID != "" || remaining.AttemptID != "" {
+		t.Fatalf("33rd review event = %#v; want pending for the next batch", remaining)
+	}
+}
+
+func TestStartForgeEventAttemptRejectsBatchSlidAfterPlanning(t *testing.T) {
+	db := openTestStore(t)
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := testForgeEvent("planned-due-review", "review_comment")
+	if _, err := db.PutForgeEventAfter(t.Context(), first, 0); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := db.PlanForgeEventAttempt(t.Context(), []string{first.ID}, record.ID, "fix due review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Attempt.ManifestJSON = []byte(`{"task_id":"planned"}`)
+	plan.Attempt.ResourceSnapshot = []byte(`{"job":{"metadata":{"name":"planned"}},"secret":{"metadata":{"name":"planned"}}}`)
+	plan.Attempt.ConfigDigest = "sha256:planned"
+
+	delayed := first
+	delayed.ID, delayed.CommentID = "new-delayed-review", 502
+	if _, err := db.PutForgeEventAfter(t.Context(), delayed, 30*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.StartForgeEventAttempt(t.Context(), plan); !errors.Is(err, ErrForgeEventNotDue) {
+		t.Fatalf("StartForgeEventAttempt() error = %v, want ErrForgeEventNotDue", err)
+	}
+	for _, id := range []string{first.ID, delayed.ID} {
+		stored, err := db.GetForgeEvent(t.Context(), id)
+		if err != nil || stored.Status != ForgeEventPending || stored.TaskID != "" || stored.AttemptID != "" || stored.Attempts != 0 {
+			t.Fatalf("event %q after refused start = %#v, %v", id, stored, err)
+		}
+	}
+	attempts, err := db.ListAttempts(t.Context(), record.ID)
+	if err != nil || len(attempts) != 1 || attempts[0].ID != original.ID {
+		t.Fatalf("attempts after refused start = %#v, %v", attempts, err)
+	}
+}
+
+func TestForgeEventReplyDraftsPersistAcrossReopenAndLeaveMissingFallbackEmpty(t *testing.T) {
+	ctx := t.Context()
+	path := filepath.Join(t.TempDir(), "tasks.sqlite")
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatalf("mark original logs exhausted: %v", err)
+	}
+
+	first := testForgeEvent("reply-draft-first", "review_comment")
+	second := first
+	second.ID = "reply-draft-second"
+	second.CommentID = 502
+	second.Body = "Please include a regression test"
+	second.URL = "https://bitbucket.example/acme/widget/pull-requests/42#comment-502"
+	for _, event := range []ForgeEvent{first, second} {
+		if _, err := db.PutForgeEventAfter(ctx, event, 0); err != nil {
+			t.Fatalf("put reply event %q: %v", event.ID, err)
+		}
+	}
+	attempt, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, "reply to review feedback")
+	if err != nil {
+		t.Fatalf("start reply follow-up: %v", err)
+	}
+	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "I pushed the parser fix."}); err != nil {
+		t.Fatalf("record reply drafts: %v", err)
+	}
+	assertForgeEventReplyDrafts(t, db, attempt.ID, first.ID, second.ID)
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	db, err = Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	assertForgeEventReplyDrafts(t, db, attempt.ID, first.ID, second.ID)
+}
+
+func TestForgeEventReplyDraftsIgnoreAmbiguousCommentIDsAcrossKinds(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	first := testForgeEvent("ambiguous-reply-issue", "review_comment")
+	first.Provider, first.CommentKind = "github", "issue_comment"
+	second := first
+	second.ID, second.CommentKind = "ambiguous-reply-inline", "review_comment"
+	for _, event := range []ForgeEvent{first, second} {
+		if _, err := db.PutForgeEvent(ctx, event); err != nil {
+			t.Fatalf("put ambiguous reply event %q: %v", event.ID, err)
+		}
+	}
+	attempt, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, "reply to ambiguous review feedback")
+	if err != nil {
+		t.Fatalf("start ambiguous reply follow-up: %v", err)
+	}
+	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "Generated draft"}); err != nil {
+		t.Fatalf("record ambiguous reply draft: %v", err)
+	}
+	events, err := db.ListForgeEventsByAttempt(ctx, attempt.ID)
+	if err != nil {
+		t.Fatalf("list ambiguous reply events: %v", err)
+	}
+	if len(events) != 2 || events[0].ReplyDraft != "" || events[1].ReplyDraft != "" {
+		t.Fatalf("ambiguous reply events = %#v; want both drafts empty", events)
+	}
+
+	if err := db.MarkForgeEventHandled(ctx, first.ID); err != nil {
+		t.Fatalf("mark one ambiguous reply handled: %v", err)
+	}
+	if err := db.RecordForgeEventReplies(ctx, attempt.ID, map[int]string{first.CommentID: "Generated draft"}); err != nil {
+		t.Fatalf("replay ambiguous reply draft: %v", err)
+	}
+	first, err = db.GetForgeEvent(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("get handled ambiguous reply event: %v", err)
+	}
+	second, err = db.GetForgeEvent(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("get running ambiguous reply event: %v", err)
+	}
+	if first.Status != ForgeEventHandled || first.ReplyDraft != "" || second.Status != ForgeEventRunning || second.ReplyDraft != "" {
+		t.Fatalf("ambiguous reply events after replay = %#v, %#v; want handled and running drafts empty", first, second)
+	}
+}
+
+func assertForgeEventReplyDrafts(t *testing.T, db *Store, attemptID, firstID, secondID string) {
+	t.Helper()
+	events, err := db.ListForgeEventsByAttempt(t.Context(), attemptID)
+	if err != nil {
+		t.Fatalf("list reply draft events: %v", err)
+	}
+	byID := make(map[string]ForgeEvent, len(events))
+	for _, event := range events {
+		byID[event.ID] = event
+	}
+	if len(byID) != 2 {
+		t.Fatalf("reply draft events = %#v; want both associated events", events)
+	}
+	first, ok := byID[firstID]
+	if !ok || first.ReplyDraft != "I pushed the parser fix." {
+		t.Fatalf("first reply draft = %#v; want persisted draft", first)
+	}
+	second, ok := byID[secondID]
+	if !ok || second.ReplyDraft != "" {
+		t.Fatalf("missing second reply draft = %#v; want empty fallback", second)
 	}
 }
 
@@ -319,8 +731,8 @@ func TestStartForgeEventAttemptIsAtomicImmutableAndReplaySafe(t *testing.T) {
 	if copiedPR.State != "open" || copiedPR.Number != originalPR.Number || copiedPR.URL != originalPR.URL || copiedPR.Title != originalPR.Title || copiedPR.HeadBranch != originalPR.HeadBranch || copiedPR.BaseBranch != originalPR.BaseBranch {
 		t.Fatalf("copied pull request = %#v; want identity from %#v", copiedPR, originalPR)
 	}
-	associated, err := db.GetForgeEventByAttempt(ctx, followUp.ID)
-	if err != nil || associated.ID != event.ID || associated.TaskID != record.ID || associated.AttemptID != followUp.ID || associated.Status != "running" || associated.Attempts != 1 {
+	associated, err := db.ListForgeEventsByAttempt(ctx, followUp.ID)
+	if err != nil || len(associated) != 1 || associated[0].ID != event.ID || associated[0].TaskID != record.ID || associated[0].AttemptID != followUp.ID || associated[0].Status != "running" || associated[0].Attempts != 1 {
 		t.Fatalf("forge event association = %#v, %v", associated, err)
 	}
 
@@ -373,7 +785,7 @@ func TestStartForgeEventAttemptRollsBackEntirePlannedSnapshotOnPreCommitFailure(
 	if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := db.PlanForgeEventAttempt(t.Context(), event.ID, record.ID, "immutable prompt")
+	plan, err := db.PlanForgeEventAttempt(t.Context(), []string{event.ID}, record.ID, "immutable prompt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -383,7 +795,7 @@ func TestStartForgeEventAttemptRollsBackEntirePlannedSnapshotOnPreCommitFailure(
 	if _, err := db.db.ExecContext(t.Context(), `CREATE TRIGGER reject_forge_transition BEFORE INSERT ON task_events WHEN NEW.trigger = 'webhook' BEGIN SELECT RAISE(FAIL, 'forced pre-commit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := db.StartForgeEventAttempt(t.Context(), event.ID, plan); err == nil || !strings.Contains(err.Error(), "forced pre-commit failure") {
+	if _, _, err := db.StartForgeEventAttempt(t.Context(), plan); err == nil || !strings.Contains(err.Error(), "forced pre-commit failure") {
 		t.Fatalf("StartForgeEventAttempt error = %v", err)
 	}
 	current, err := db.GetTask(t.Context(), record.ID)
@@ -422,21 +834,28 @@ func TestStartForgeEventAttemptRejectsStateOutsideMachineReset(t *testing.T) {
 	}
 }
 
-func TestRetryTaskOnceRebindsRunningForgeEventAndCopiesFollowUpContext(t *testing.T) {
+func TestRetryTaskOnceRebindsRunningForgeEventBatchAndClearsDrafts(t *testing.T) {
 	db := openTestStore(t)
 	ctx := context.Background()
 	record, originalAttempt, originalPR := createOpenPullRequestTask(t, db)
 	if err := db.MarkLogsExhausted(ctx, record.ID, originalAttempt.ID); err != nil {
 		t.Fatalf("mark original logs exhausted: %v", err)
 	}
-	event := testForgeEvent("forge-retry", "review_comment")
-	if _, err := db.PutForgeEvent(ctx, event); err != nil {
-		t.Fatalf("put forge event: %v", err)
+	first := testForgeEvent("forge-retry-first", "review_comment")
+	second := first
+	second.ID, second.CommentID = "forge-retry-second", 502
+	for _, event := range []ForgeEvent{first, second} {
+		if _, err := db.PutForgeEvent(ctx, event); err != nil {
+			t.Fatalf("put forge event: %v", err)
+		}
 	}
 	prompt := "Original task: fix the parser; body=preserve quoted commas"
-	failed, _, err := startForgeEventAttemptForTest(ctx, db, event.ID, record.ID, prompt)
+	failed, _, err := startForgeEventBatchForTest(ctx, db, []string{first.ID, second.ID}, record.ID, prompt)
 	if err != nil {
 		t.Fatalf("start forge follow-up: %v", err)
+	}
+	if err := db.RecordForgeEventReplies(ctx, failed.ID, map[int]string{first.CommentID: "first draft", second.CommentID: "second draft"}); err != nil {
+		t.Fatalf("record pre-retry drafts: %v", err)
 	}
 	if err := db.Transition(ctx, record.ID, task.QUEUED, task.FAILED, TransitionParams{Reason: "follow-up failed", Trigger: "kubernetes"}); err != nil {
 		t.Fatalf("fail follow-up: %v", err)
@@ -459,12 +878,17 @@ func TestRetryTaskOnceRebindsRunningForgeEventAndCopiesFollowUpContext(t *testin
 	if copiedPR.Number != originalPR.Number || copiedPR.URL != originalPR.URL || copiedPR.HeadBranch != originalPR.HeadBranch {
 		t.Fatalf("retry pull request = %#v; want copied open PR %#v", copiedPR, originalPR)
 	}
-	associated, err := db.GetForgeEvent(ctx, event.ID)
-	if err != nil || associated.Status != ForgeEventRunning || associated.AttemptID != retry.ID || associated.TaskID != record.ID {
-		t.Fatalf("rebound forge event = %#v, %v", associated, err)
+	associated, err := db.ListForgeEventsByAttempt(ctx, retry.ID)
+	if err != nil || len(associated) != 2 {
+		t.Fatalf("rebound forge events = %#v, %v", associated, err)
 	}
-	if _, err := db.GetForgeEventByAttempt(ctx, failed.ID); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("failed attempt remains associated with forge event: %v", err)
+	for _, event := range associated {
+		if event.Status != ForgeEventRunning || event.AttemptID != retry.ID || event.TaskID != record.ID || event.ReplyDraft != "" {
+			t.Fatalf("rebound forge event = %#v; want running with cleared draft", event)
+		}
+	}
+	if old, err := db.ListForgeEventsByAttempt(ctx, failed.ID); err != nil || len(old) != 0 {
+		t.Fatalf("failed attempt remains associated with forge event: %#v, %v", old, err)
 	}
 	replayed, inserted, err := retryTaskOnceForForgeTest(ctx, db, record.ID, "retry-forge-follow-up")
 	if err != nil || inserted || replayed.ID != retry.ID || replayed.Prompt != prompt {
@@ -544,8 +968,18 @@ func testForgeEvent(id, kind string) ForgeEvent {
 	return event
 }
 
-func startForgeEventAttemptForTest(ctx context.Context, db *Store, eventID, taskID, prompt string) (Attempt, bool, error) {
-	plan, err := db.PlanForgeEventAttempt(ctx, eventID, taskID, prompt)
+func assertForgeEventDeadline(t *testing.T, event ForgeEvent, want time.Time) {
+	t.Helper()
+	if event.NextAttemptAt == nil {
+		t.Fatalf("forge event deadline is nil; want approximately %v", want)
+	}
+	if delta := event.NextAttemptAt.Sub(want); delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("forge event deadline = %v; want approximately %v", event.NextAttemptAt, want)
+	}
+}
+
+func startForgeEventBatchForTest(ctx context.Context, db *Store, eventIDs []string, taskID, prompt string) (Attempt, bool, error) {
+	plan, err := db.PlanForgeEventAttempt(ctx, eventIDs, taskID, prompt)
 	if err != nil {
 		return Attempt{}, false, err
 	}
@@ -554,7 +988,11 @@ func startForgeEventAttemptForTest(ctx context.Context, db *Store, eventID, task
 		plan.Attempt.ResourceSnapshot = []byte(`{"job":{"metadata":{"name":"` + plan.Attempt.ID + `"}},"secret":{"metadata":{"name":"` + plan.Attempt.ID + `"}}}`)
 		plan.Attempt.ConfigDigest = "sha256:" + plan.Attempt.ID
 	}
-	return db.StartForgeEventAttempt(ctx, eventID, plan)
+	return db.StartForgeEventAttempt(ctx, plan)
+}
+
+func startForgeEventAttemptForTest(ctx context.Context, db *Store, eventID, taskID, prompt string) (Attempt, bool, error) {
+	return startForgeEventBatchForTest(ctx, db, []string{eventID}, taskID, prompt)
 }
 
 func retryTaskOnceForForgeTest(ctx context.Context, db *Store, taskID, key string) (Attempt, bool, error) {

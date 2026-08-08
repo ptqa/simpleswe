@@ -6,9 +6,18 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const EventPrefix = "@@simpleswe:"
+
+// ReviewReplyInstruction is the immutable output requirement for forge review follow-ups.
+const ReviewReplyInstruction = "After completing the code changes, make your final assistant answer exactly a JSON object mapping each comment_id to a concise reply"
+
+const (
+	maxEventReplies    = 32
+	maxReplyDraftBytes = 2 << 10
+)
 
 const (
 	EventAgentStarted        = "agent_started"
@@ -23,14 +32,15 @@ const (
 // Event is the structured subset of worker output. Any fields not represented
 // here remain in the raw log stream rather than being guessed at by the parser.
 type Event struct {
-	Type      string    `json:"type"`
-	TaskID    string    `json:"task_id,omitempty"`
-	Message   string    `json:"message,omitempty"`
-	Timestamp time.Time `json:"timestamp,omitempty"`
-	Command   []string  `json:"command,omitempty"`
-	ExitCode  int       `json:"exit_code"`
-	Branch    string    `json:"branch,omitempty"`
-	CommitSHA string    `json:"commit_sha,omitempty"`
+	Type      string         `json:"type"`
+	TaskID    string         `json:"task_id,omitempty"`
+	Message   string         `json:"message,omitempty"`
+	Timestamp time.Time      `json:"timestamp,omitzero"`
+	Command   []string       `json:"command,omitempty"`
+	ExitCode  int            `json:"exit_code"`
+	Branch    string         `json:"branch,omitempty"`
+	CommitSHA string         `json:"commit_sha,omitempty"`
+	Replies   map[int]string `json:"replies,omitempty"`
 }
 
 type ParsedLine struct {
@@ -80,6 +90,23 @@ func ValidateEvent(event Event, expectedBranch string) error {
 	for _, char := range event.CommitSHA {
 		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
 			return fmt.Errorf("branch_pushed commit_sha must be lowercase hexadecimal")
+		}
+	}
+	if len(event.Replies) > maxEventReplies {
+		return fmt.Errorf("branch_pushed replies exceed %d entries", maxEventReplies)
+	}
+	for commentID, draft := range event.Replies {
+		if commentID <= 0 {
+			return fmt.Errorf("branch_pushed reply comment ID must be positive")
+		}
+		if strings.TrimSpace(draft) == "" {
+			return fmt.Errorf("branch_pushed reply draft must not be blank")
+		}
+		if len(draft) > maxReplyDraftBytes {
+			return fmt.Errorf("branch_pushed reply draft exceeds %d bytes", maxReplyDraftBytes)
+		}
+		if strings.IndexFunc(draft, unicode.IsControl) >= 0 {
+			return fmt.Errorf("branch_pushed reply draft contains control characters")
 		}
 	}
 	return nil

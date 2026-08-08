@@ -206,7 +206,8 @@ CREATE TABLE IF NOT EXISTS forge_events (
 	author TEXT NOT NULL DEFAULT '',
 	url TEXT NOT NULL DEFAULT '',
 	task_id TEXT REFERENCES tasks(id),
-	attempt_id TEXT UNIQUE REFERENCES task_attempts(id),
+	attempt_id TEXT REFERENCES task_attempts(id),
+	reply_draft TEXT NOT NULL DEFAULT '',
 	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'handled', 'failed')),
 	attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
 	last_error TEXT NOT NULL DEFAULT '',
@@ -394,8 +395,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`).Scan(&userTables); err != nil {
 		return closeOnError(fmt.Errorf("inspect SQLite schema: %w", err))
 	}
-	if version != 1 && (version != 0 || userTables != 0) {
-		return closeOnError(fmt.Errorf("unsupported SQLite schema version %d with %d user tables; recreate the controller PVC/database for schema version 1", version, userTables))
+	if version < 0 || version > 2 || version == 0 && userTables != 0 {
+		return closeOnError(fmt.Errorf("unsupported SQLite schema version %d with %d user tables; recreate the controller PVC/database for schema version 2", version, userTables))
 	}
 	if version == 0 {
 		tx, err := db.BeginTx(ctx, nil)
@@ -406,19 +407,106 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			_ = tx.Rollback()
 			return closeOnError(fmt.Errorf("create SQLite schema: %w", err))
 		}
-		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
 			_ = tx.Rollback()
 			return closeOnError(fmt.Errorf("mark SQLite schema version: %w", err))
 		}
 		if err := tx.Commit(); err != nil {
 			return closeOnError(fmt.Errorf("commit SQLite schema initialization: %w", err))
 		}
-	} else {
-		if _, err := db.ExecContext(ctx, "ALTER TABLE tasks ADD COLUMN pr_title TEXT NOT NULL DEFAULT ''"); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-			return closeOnError(fmt.Errorf("migrate tasks pr_title column: %w", err))
+	} else if version == 1 {
+		if err := migrateSchemaV1ToV2(ctx, db); err != nil {
+			return closeOnError(err)
 		}
 	}
 	return &Store{db: db}, nil
+}
+
+func migrateSchemaV1ToV2(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin SQLite schema migration to version 2: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	hasPRTitle, err := migrationTableHasColumn(ctx, tx, "tasks", "pr_title")
+	if err != nil {
+		return fmt.Errorf("inspect tasks schema: %w", err)
+	}
+	if !hasPRTitle {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE tasks ADD COLUMN pr_title TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("migrate tasks pr_title column: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		CREATE TABLE forge_events_v2 (
+			id TEXT PRIMARY KEY,
+			provider TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			owner TEXT NOT NULL,
+			repository TEXT NOT NULL,
+			pull_request_number INTEGER NOT NULL DEFAULT 0 CHECK (pull_request_number >= 0),
+			commit_sha TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			comment_id INTEGER NOT NULL DEFAULT 0 CHECK (comment_id >= 0),
+			comment_kind TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL DEFAULT '',
+			body TEXT NOT NULL DEFAULT '',
+			author TEXT NOT NULL DEFAULT '',
+			url TEXT NOT NULL DEFAULT '',
+			task_id TEXT REFERENCES tasks(id),
+			attempt_id TEXT REFERENCES task_attempts(id),
+			reply_draft TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'running', 'handled', 'failed')),
+			attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			handled_at TEXT,
+			failed_at TEXT,
+			next_attempt_at TEXT
+		);
+		INSERT INTO forge_events_v2
+			(id, provider, kind, owner, repository, pull_request_number, commit_sha, branch,
+			 comment_id, comment_kind, title, body, author, url, task_id, attempt_id,
+			 status, attempts, last_error, created_at, updated_at, handled_at, failed_at, next_attempt_at)
+		SELECT id, provider, kind, owner, repository, pull_request_number, commit_sha, branch,
+		       comment_id, comment_kind, title, body, author, url, task_id, attempt_id,
+		       status, attempts, last_error, created_at, updated_at, handled_at, failed_at, next_attempt_at
+		FROM forge_events;
+		DROP TABLE forge_events;
+		ALTER TABLE forge_events_v2 RENAME TO forge_events;
+		CREATE INDEX forge_events_incomplete ON forge_events(status, created_at);
+		CREATE INDEX forge_events_task_status ON forge_events(task_id, status);
+		PRAGMA user_version = 2;
+	`); err != nil {
+		return fmt.Errorf("migrate forge events to schema version 2: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit SQLite schema migration to version 2: %w", err)
+	}
+	return nil
+}
+
+func migrationTableHasColumn(ctx context.Context, tx *sql.Tx, table, column string) (_ bool, resultErr error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, fmt.Errorf("query migration table %q for column %q: %w", table, column, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, fmt.Errorf("scan migration table %q for column %q: %w", table, column, err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read migration table %q for column %q: %w", table, column, err)
+	}
+	return false, nil
 }
 
 func (s *Store) Close() error {
@@ -725,11 +813,11 @@ func (s *Store) PlanRetryAttempt(ctx context.Context, taskID, idempotencyKey str
 	if logsExhausted != 1 {
 		return RetryAttemptPlan{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
 	}
-	var forgeEventID string
-	if err := s.db.QueryRowContext(ctx, `SELECT id FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&forgeEventID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	var runningForgeEvents int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&runningForgeEvents); err != nil {
 		return RetryAttemptPlan{}, false, fmt.Errorf("plan running forge event retry: %w", err)
 	}
-	if forgeEventID == "" {
+	if runningForgeEvents == 0 {
 		prompt, baseBranch, taskBranch = "", "", ""
 	}
 	var number int
@@ -823,14 +911,14 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	if logsExhausted != 1 {
 		return Attempt{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
 	}
-	var forgeEventID string
+	var runningForgeEvents int
 	if err := tx.QueryRowContext(ctx, `
-		SELECT id FROM forge_events
-		WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&forgeEventID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		SELECT COUNT(*) FROM forge_events
+		WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&runningForgeEvents); err != nil {
 		return Attempt{}, false, fmt.Errorf("read running forge event for retry: %w", err)
 	}
 	retryPrompt, retryBaseBranch, retryTaskBranch := "", "", ""
-	if forgeEventID != "" {
+	if runningForgeEvents > 0 {
 		retryPrompt, retryBaseBranch, retryTaskBranch = prompt, baseBranch, taskBranch
 	}
 
@@ -844,7 +932,7 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 		Prompt: retryPrompt, BaseBranch: retryBaseBranch, TaskBranch: retryTaskBranch,
 	}
 	if plan == nil {
-		if forgeEventID != "" {
+		if runningForgeEvents > 0 {
 			return Attempt{}, false, fmt.Errorf("%w: running forge follow-up retry requires a complete planned snapshot", ErrConflict)
 		}
 		attempt.ID, err = newID("swe-attempt-")
@@ -876,7 +964,7 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 		attempt.Prompt, attempt.BaseBranch, attempt.TaskBranch, attempt.ManifestJSON, attempt.ResourceSnapshot, attempt.ConfigDigest, stamp(now)); err != nil {
 		return Attempt{}, false, fmt.Errorf("insert retry attempt: %w", err)
 	}
-	if forgeEventID != "" {
+	if runningForgeEvents > 0 {
 		result, err := tx.ExecContext(ctx, `
 			INSERT INTO pull_requests
 				(attempt_id, state, number, url, title, head_branch, base_branch, error)
@@ -886,17 +974,17 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 			return Attempt{}, false, fmt.Errorf("copy forge retry pull request: %w", err)
 		}
 		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-			return Attempt{}, false, fmt.Errorf("%w: running forge event %q has no open pull request", ErrConflict, forgeEventID)
+			return Attempt{}, false, fmt.Errorf("%w: running forge event batch has no open pull request", ErrConflict)
 		}
 		result, err = tx.ExecContext(ctx, `
-			UPDATE forge_events SET attempt_id = ?, updated_at = ?
-			WHERE id = ? AND task_id = ? AND attempt_id = ? AND status = 'running'`,
-			attempt.ID, stamp(now), forgeEventID, taskID, currentAttemptID)
+			UPDATE forge_events SET attempt_id = ?, reply_draft = '', updated_at = ?
+			WHERE task_id = ? AND attempt_id = ? AND status = 'running'`,
+			attempt.ID, stamp(now), taskID, currentAttemptID)
 		if err != nil {
 			return Attempt{}, false, fmt.Errorf("rebind forge event retry: %w", err)
 		}
-		if affected, err := result.RowsAffected(); err != nil || affected != 1 {
-			return Attempt{}, false, fmt.Errorf("%w: running forge event %q changed during retry", ErrConflict, forgeEventID)
+		if affected, err := result.RowsAffected(); err != nil || affected != int64(runningForgeEvents) {
+			return Attempt{}, false, fmt.Errorf("%w: running forge event batch changed during retry", ErrConflict)
 		}
 	}
 	result, err := tx.ExecContext(ctx,

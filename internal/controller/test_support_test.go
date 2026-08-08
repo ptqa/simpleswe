@@ -122,8 +122,11 @@ type fakePullRequestCreator struct {
 	replyExistRequests []forge.ReplyRequest
 	replyMarkers       []string
 	replyExists        bool
+	replyExistsInPosts bool
 	replyExistsErr     error
+	replyExistsErrByID map[int]error
 	replyErr           error
+	replyErrByID       map[int]error
 	found              *forge.PullRequest
 	findCalls          int
 	findTargets        []forge.Target
@@ -200,6 +203,9 @@ func (f *fakePullRequestCreator) ReplyToPullRequest(_ context.Context, target fo
 	defer f.mu.Unlock()
 	f.replyTargets = append(f.replyTargets, target)
 	f.replies = append(f.replies, input)
+	if err := f.replyErrByID[input.CommentID]; err != nil {
+		return err
+	}
 	return f.replyErr
 }
 
@@ -209,6 +215,16 @@ func (f *fakePullRequestCreator) PullRequestReplyExists(_ context.Context, targe
 	f.replyExistTargets = append(f.replyExistTargets, target)
 	f.replyExistRequests = append(f.replyExistRequests, input)
 	f.replyMarkers = append(f.replyMarkers, marker)
+	if err := f.replyExistsErrByID[input.CommentID]; err != nil {
+		return false, err
+	}
+	if f.replyExistsInPosts {
+		for _, reply := range f.replies {
+			if strings.Contains(reply.Body, marker) {
+				return true, nil
+			}
+		}
+	}
 	return f.replyExists, f.replyExistsErr
 }
 

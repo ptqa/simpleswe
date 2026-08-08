@@ -12,14 +12,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/store"
 )
 
 const (
-	githubWebhookSecret    = "github-webhook-test-secret"
-	bitbucketWebhookSecret = "bitbucket-webhook-test-secret"
+	githubWebhookSecret      = "github-webhook-test-secret"
+	bitbucketWebhookSecret   = "bitbucket-webhook-test-secret"
+	webhookReviewQuietPeriod = 30 * time.Minute
 )
 
 func TestWebhookHTTPReception(t *testing.T) {
@@ -44,20 +46,19 @@ func TestWebhookHTTPReception(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		provider      string
-		path          string
-		secret        string
-		delivery      string
-		event         string
-		body          []byte
-		method        string
-		signature     string
-		omitDelivery  bool
-		omitEvent     bool
-		wantStatus    int
-		wantEvent     bool
-		duplicateBody []byte
+		name         string
+		provider     string
+		path         string
+		secret       string
+		delivery     string
+		event        string
+		body         []byte
+		method       string
+		signature    string
+		omitDelivery bool
+		omitEvent    bool
+		wantStatus   int
+		wantEvent    bool
 	}{
 		{
 			name:     "signed actionable GitHub",
@@ -156,13 +157,6 @@ func TestWebhookHTTPReception(t *testing.T) {
 			method: http.MethodPost, signature: "valid", wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:     "duplicate delivery does not replace the first payload",
-			provider: "github", path: "/v1/webhooks/github", secret: githubWebhookSecret,
-			delivery: "github-duplicate", event: "issue_comment", body: []byte(githubActionablePayload),
-			duplicateBody: []byte(strings.Replace(githubActionablePayload, "Please fix this", "replacement payload", 1)),
-			method:        http.MethodPost, signature: "valid", wantStatus: http.StatusAccepted,
-		},
-		{
 			name:     "body limit",
 			provider: "github", path: "/v1/webhooks/github", secret: githubWebhookSecret,
 			delivery: "github-too-large", event: "push", body: bytes.Repeat([]byte{'x'}, 1<<20+1),
@@ -207,36 +201,6 @@ func TestWebhookHTTPReception(t *testing.T) {
 					t.Fatal("accepted event has empty normalized body")
 				}
 			}
-
-			if len(tt.duplicateBody) == 0 {
-				return
-			}
-			duplicate := newWebhookRequest(tt.method, tt.path, tt.provider, tt.secret, tt.delivery, tt.event, tt.duplicateBody, tt.signature, tt.omitDelivery, tt.omitEvent)
-			duplicateRecorder := httptest.NewRecorder()
-			handler.ServeHTTP(duplicateRecorder, duplicate)
-			if duplicateRecorder.Code != http.StatusAccepted {
-				t.Fatalf("duplicate status = %d, want %d: %s", duplicateRecorder.Code, http.StatusAccepted, duplicateRecorder.Body.String())
-			}
-			stored, err := db.GetForgeEvent(t.Context(), tt.provider+":"+tt.delivery)
-			if err != nil {
-				t.Fatalf("get duplicate event: %v", err)
-			}
-			if stored.Body != "Please fix this" {
-				t.Fatalf("duplicate replaced event body = %q, want original payload", stored.Body)
-			}
-			incomplete, err := db.ListIncompleteForgeEvents(t.Context())
-			if err != nil {
-				t.Fatalf("list incomplete forge events: %v", err)
-			}
-			count := 0
-			for _, event := range incomplete {
-				if event.ID == tt.provider+":"+tt.delivery {
-					count++
-				}
-			}
-			if count != 1 {
-				t.Fatalf("durable duplicate event count = %d, want 1", count)
-			}
 		})
 	}
 }
@@ -261,6 +225,121 @@ func TestWebhookReturnsInternalErrorWhenStoreFails(t *testing.T) {
 	handler.ServeHTTP(recorder, newWebhookRequest(http.MethodPost, "/v1/webhooks/github", "github", githubWebhookSecret, "github-store-error", "issue_comment", []byte(githubActionablePayload), "valid", false, false))
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d: %s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+}
+
+func TestWebhookReviewQuietPeriod(t *testing.T) {
+	t.Setenv("BITBUCKET_WEBHOOK_SECRET", bitbucketWebhookSecret)
+	db := openRunTestStore(t)
+	handler, err := newWebhookHandler(config.Config{
+		Bitbucket:    config.BitbucketConfig{WebhookSecret: config.SecretSource{Env: "BITBUCKET_WEBHOOK_SECRET"}},
+		Repositories: config.RepositoryConfigs{{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "service"}}},
+	}, db)
+	if err != nil {
+		t.Fatalf("newWebhookHandler: %v", err)
+	}
+
+	firstBefore := time.Now().UTC()
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, newWebhookRequest(http.MethodPost, "/v1/webhooks/bitbucket", "bitbucket", bitbucketWebhookSecret, "review-first", "pullrequest:comment_created", []byte(bitbucketActionablePayload), "valid", false, false))
+	firstAfter := time.Now().UTC()
+	if firstRecorder.Code != http.StatusAccepted {
+		t.Fatalf("first review status = %d, want %d: %s", firstRecorder.Code, http.StatusAccepted, firstRecorder.Body.String())
+	}
+	first, err := db.GetForgeEvent(t.Context(), "bitbucket:review-first")
+	if err != nil {
+		t.Fatalf("get first review event: %v", err)
+	}
+	assertWebhookReviewDeadline(t, first, firstBefore, firstAfter)
+	due, err := db.ListIncompleteForgeEvents(t.Context())
+	if err != nil {
+		t.Fatalf("list events during first review quiet period: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("events due during first review quiet period = %#v, want none", due)
+	}
+}
+
+func TestWebhookKeepsGitHubIssueCommentQuietPeriodsIndependent(t *testing.T) {
+	t.Setenv("GITHUB_WEBHOOK_SECRET", githubWebhookSecret)
+	db := openRunTestStore(t)
+	handler, err := newWebhookHandler(config.Config{
+		GitHub:       config.GitHubConfig{WebhookSecret: config.SecretSource{Env: "GITHUB_WEBHOOK_SECRET"}},
+		Repositories: config.RepositoryConfigs{{GitHub: config.RepositoryGitHubConfig{Owner: "acme", Repository: "service"}}},
+	}, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(firstRecorder, newWebhookRequest(http.MethodPost, "/v1/webhooks/github", "github", githubWebhookSecret, "issue-first", "issue_comment", []byte(githubActionablePayload), "valid", false, false))
+	if firstRecorder.Code != http.StatusAccepted {
+		t.Fatalf("first issue comment status = %d: %s", firstRecorder.Code, firstRecorder.Body.String())
+	}
+	first, err := db.GetForgeEvent(t.Context(), "github:issue-first")
+	if err != nil || first.CommitSHA != "" || first.NextAttemptAt == nil {
+		t.Fatalf("first issue comment = %#v, %v; want delayed SHA-less event", first, err)
+	}
+	firstDeadline := *first.NextAttemptAt
+	time.Sleep(time.Millisecond)
+
+	secondPayload := strings.ReplaceAll(githubActionablePayload, `"id":101`, `"id":102`)
+	secondPayload = strings.ReplaceAll(secondPayload, "issuecomment-101", "issuecomment-102")
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, newWebhookRequest(http.MethodPost, "/v1/webhooks/github", "github", githubWebhookSecret, "issue-second", "issue_comment", []byte(secondPayload), "valid", false, false))
+	if secondRecorder.Code != http.StatusAccepted {
+		t.Fatalf("second issue comment status = %d: %s", secondRecorder.Code, secondRecorder.Body.String())
+	}
+
+	first, err = db.GetForgeEvent(t.Context(), first.ID)
+	if err != nil || first.NextAttemptAt == nil || !first.NextAttemptAt.Equal(firstDeadline) {
+		t.Fatalf("first issue deadline after sibling = %v, %v; want unchanged %v", first.NextAttemptAt, err, firstDeadline)
+	}
+	second, err := db.GetForgeEvent(t.Context(), "github:issue-second")
+	if err != nil || second.CommitSHA != "" || second.NextAttemptAt == nil || !second.NextAttemptAt.After(firstDeadline) {
+		t.Fatalf("second issue comment = %#v, %v; want its own later quiet deadline", second, err)
+	}
+}
+
+func TestWebhookQualityGateRemainsImmediate(t *testing.T) {
+	t.Setenv("BITBUCKET_WEBHOOK_SECRET", bitbucketWebhookSecret)
+	db := openRunTestStore(t)
+	handler, err := newWebhookHandler(config.Config{
+		Bitbucket:    config.BitbucketConfig{WebhookSecret: config.SecretSource{Env: "BITBUCKET_WEBHOOK_SECRET"}},
+		Repositories: config.RepositoryConfigs{{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "service"}}},
+	}, db)
+	if err != nil {
+		t.Fatalf("newWebhookHandler: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, newWebhookRequest(http.MethodPost, "/v1/webhooks/bitbucket", "bitbucket", bitbucketWebhookSecret, "quality-first", "pipeline:build:completed", []byte(bitbucketQualityGatePayload), "valid", false, false))
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("quality-gate status = %d, want %d: %s", recorder.Code, http.StatusAccepted, recorder.Body.String())
+	}
+	stored, err := db.GetForgeEvent(t.Context(), "bitbucket:quality-first")
+	if err != nil {
+		t.Fatalf("get quality-gate event: %v", err)
+	}
+	if stored.Kind != "quality_gate_failed" || stored.NextAttemptAt != nil {
+		t.Fatalf("quality-gate event = %#v, want immediate quality_gate_failed event", stored)
+	}
+	due, err := db.ListIncompleteForgeEvents(t.Context())
+	if err != nil {
+		t.Fatalf("list immediately due quality-gate events: %v", err)
+	}
+	if len(due) != 1 || due[0].ID != "bitbucket:quality-first" {
+		t.Fatalf("immediately due quality-gate events = %#v, want quality event", due)
+	}
+}
+
+func assertWebhookReviewDeadline(t *testing.T, event store.ForgeEvent, before, after time.Time) {
+	t.Helper()
+	if event.NextAttemptAt == nil {
+		t.Fatalf("review event %q has no next_attempt_at", event.ID)
+	}
+	if event.NextAttemptAt.Before(before.Add(webhookReviewQuietPeriod-2*time.Minute)) || event.NextAttemptAt.After(after.Add(webhookReviewQuietPeriod+2*time.Minute)) {
+		t.Fatalf("review event %q next_attempt_at = %s, want approximately 30 minutes after receipt", event.ID, event.NextAttemptAt)
 	}
 }
 
@@ -448,3 +527,5 @@ func webhookTestSignature(secret string, body []byte, mode string) string {
 const githubActionablePayload = `{"action":"created","issue":{"number":42,"title":"Fix flaky test","html_url":"https://github.com/acme/service/pull/42","pull_request":{"url":"https://api.github.com/repos/acme/service/pulls/42"}},"comment":{"id":101,"body":"Please fix this","author_association":"MEMBER","user":{"login":"reviewer"},"html_url":"https://github.com/acme/service/issues/42#issuecomment-101"},"repository":{"name":"service","owner":{"login":"acme"}}}`
 
 const bitbucketActionablePayload = `{"comment":{"id":501,"content":{"raw":"Please fix this"},"user":{"uuid":"reviewer-uuid","nickname":"reviewer","display_name":"reviewer"},"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42/_/diff#comment-501"}}},"pullrequest":{"id":42,"title":"Fix flaky test","reviewers":[{"uuid":"reviewer-uuid"}],"links":{"html":{"href":"https://bitbucket.org/acme/service/pull-requests/42"}},"source":{"branch":{"name":"feature/fix"},"commit":{"hash":"abc123"}}},"repository":{"name":"service","slug":"service","workspace":{"slug":"acme"}}}`
+
+const bitbucketQualityGatePayload = `{"actor":{"display_name":"Bitbucket Pipelines"},"repository":{"name":"service","slug":"service","workspace":{"slug":"acme"}},"pipeline":{"uuid":"{pipeline-uuid}","build_number":404,"state":{"name":"COMPLETED","result":{"name":"FAILED"}},"target":{"ref_name":"feature/fix","commit":{"hash":"abc123"}},"links":{"self":{"href":"https://api.bitbucket.org/2.0/repositories/acme/service/pipelines/{pipeline-uuid}"}}}}`

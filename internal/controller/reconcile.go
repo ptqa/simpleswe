@@ -269,13 +269,15 @@ func (c *Controller) reconcileCancellation(ctx context.Context, record store.Tas
 	if err := c.store.MarkLogsExhausted(ctx, record.ID, attempt.ID); err != nil {
 		return err
 	}
-	if event, err := c.store.GetForgeEventByAttempt(ctx, attempt.ID); err == nil {
-		if event.Status == store.ForgeEventRunning {
-			if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
-				return err
+	if events, err := c.store.ListForgeEventsByAttempt(ctx, attempt.ID); err == nil {
+		for _, event := range events {
+			if event.Status == store.ForgeEventRunning {
+				if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
+					return fmt.Errorf("mark forge event %q handled during cancellation: %w", event.ID, err)
+				}
 			}
 		}
-	} else if !errors.Is(err, store.ErrNotFound) {
+	} else {
 		return err
 	}
 	if err := c.transition(ctx, record.ID, record.State, task.CANCELLED, "cancellation confirmed Job and owned Pods absent job="+jobName, "controller"); err != nil {
