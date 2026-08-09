@@ -324,6 +324,51 @@ func TestApplyDetailRejectsOlderGenerationForSameTask(t *testing.T) {
 	}
 }
 
+func TestCompletedLogStreamIsNotPeriodicallyRestarted(t *testing.T) {
+	vx, console := newTestVaxis(t, 80, 18)
+	fixture := newControllerFixture(t)
+	app := newTestApplication(t, fixture.client())
+	app.vx = vx
+	app.mode = viewLogs
+	app.model.RefreshTasks([]Task{fixture.task})
+	app.model.SetDetail(TaskDetail{Task: fixture.task, Attempts: []Attempt{fixture.attempt}})
+	app.model.SetConnectivity(ConnectivityConnected)
+	app.message = "ready"
+	app.startLogs(fixture.task.ID)
+
+	for {
+		result := receive(t, app.logsCh)
+		app.applyLog(result)
+		if result.done {
+			break
+		}
+	}
+	want := []string{"first line", "second line"}
+	if got := app.model.Logs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("completed logs = %#v, want %#v", got, want)
+	}
+
+	app.draw()
+	console.resetOutput()
+	logGeneration := app.logGen
+	app.options.RefreshInterval = time.Millisecond
+	quit := time.AfterFunc(20*time.Millisecond, func() { app.vx.PostEvent(vaxis.QuitEvent{}) })
+	defer quit.Stop()
+	if err := app.run(); err != nil {
+		t.Fatalf("run refresh cycle: %v", err)
+	}
+	if got := app.model.Logs(); !reflect.DeepEqual(got, want) || app.logGen != logGeneration {
+		t.Fatalf("unchanged refresh = logs %#v, generation %d", got, app.logGen)
+	}
+
+	console.resetOutput()
+	app.applyLog(logResult{taskID: fixture.task.ID, generation: app.logGen, line: "new line"})
+	app.draw()
+	if got := app.model.Logs(); !reflect.DeepEqual(got, append(want, "new line")) || console.output() == "" {
+		t.Fatalf("changed logs = %#v, terminal output bytes %d", got, len(console.output()))
+	}
+}
+
 func TestRunnerEntrypointsAndDefaults(t *testing.T) {
 	if err := (*Runner)(nil).Run(context.Background()); err == nil || err.Error() != "tui client is nil" {
 		t.Fatalf("nil runner error = %v", err)

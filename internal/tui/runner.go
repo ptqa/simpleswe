@@ -189,14 +189,15 @@ type application struct {
 	createError        string
 	createAccepted     bool
 
-	tasksCh    chan taskResult
-	detailCh   chan detailResult
-	logsCh     chan logResult
-	actionCh   chan actionResult
-	detailStop context.CancelFunc
-	logStop    context.CancelFunc
-	detailGen  uint64
-	logGen     uint64
+	tasksCh     chan taskResult
+	detailCh    chan detailResult
+	logsCh      chan logResult
+	actionCh    chan actionResult
+	detailStop  context.CancelFunc
+	logStop     context.CancelFunc
+	logComplete bool
+	detailGen   uint64
+	logGen      uint64
 }
 
 func newApplication(parent context.Context, vx *vaxis.Vaxis, api *client.Client, options Options) *application {
@@ -246,7 +247,7 @@ func (a *application) run() error {
 			a.applyAction(result)
 		case <-ticker.C:
 			a.refresh()
-			if a.logStop == nil {
+			if a.logStop == nil && !a.logComplete {
 				a.startLogs(a.model.SelectedTaskID())
 			}
 		}
@@ -387,6 +388,7 @@ func (a *application) startLogs(taskID string) {
 	attemptID := a.model.Detail().Task.CurrentAttemptID
 	ctx, stop := context.WithCancel(a.ctx)
 	a.logStop = stop
+	a.logComplete = false
 	a.model.ResetLogs()
 	go func() {
 		err := a.client.StreamLogs(ctx, taskID, client.LogOptions{
@@ -424,6 +426,7 @@ func (a *application) applyLog(result logResult) {
 	}
 	if result.done {
 		a.logStop = nil
+		a.logComplete = result.err == nil
 		if result.err != nil && !errors.Is(result.err, context.Canceled) {
 			a.message = "log stream interrupted: " + shortError(result.err)
 		}
