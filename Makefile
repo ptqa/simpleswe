@@ -3,7 +3,10 @@ CONTEXT := kind-$(CLUSTER)
 CONTROLLER_IMAGE ?= simpleswe-controller:kind
 KIND_NODE_IMAGE ?= kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
 
-.PHONY: local local-down
+.PHONY: build local local-down
+
+build:
+	go build -o simpleswe ./cmd/simpleswe
 
 local:
 	@kind get clusters | grep -qx "$(CLUSTER)" || kind create cluster --name "$(CLUSTER)" --image "$(KIND_NODE_IMAGE)"
