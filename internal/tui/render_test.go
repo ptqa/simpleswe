@@ -44,13 +44,18 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	console.resetOutput()
 	app.help = true
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "SIMPLESWE HELP", "Cancellation always asks")
+	assertOutputContains(t, renderedScreen(console, terminal), "SIMPLESWE HELP", "Restart and cancellation always ask")
 	app.help = false
 	console.resetOutput()
-	app.confirmCancel = true
+	app.confirmAction = "cancel"
 	app.draw()
 	assertOutputContains(t, renderedScreen(console, terminal), "CONFIRM CANCELLATION", "Cancel task task-1")
-	app.confirmCancel = false
+	app.confirmAction = ""
+	console.resetOutput()
+	app.confirmAction = "retry"
+	app.draw()
+	assertOutputContains(t, renderedScreen(console, terminal), "CONFIRM RESTART", "Restart task task-1")
+	app.confirmAction = ""
 	console.resetOutput()
 	app.themePicker = true
 	app.draw()
@@ -203,13 +208,6 @@ func TestRenderHelpers(t *testing.T) {
 	}
 	if formatTime(time.Time{}) != "—" || !strings.Contains(formatTime(time.Date(2026, 8, 6, 1, 2, 3, 0, time.UTC)), "2026-08-06") {
 		t.Fatal("formatTime returned unexpected text")
-	}
-	values := []string{"a", "b", "c"}
-	if got := rangeSlice(values, 1); strings.Join(got, "") != "bc" {
-		t.Fatalf("rangeSlice valid = %#v", got)
-	}
-	if rangeSlice(values, -1)[0] != "a" || rangeSlice(values, len(values))[0] != "a" {
-		t.Fatal("rangeSlice invalid start should return all values")
 	}
 }
 

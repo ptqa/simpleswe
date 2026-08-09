@@ -27,6 +27,16 @@ func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
 		}
 	case vaxis.QuitEvent:
 		return true, nil
+	case vaxis.Mouse:
+		if event.EventType != vaxis.EventRelease {
+			switch event.Button {
+			case vaxis.MouseWheelUp:
+				a.logOffset += 3
+			case vaxis.MouseWheelDown:
+				a.logOffset = max(0, a.logOffset-3)
+			default:
+			}
+		}
 	case vaxis.Key:
 		if event.EventType == vaxis.EventRelease {
 			return false, nil
@@ -78,14 +88,19 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 		}
 		return false, nil
 	}
-	if a.confirmCancel {
+	if a.confirmAction != "" {
 		switch {
 		case key.MatchString("y"), key.Matches(vaxis.KeyEnter):
-			a.confirmCancel = false
-			a.performAction("cancel")
+			action := a.confirmAction
+			a.confirmAction = ""
+			a.performAction(action)
 		case key.MatchString("n"), key.MatchString("q"), key.Matches(vaxis.KeyEsc):
-			a.confirmCancel = false
-			a.message = "cancellation dismissed"
+			if a.confirmAction == "retry" {
+				a.message = "restart dismissed"
+			} else {
+				a.message = "cancellation dismissed"
+			}
+			a.confirmAction = ""
 		}
 		return false, nil
 	}
@@ -128,12 +143,16 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	case key.MatchString("s"):
 		return false, a.shell()
 	case key.MatchString("r"):
-		a.performAction("retry")
+		if a.model.SelectedTaskID() == "" {
+			a.message = "no task selected"
+		} else {
+			a.confirmAction = "retry"
+		}
 	case key.MatchString("Ctrl+d"):
 		if a.model.SelectedTaskID() == "" {
 			a.message = "no task selected"
 		} else {
-			a.confirmCancel = true
+			a.confirmAction = "cancel"
 		}
 	case key.MatchString("R"):
 		a.message = "refreshing"

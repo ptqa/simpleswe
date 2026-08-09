@@ -79,7 +79,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		return errors.New("tui TTY and Console are mutually exclusive")
 	}
 	vx, err := vaxis.New(vaxis.Options{
-		DisableMouse:   true,
 		EventQueueSize: 256,
 		WithTTY:        options.TTY,
 		WithConsole:    options.Console,
@@ -172,9 +171,10 @@ type application struct {
 	themeCursor        int
 	themePrevious      themeName
 	help               bool
-	confirmCancel      bool
+	confirmAction      string
 	narrowDetail       bool
 	wrapLogs           bool
+	logOffset          int
 	message            string
 	refreshing         bool
 	refreshGen         uint64
@@ -389,6 +389,7 @@ func (a *application) startLogs(taskID string) {
 	ctx, stop := context.WithCancel(a.ctx)
 	a.logStop = stop
 	a.logComplete = false
+	a.logOffset = 0
 	a.model.ResetLogs()
 	go func() {
 		err := a.client.StreamLogs(ctx, taskID, client.LogOptions{

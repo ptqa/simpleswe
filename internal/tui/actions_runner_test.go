@@ -37,6 +37,17 @@ func TestHandleVaxisEvents(t *testing.T) {
 	if quit, err := app.handleVaxisEvent(struct{}{}); err != nil || quit {
 		t.Fatalf("unknown event = quit %v, error %v", quit, err)
 	}
+	app.model.RefreshTasks([]Task{{ID: "task-1"}, {ID: "task-2"}})
+	selected := app.model.SelectedTaskID()
+	if quit, err := app.handleVaxisEvent(vaxis.Mouse{Button: vaxis.MouseWheelUp}); err != nil || quit {
+		t.Fatalf("wheel up = quit %v, error %v", quit, err)
+	}
+	if app.logOffset != 3 || app.model.SelectedTaskID() != selected {
+		t.Fatalf("wheel up = offset %d, selected %q", app.logOffset, app.model.SelectedTaskID())
+	}
+	if quit, err := app.handleVaxisEvent(vaxis.Mouse{Button: vaxis.MouseWheelDown}); err != nil || quit || app.logOffset != 0 {
+		t.Fatalf("wheel down = quit %v, error %v, offset %d", quit, err, app.logOffset)
+	}
 }
 
 func TestHandleKeyTransitions(t *testing.T) {
@@ -52,10 +63,10 @@ func TestHandleKeyTransitions(t *testing.T) {
 	if app.help {
 		t.Fatal("? did not close help")
 	}
-	app.confirmCancel = true
+	app.confirmAction = "cancel"
 	pressKey(t, app, key('n'))
-	if app.confirmCancel || app.message != "cancellation dismissed" {
-		t.Fatalf("dismiss cancel = confirm %v, message %q", app.confirmCancel, app.message)
+	if app.confirmAction != "" || app.message != "cancellation dismissed" {
+		t.Fatalf("dismiss cancel = confirm %q, message %q", app.confirmAction, app.message)
 	}
 
 	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyDown})
@@ -98,12 +109,12 @@ func TestHandleKeyTransitions(t *testing.T) {
 		t.Fatalf("retry without task message = %q", app.message)
 	}
 	pressKey(t, app, vaxis.Key{Keycode: 'd', Modifiers: vaxis.ModCtrl})
-	if app.confirmCancel || app.message != "no task selected" {
-		t.Fatalf("cancel without task = confirm %v, message %q", app.confirmCancel, app.message)
+	if app.confirmAction != "" || app.message != "no task selected" {
+		t.Fatalf("cancel without task = confirm %q, message %q", app.confirmAction, app.message)
 	}
 	app.model.SetSelectedTask("task-1")
 	pressKey(t, app, vaxis.Key{Keycode: 'd', Modifiers: vaxis.ModCtrl})
-	if !app.confirmCancel {
+	if app.confirmAction != "cancel" {
 		t.Fatal("ctrl-d did not request confirmation")
 	}
 	pressKey(t, app, key('n'))
@@ -151,6 +162,29 @@ func TestHandleKeyTransitions(t *testing.T) {
 	}
 	if quit, err := app.handleKey(vaxis.Key{Keycode: 'c', Modifiers: vaxis.ModCtrl}); err != nil || !quit {
 		t.Fatalf("Ctrl+c = quit %v, error %v", quit, err)
+	}
+}
+
+func TestRestartRequiresConfirmation(t *testing.T) {
+	fixture := newControllerFixture(t)
+	app := newTestApplication(t, fixture.client())
+	app.model.RefreshTasks([]Task{fixture.task})
+
+	pressKey(t, app, key('r'))
+	if app.confirmAction != "retry" || app.actionPending {
+		t.Fatalf("restart key = confirm %q, pending %v", app.confirmAction, app.actionPending)
+	}
+	pressKey(t, app, key('n'))
+	if app.confirmAction != "" || app.message != "restart dismissed" {
+		t.Fatalf("dismissed restart = confirm %q, message %q", app.confirmAction, app.message)
+	}
+	pressKey(t, app, key('r'))
+	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyEnter})
+	if app.confirmAction != "" || !app.actionPending {
+		t.Fatalf("confirmed restart = confirm %q, pending %v", app.confirmAction, app.actionPending)
+	}
+	if result := receive(t, app.actionCh); result.name != "retry" || result.err != nil {
+		t.Fatalf("restart result = %#v", result)
 	}
 }
 

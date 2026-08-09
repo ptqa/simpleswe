@@ -61,8 +61,8 @@ func (a *application) draw() {
 		if a.themePicker {
 			a.drawThemeSwitcher(root)
 		}
-		if a.confirmCancel {
-			a.drawCancelConfirmation(root)
+		if a.confirmAction != "" {
+			a.drawActionConfirmation(root)
 		}
 		if a.createModal {
 			a.drawCreateTask(root)
@@ -101,8 +101,8 @@ func (a *application) draw() {
 	if a.themePicker {
 		a.drawThemeSwitcher(root)
 	}
-	if a.confirmCancel {
-		a.drawCancelConfirmation(root)
+	if a.confirmAction != "" {
+		a.drawActionConfirmation(root)
 	}
 	if a.createModal {
 		a.drawCreateTask(root)
@@ -143,7 +143,7 @@ func (a *application) drawFooter(win vaxis.Window) {
 	palette := a.colors()
 	fill(win, palette.header)
 	width, _ := win.Size()
-	keys := " n create  j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  ctrl-d cancel  t themes  w wrap  ? help  q back"
+	keys := " n create  j/k move  g/G ends  enter details  l logs  d job  p pod  s shell  r restart  ctrl-d cancel  t themes  w wrap  ? help  q back"
 	if width < 82 {
 		keys = " n create  j/k move  enter details  t themes  w wrap  ? help  q back"
 	}
@@ -350,34 +350,25 @@ func (a *application) drawLogs(win vaxis.Window) {
 	logs := a.model.Logs()
 	visible := max(0, height-1)
 	if len(logs) == 0 {
+		a.logOffset = 0
 		if height > 1 {
 			win.PrintTruncate(1, vaxis.Segment{Text: " Waiting for log stream…", Style: palette.dim})
 		}
 		return
 	}
-	if a.wrapLogs {
-		var flat [][]vaxis.Segment
-		for _, line := range logs {
-			rows := wrappedLogRows(line, palette.base, width)
-			flat = append(flat, rows...)
+	rows := make([][]vaxis.Segment, 0, len(logs))
+	for _, line := range logs {
+		if a.wrapLogs {
+			rows = append(rows, wrappedLogRows(line, palette.base, width)...)
+		} else {
+			rows = append(rows, ansiSegments(line, palette.base))
 		}
-		start := max(0, len(flat)-visible)
-		for index, segs := range flat[start:] {
-			row := index + 1
-			if row >= height {
-				break
-			}
-			win.PrintTruncate(row, segs...)
-		}
-		return
 	}
-	start := max(0, len(logs)-visible)
-	for index, line := range rangeSlice(logs, start) {
+	a.logOffset = min(a.logOffset, max(0, len(rows)-visible))
+	start := max(0, len(rows)-visible-a.logOffset)
+	end := min(len(rows), start+visible)
+	for index, segments := range rows[start:end] {
 		row := index + 1
-		if row >= height {
-			break
-		}
-		segments := ansiSegments(line, palette.base)
 		win.PrintTruncate(row, segments...)
 	}
 }
@@ -390,26 +381,36 @@ func (a *application) drawHelp(root vaxis.Window) {
 		"enter   task and attempt details",
 		"l       logs          e  events",
 		"d       Job details   p  Pod details",
-		"s       shell         r  retry",
+		"s       shell         r  restart",
 		"ctrl-d  cancel        R  refresh",
 		"t       choose theme  h  back",
 		"w       wrap logs     ?  help",
 		"q       back / quit",
 		"",
-		"Cancellation always asks for confirmation.",
+		"Restart and cancellation always ask for confirmation.",
 	}
 	a.drawOverlay(root, min(62, root.Width-4), min(len(lines)+4, root.Height-2), " SIMPLESWE HELP ", lines)
 }
 
-func (a *application) drawCancelConfirmation(root vaxis.Window) {
+func (a *application) drawActionConfirmation(root vaxis.Window) {
 	taskID := a.model.SelectedTaskID()
 	lines := []string{
-		"Cancel task " + taskID + "?",
-		"The controller will stop its active attempt.",
+		"Restart task " + taskID + "?",
+		"The controller will create a new attempt.",
 		"",
-		"y / enter  confirm     n / esc  keep running",
+		"y / enter  confirm     n / esc  keep current attempt",
 	}
-	a.drawOverlay(root, min(68, root.Width-4), min(8, root.Height-2), " CONFIRM CANCELLATION ", lines)
+	title := " CONFIRM RESTART "
+	if a.confirmAction == "cancel" {
+		title = " CONFIRM CANCELLATION "
+		lines = []string{
+			"Cancel task " + taskID + "?",
+			"The controller will stop its active attempt.",
+			"",
+			"y / enter  confirm     n / esc  keep running",
+		}
+	}
+	a.drawOverlay(root, min(68, root.Width-4), min(8, root.Height-2), title, lines)
 }
 
 func (a *application) drawCreateTask(root vaxis.Window) {
@@ -633,11 +634,4 @@ func formatTime(value time.Time) string {
 		return "—"
 	}
 	return value.Local().Format("2006-01-02 15:04:05 MST")
-}
-
-func rangeSlice(values []string, start int) []string {
-	if start < 0 || start >= len(values) {
-		return values
-	}
-	return values[start:]
 }

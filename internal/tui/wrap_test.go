@@ -32,8 +32,8 @@ func TestWrapToggleDefaultOffAndKey(t *testing.T) {
 		t.Fatal("wrapLogs is not per-application")
 	}
 
-	for _, active := range []string{"help", "themePicker", "confirmCancel", "createModal"} {
-		app.help, app.themePicker, app.confirmCancel = false, false, false
+	for _, active := range []string{"help", "themePicker", "confirmCancel", "confirmRetry", "createModal"} {
+		app.help, app.themePicker, app.confirmAction = false, false, ""
 		app.resetCreateTask()
 		app.wrapLogs = false
 		app.message = "unchanged"
@@ -43,7 +43,9 @@ func TestWrapToggleDefaultOffAndKey(t *testing.T) {
 		case "themePicker":
 			app.themePicker = true
 		case "confirmCancel":
-			app.confirmCancel = true
+			app.confirmAction = "cancel"
+		case "confirmRetry":
+			app.confirmAction = "retry"
 		case "createModal":
 			app.openCreateTask()
 		}
@@ -51,6 +53,24 @@ func TestWrapToggleDefaultOffAndKey(t *testing.T) {
 		if app.wrapLogs || app.message != "unchanged" {
 			t.Fatalf("w toggled with %s active: wrap %v, message %q", active, app.wrapLogs, app.message)
 		}
+	}
+}
+
+func TestDrawLogsUsesMouseScrollOffset(t *testing.T) {
+	vx, console := newTestVaxis(t, 20, 5)
+	model := NewModel(10)
+	for _, line := range []string{"line-1", "line-2", "line-3", "line-4", "line-5", "line-6", "line-7"} {
+		model.AppendLog(line)
+	}
+	app := &application{vx: vx, model: model, logOffset: 3, options: Options{LogCapacity: 10}}
+	terminal := term.New()
+	terminal.Resize(20, 5)
+
+	app.drawLogs(vx.Window())
+	vx.Render()
+	output := renderedScreen(console, terminal)
+	if !strings.Contains(output, "line-1") || strings.Contains(output, "line-7") {
+		t.Fatalf("scrolled logs = %q", output)
 	}
 }
 
