@@ -21,7 +21,7 @@ import (
 const (
 	githubWebhookSecret      = "github-webhook-test-secret"
 	bitbucketWebhookSecret   = "bitbucket-webhook-test-secret"
-	webhookReviewQuietPeriod = 30 * time.Minute
+	webhookReviewQuietPeriod = 5 * time.Minute
 )
 
 func TestWebhookHTTPReception(t *testing.T) {
@@ -238,6 +238,7 @@ func TestWebhookReviewQuietPeriod(t *testing.T) {
 	t.Setenv("BITBUCKET_WEBHOOK_SECRET", bitbucketWebhookSecret)
 	db := openRunTestStore(t)
 	handler, err := newWebhookHandler(config.Config{
+		Controller:   config.ControllerConfig{ReviewDebounce: webhookReviewQuietPeriod},
 		Bitbucket:    config.BitbucketConfig{WebhookSecret: config.SecretSource{Env: "BITBUCKET_WEBHOOK_SECRET"}},
 		Repositories: config.RepositoryConfigs{{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "service"}}},
 	}, db)
@@ -270,6 +271,7 @@ func TestWebhookKeepsGitHubIssueCommentQuietPeriodsIndependent(t *testing.T) {
 	t.Setenv("GITHUB_WEBHOOK_SECRET", githubWebhookSecret)
 	db := openRunTestStore(t)
 	handler, err := newWebhookHandler(config.Config{
+		Controller:   config.ControllerConfig{ReviewDebounce: webhookReviewQuietPeriod},
 		GitHub:       config.GitHubConfig{WebhookSecret: config.SecretSource{Env: "GITHUB_WEBHOOK_SECRET"}},
 		Repositories: config.RepositoryConfigs{{GitHub: config.RepositoryGitHubConfig{Owner: "acme", Repository: "service"}}},
 	}, db)
@@ -344,8 +346,8 @@ func assertWebhookReviewDeadline(t *testing.T, event store.ForgeEvent, before, a
 	if event.NextAttemptAt == nil {
 		t.Fatalf("review event %q has no next_attempt_at", event.ID)
 	}
-	if event.NextAttemptAt.Before(before.Add(webhookReviewQuietPeriod-2*time.Minute)) || event.NextAttemptAt.After(after.Add(webhookReviewQuietPeriod+2*time.Minute)) {
-		t.Fatalf("review event %q next_attempt_at = %s, want approximately 30 minutes after receipt", event.ID, event.NextAttemptAt)
+	if event.NextAttemptAt.Before(before.Add(webhookReviewQuietPeriod-time.Minute)) || event.NextAttemptAt.After(after.Add(webhookReviewQuietPeriod+time.Minute)) {
+		t.Fatalf("review event %q next_attempt_at = %s, want approximately %s after receipt", event.ID, event.NextAttemptAt, webhookReviewQuietPeriod)
 	}
 }
 

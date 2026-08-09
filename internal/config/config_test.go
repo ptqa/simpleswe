@@ -47,6 +47,9 @@ repositories:
 	if got, want := cfg.Controller.Deadline, 30*time.Minute; got != want {
 		t.Errorf("controller deadline = %s, want %s", got, want)
 	}
+	if got, want := cfg.Controller.ReviewDebounce, 30*time.Minute; got != want {
+		t.Errorf("controller review debounce = %s, want %s", got, want)
+	}
 	if got, want := cfg.Controller.MaxFixAttempts, 3; got != want {
 		t.Errorf("controller max fix attempts = %d, want %d", got, want)
 	}
@@ -65,6 +68,7 @@ func TestLoadPreservesRepositoryWorkerConfiguration(t *testing.T) {
 	cfg, err := Load(strings.NewReader(`
 controller:
   namespace: engineering
+  review_debounce: 5m
 bitbucket:
   webhook_secret:
     file: /run/secrets/webhooks/bitbucket
@@ -106,6 +110,9 @@ repositories:
 
 	if len(cfg.Repositories) != 1 {
 		t.Fatalf("repositories = %d, want 1", len(cfg.Repositories))
+	}
+	if got, want := cfg.Controller.ReviewDebounce, 5*time.Minute; got != want {
+		t.Errorf("controller review debounce = %s, want %s", got, want)
 	}
 	repository := cfg.Repositories[0]
 	if got, want := repository.CloneURL, "https://bitbucket.example/acme/widget.git"; got != want {

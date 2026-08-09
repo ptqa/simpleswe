@@ -21,6 +21,7 @@ const (
 	defaultWorkerCommand        = "opencode"
 	defaultBranchPrefix         = "simpleswe/"
 	defaultDeadline             = 30 * time.Minute
+	defaultReviewDebounce       = 30 * time.Minute
 	defaultMaxFixAttempts       = 3
 )
 
@@ -55,6 +56,7 @@ type ControllerConfig struct {
 	WebhookListenAddress string        `yaml:"webhook_listen_address"`
 	Namespace            string        `yaml:"namespace"`
 	Deadline             time.Duration `yaml:"deadline"`
+	ReviewDebounce       time.Duration `yaml:"review_debounce"`
 	MaxFixAttempts       int           `yaml:"max_fix_attempts"`
 	maxFixAttemptsSet    bool
 }
@@ -287,6 +289,9 @@ func (c *Config) applyDefaults() {
 	if c.Controller.Deadline == 0 {
 		c.Controller.Deadline = defaultDeadline
 	}
+	if c.Controller.ReviewDebounce == 0 {
+		c.Controller.ReviewDebounce = defaultReviewDebounce
+	}
 	if !c.Controller.maxFixAttemptsSet && c.Controller.MaxFixAttempts == 0 {
 		c.Controller.MaxFixAttempts = defaultMaxFixAttempts
 	}
@@ -345,6 +350,9 @@ func (c Config) validate() error {
 	}
 	if c.Controller.Deadline <= 0 {
 		return fmt.Errorf("controller.deadline must be positive")
+	}
+	if c.Controller.ReviewDebounce <= 0 {
+		return fmt.Errorf("controller.review_debounce must be positive")
 	}
 	if c.Controller.MaxFixAttempts < 0 {
 		return fmt.Errorf("controller.max_fix_attempts must not be negative")
@@ -656,6 +664,7 @@ func (c *ControllerConfig) UnmarshalYAML(node *yaml.Node) error {
 		WebhookListenAddress string `yaml:"webhook_listen_address"`
 		Namespace            string `yaml:"namespace"`
 		Deadline             string `yaml:"deadline"`
+		ReviewDebounce       string `yaml:"review_debounce"`
 		MaxFixAttempts       *int   `yaml:"max_fix_attempts"`
 	}
 	if err := decodeNodeStrict(node, &raw); err != nil {
@@ -669,11 +678,20 @@ func (c *ControllerConfig) UnmarshalYAML(node *yaml.Node) error {
 		}
 		deadline = parsed
 	}
+	reviewDebounce := time.Duration(0)
+	if raw.ReviewDebounce != "" {
+		parsed, err := time.ParseDuration(raw.ReviewDebounce)
+		if err != nil {
+			return fmt.Errorf("controller.review_debounce must be a duration")
+		}
+		reviewDebounce = parsed
+	}
 	*c = ControllerConfig{
 		ListenAddress:        raw.ListenAddress,
 		WebhookListenAddress: raw.WebhookListenAddress,
 		Namespace:            raw.Namespace,
 		Deadline:             deadline,
+		ReviewDebounce:       reviewDebounce,
 		maxFixAttemptsSet:    raw.MaxFixAttempts != nil,
 	}
 	if raw.MaxFixAttempts != nil {

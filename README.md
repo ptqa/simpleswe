@@ -140,6 +140,7 @@ controller:
   webhook_listen_address: ":8081"
   namespace: simpleswe
   deadline: 30m
+  review_debounce: 30m
   max_fix_attempts: 3
 
 worker:

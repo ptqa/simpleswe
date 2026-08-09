@@ -21,14 +21,12 @@ import (
 	"github.com/simpleswe/simpleswe/internal/store"
 )
 
-const (
-	maxWebhookBodyBytes    = 1 << 20
-	forgeReviewQuietWindow = 30 * time.Minute
-)
+const maxWebhookBodyBytes = 1 << 20
 
 type webhookHandler struct {
-	store   *store.Store
-	secrets map[forge.Provider]string
+	store          *store.Store
+	secrets        map[forge.Provider]string
+	reviewDebounce time.Duration
 }
 
 func newWebhookHandler(cfg config.Config, db *store.Store) (http.Handler, error) {
@@ -61,7 +59,7 @@ func newWebhookHandler(cfg config.Config, db *store.Store) (http.Handler, error)
 		}
 		secrets[provider.name] = secret
 	}
-	return webhookHandler{store: db, secrets: secrets}, nil
+	return webhookHandler{store: db, secrets: secrets, reviewDebounce: cfg.Controller.ReviewDebounce}, nil
 }
 
 func readWebhookSecret(source config.SecretSource, description string) (string, error) {
@@ -148,7 +146,7 @@ func (h webhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			CommitSHA: event.CommitSHA, Branch: event.Branch, CommentID: event.CommentID,
 			CommentKind: event.CommentKind, Title: event.Title, Body: event.Body,
 			Author: event.Author, URL: event.URL,
-		}, forgeReviewQuietWindow); err != nil {
+		}, h.reviewDebounce); err != nil {
 			writeWebhookError(w, http.StatusInternalServerError, "internal_error", "internal server error")
 			return
 		}

@@ -139,7 +139,8 @@
           "type": "object",
           "properties": {
             "listen_address": { "type": "string", "pattern": ".*\\S.*" },
-            "webhook_listen_address": { "const": ":8081" }
+            "webhook_listen_address": { "const": ":8081" },
+            "review_debounce": { "type": "string", "pattern": ".*\\S.*" }
           }
         },
         "bitbucket": {

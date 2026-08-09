@@ -83,6 +83,7 @@ func validConfig() Config {
 			WebhookListenAddress: ":8081",
 			Namespace:            "simpleswe",
 			Deadline:             time.Minute,
+			ReviewDebounce:       time.Minute,
 			MaxFixAttempts:       1,
 		},
 		Worker: WorkerConfig{
@@ -100,6 +101,9 @@ func TestConfigValidateTopLevelFields(t *testing.T) {
 		"shared listen address":  func(c *Config) { c.Controller.WebhookListenAddress = c.Controller.ListenAddress },
 		"namespace":              func(c *Config) { c.Controller.Namespace = "INVALID" },
 		"deadline":               func(c *Config) { c.Controller.Deadline = 0 },
+		"negative review debounce": func(c *Config) {
+			c.Controller.ReviewDebounce = -time.Second
+		},
 		"max fix attempts": func(c *Config) {
 			c.Controller.MaxFixAttempts = -1
 		},
@@ -248,8 +252,9 @@ func TestValidationHelpers(t *testing.T) {
 
 func TestYAMLUnmarshalStrictErrors(t *testing.T) {
 	for name, input := range map[string]string{
-		"controller unknown field": "unexpected: true\n",
-		"controller bad deadline":  "deadline: not-a-duration\n",
+		"controller unknown field":       "unexpected: true\n",
+		"controller bad deadline":        "deadline: not-a-duration\n",
+		"controller bad review debounce": "review_debounce: not-a-duration\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			var controller ControllerConfig
