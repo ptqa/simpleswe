@@ -18,7 +18,9 @@ const (
 	ForgeEventHandled = "handled"
 	ForgeEventFailed  = "failed"
 	// forgeEventBatchSize bounds each review follow-up.
-	forgeEventBatchSize = 32
+	forgeEventBatchSize     = 32
+	forgeEventErrorMaxBytes = 4 << 10
+	forgeEventYieldDelay    = 5 * time.Second
 )
 
 var ErrForgeEventNotDue = errors.New("forge event is not due")
@@ -211,9 +213,10 @@ func (s *Store) ListForgeEventsByAttempt(ctx context.Context, attemptID string) 
 	return events, nil
 }
 
-// ListIncompleteForgeEvents returns due pending and running events in acceptance order.
+// ListIncompleteForgeEvents returns due pending and running events in
+// eligibility order, with acceptance order as the stable tie-breaker.
 func (s *Store) ListIncompleteForgeEvents(ctx context.Context) (_ []ForgeEvent, resultErr error) {
-	rows, err := s.db.QueryContext(ctx, forgeEventSelect+" WHERE status IN ('pending', 'running') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY created_at, rowid LIMIT ?", stamp(time.Now().UTC()), forgeEventBatchSize)
+	rows, err := s.db.QueryContext(ctx, forgeEventSelect+" WHERE status IN ('pending', 'running') AND (next_attempt_at IS NULL OR next_attempt_at <= ?) ORDER BY COALESCE(next_attempt_at, created_at), created_at, rowid LIMIT ?", stamp(time.Now().UTC()), forgeEventBatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("list incomplete forge events: %w", err)
 	}
@@ -230,6 +233,33 @@ func (s *Store) ListIncompleteForgeEvents(ctx context.Context) (_ []ForgeEvent, 
 		return nil, fmt.Errorf("list incomplete forge events: %w", err)
 	}
 	return events, nil
+}
+
+// DeferForgeEvent yields incomplete work without changing its outcome,
+// ownership, failure count, or diagnostic error.
+func (s *Store) DeferForgeEvent(ctx context.Context, id, expectedStatus string) error {
+	if strings.TrimSpace(id) == "" {
+		return errors.New("forge event ID is empty")
+	}
+	if expectedStatus != ForgeEventPending && expectedStatus != ForgeEventRunning {
+		return fmt.Errorf("forge event expected status %q cannot be deferred", expectedStatus)
+	}
+	now := time.Now().UTC()
+	deadline := stamp(now.Add(forgeEventYieldDelay))
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE forge_events
+		SET next_attempt_at = CASE
+			WHEN next_attempt_at IS NULL OR next_attempt_at < ? THEN ?
+			ELSE next_attempt_at
+		END, updated_at = ?
+		WHERE id = ? AND status = ?`, deadline, deadline, stamp(now), id, expectedStatus)
+	if err != nil {
+		return fmt.Errorf("defer forge event %q: %w", id, err)
+	}
+	if _, err := result.RowsAffected(); err != nil {
+		return fmt.Errorf("confirm forge event %q deferral: %w", id, err)
+	}
+	return nil
 }
 
 // ListDueForgeEventBatch expands a due review seed to the oldest due pending
@@ -268,28 +298,6 @@ func (s *Store) ListDueForgeEventBatch(ctx context.Context, seed ForgeEvent) (_ 
 	return events, nil
 }
 
-// RequestForgeEventCancellation records cancellation only while the event still
-// owns the task's current non-terminal attempt. Missing or stale associations
-// are safe no-ops.
-func (s *Store) RequestForgeEventCancellation(ctx context.Context, eventID string) (bool, error) {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET cancellation_requested = 1, updated_at = ?
-		WHERE state NOT IN (?, ?, ?)
-		  AND EXISTS (
-			SELECT 1 FROM forge_events
-			WHERE id = ? AND status = 'running' AND task_id = tasks.id
-			  AND attempt_id = tasks.current_attempt_id
-		  )`, stamp(time.Now().UTC()), task.READY, task.FAILED, task.CANCELLED, eventID)
-	if err != nil {
-		return false, fmt.Errorf("request forge event %q cancellation: %w", eventID, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("confirm forge event %q cancellation: %w", eventID, err)
-	}
-	return affected == 1, nil
-}
-
 // RecordForgeEventError records a failed processing attempt without completing
 // the event.
 func (s *Store) RecordForgeEventError(ctx context.Context, id string, cause error) error {
@@ -299,14 +307,11 @@ func (s *Store) RecordForgeEventError(ctx context.Context, id string, cause erro
 // RecordForgeEventErrorAfter defers transient work with bounded exponential
 // pacing, honoring a longer provider-supplied delay when available.
 func (s *Store) RecordForgeEventErrorAfter(ctx context.Context, id string, cause error, retryAfter time.Duration) error {
-	retryAfter = min(retryAfter, 24*time.Hour)
+	retryAfter = max(0, min(retryAfter, 24*time.Hour))
 	if strings.TrimSpace(id) == "" {
 		return errors.New("forge event ID is empty")
 	}
-	message := ""
-	if cause != nil {
-		message = cause.Error()
-	}
+	message := boundedForgeEventError(cause)
 	var attempts int
 	if err := s.db.QueryRowContext(ctx, `SELECT attempts FROM forge_events WHERE id = ? AND status IN ('pending', 'running')`, id).Scan(&attempts); errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: incomplete forge event %s", ErrNotFound, id)
@@ -333,6 +338,112 @@ func (s *Store) RecordForgeEventErrorAfter(ctx context.Context, id string, cause
 	return nil
 }
 
+// RecordForgeEventBatchErrorAfter atomically defers an exact selected batch.
+// The batch must either still be due, pending, and unassociated or be the
+// complete running association for one task attempt. A durable exact replay is
+// a no-op.
+func (s *Store) RecordForgeEventBatchErrorAfter(ctx context.Context, eventIDs []string, cause error, retryAfter time.Duration) error {
+	if err := validateForgeEventIDs(eventIDs); err != nil {
+		return err
+	}
+	retryAfter = max(0, min(retryAfter, 24*time.Hour))
+	message := boundedForgeEventError(cause)
+	return s.immediateTransaction(ctx, "forge event batch deferral", func(conn *sql.Conn) error {
+		events, err := readForgeEventsByIDs(ctx, conn, eventIDs)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		if replay, err := forgeEventBatchDeferralReplay(ctx, conn, events, message, retryAfter, now); replay || err != nil {
+			return err
+		}
+		outcome, err := validateForgeEventOutcomeBatch(ctx, conn, events, now)
+		if err != nil {
+			return err
+		}
+		delay := retryAfter
+		maxAttempts := 0
+		for _, event := range events {
+			delay = max(delay, forgeEventRetryDelay(event.Attempts))
+			maxAttempts = max(maxAttempts, event.Attempts)
+		}
+		updatedAt, nextAttemptAt := stamp(now), stamp(now.Add(delay))
+		args := make([]any, 0, forgeEventBatchSize+4)
+		args = append(args, message, updatedAt, nextAttemptAt)
+		for _, id := range eventIDs {
+			args = append(args, id)
+		}
+		for range forgeEventBatchSize - len(eventIDs) {
+			args = append(args, nil)
+		}
+		args = append(args, updatedAt)
+		query := `
+			UPDATE forge_events
+			SET attempts = attempts + 1, last_error = ?, updated_at = ?, next_attempt_at = ?
+			WHERE id IN (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) AND status = 'pending'
+			  AND task_id IS NULL AND attempt_id IS NULL
+			  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`
+		if outcome.status == ForgeEventRunning {
+			query = `
+				UPDATE forge_events
+				SET attempts = ?, last_error = ?, updated_at = ?, next_attempt_at = ?
+				WHERE id IN (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) AND status = 'running'
+				  AND task_id = ? AND attempt_id = ?`
+			args = append([]any{maxAttempts + 1}, args[:len(args)-1]...)
+			args = append(args, outcome.taskID, outcome.attemptID)
+		}
+		result, err := conn.ExecContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("record forge event batch error: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("confirm forge event batch error: %w", err)
+		} else if affected != int64(len(eventIDs)) {
+			return fmt.Errorf("%w: forge event batch changed while recording error", ErrConflict)
+		}
+		return nil
+	})
+}
+
+func forgeEventBatchDeferralReplay(ctx context.Context, conn *sql.Conn, events []ForgeEvent, message string, retryAfter time.Duration, now time.Time) (bool, error) {
+	first := events[0]
+	if first.Status != ForgeEventPending && first.Status != ForgeEventRunning || first.Attempts == 0 || first.LastError != message ||
+		first.NextAttemptAt == nil || !first.NextAttemptAt.After(now) {
+		return false, nil
+	}
+	associated := first.Status == ForgeEventRunning && first.TaskID != "" && first.AttemptID != ""
+	if first.Status == ForgeEventPending && (first.TaskID != "" || first.AttemptID != "") || first.Status == ForgeEventRunning && !associated {
+		return false, fmt.Errorf("%w: forge event batch deferral replay has an invalid association", ErrConflict)
+	}
+	for _, event := range events[1:] {
+		if event.Status != first.Status || event.TaskID != first.TaskID || event.AttemptID != first.AttemptID || event.Attempts == 0 || event.LastError != message ||
+			event.NextAttemptAt == nil || !event.NextAttemptAt.Equal(*first.NextAttemptAt) || !event.UpdatedAt.Equal(first.UpdatedAt) {
+			if associated {
+				return false, nil
+			}
+			return false, fmt.Errorf("%w: forge event batch deferral replay has different diagnostics", ErrConflict)
+		}
+	}
+	delay := retryAfter
+	for _, event := range events {
+		delay = max(delay, forgeEventRetryDelay(event.Attempts-1))
+	}
+	if !first.NextAttemptAt.Equal(first.UpdatedAt.Add(delay)) {
+		if associated {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: forge event batch deferral replay has a different retry delay", ErrConflict)
+	}
+	count, err := forgeEventOutcomeReplayCount(ctx, conn, first, message)
+	if err != nil {
+		return false, fmt.Errorf("confirm forge event batch deferral replay: %w", err)
+	}
+	if count != len(events) {
+		return false, fmt.Errorf("%w: forge event batch deferral replay has different members", ErrConflict)
+	}
+	return true, nil
+}
+
 func forgeEventRetryDelay(attempts int) time.Duration {
 	const base, maximum = 5 * time.Second, 5 * time.Minute
 	delay := base
@@ -342,29 +453,270 @@ func forgeEventRetryDelay(attempts int) time.Duration {
 	return min(delay, maximum)
 }
 
-// MarkForgeEventFailed records a permanent processing error without losing any
-// task and attempt association needed for durable diagnostics.
-func (s *Store) MarkForgeEventFailed(ctx context.Context, id string, cause error) error {
+// FailForgeEvent atomically fails incomplete work and requests cancellation
+// only when a running batch still owns the task's current non-terminal attempt.
+// Missing, stale, and terminal task associations do not prevent event failure.
+func (s *Store) FailForgeEvent(ctx context.Context, id string, cause error) error {
 	if strings.TrimSpace(id) == "" {
 		return errors.New("forge event ID is empty")
 	}
 	if cause == nil || strings.TrimSpace(cause.Error()) == "" {
 		return errors.New("forge event permanent error is empty")
 	}
-	now := stamp(time.Now().UTC())
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE forge_events
-		SET status = 'failed', attempts = attempts + 1, last_error = ?, next_attempt_at = NULL, failed_at = ?, updated_at = ?
-		WHERE id = ? AND status IN ('pending', 'running')`, cause.Error(), now, now, id)
+	message := boundedForgeEventError(cause)
+	return s.immediateTransaction(ctx, fmt.Sprintf("forge event %q failure", id), func(conn *sql.Conn) error {
+		var status, lastError string
+		var taskID, attemptID, failedAt sql.NullString
+		if err := conn.QueryRowContext(ctx, `SELECT status, task_id, attempt_id, last_error, failed_at FROM forge_events WHERE id = ?`, id).
+			Scan(&status, &taskID, &attemptID, &lastError, &failedAt); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: incomplete forge event %s", ErrNotFound, id)
+		} else if err != nil {
+			return fmt.Errorf("read forge event %q failure target: %w", id, err)
+		}
+		associated := taskID.Valid && taskID.String != "" && attemptID.Valid && attemptID.String != ""
+		if status == ForgeEventFailed && associated && lastError == message && failedAt.Valid {
+			return nil
+		}
+		if status != ForgeEventPending && status != ForgeEventRunning {
+			if status == ForgeEventFailed && associated {
+				return fmt.Errorf("%w: forge event %s already failed with different diagnostics", ErrConflict, id)
+			}
+			return fmt.Errorf("%w: incomplete forge event %s", ErrNotFound, id)
+		}
+
+		now := stamp(time.Now().UTC())
+		var result sql.Result
+		var err error
+		if status == ForgeEventRunning && associated {
+			if _, err := conn.ExecContext(ctx, `
+				UPDATE tasks SET cancellation_requested = 1, updated_at = ?
+				WHERE id = ? AND current_attempt_id = ? AND state NOT IN (?, ?, ?)`,
+				now, taskID.String, attemptID.String, task.READY, task.FAILED, task.CANCELLED); err != nil {
+				return fmt.Errorf("request forge event %q cancellation: %w", id, err)
+			}
+			result, err = conn.ExecContext(ctx, `
+				UPDATE forge_events
+				SET status = 'failed', attempts = attempts + 1, last_error = ?, next_attempt_at = NULL, failed_at = ?, updated_at = ?
+				WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, message, now, now, taskID.String, attemptID.String)
+		} else {
+			result, err = conn.ExecContext(ctx, `
+				UPDATE forge_events
+				SET status = 'failed', attempts = attempts + 1, last_error = ?, next_attempt_at = NULL, failed_at = ?, updated_at = ?
+				WHERE id = ? AND status IN ('pending', 'running')`, message, now, now, id)
+		}
+		if err != nil {
+			return fmt.Errorf("fail forge event %q: %w", id, err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("confirm forge event %q failure: %w", id, err)
+		} else if affected < 1 {
+			return fmt.Errorf("%w: incomplete forge event %s", ErrNotFound, id)
+		}
+		return nil
+	})
+}
+
+// FailForgeEventBatch atomically fails an exact selected batch. Pending work is
+// failed without cancellation. A complete running association is failed and
+// cancellation is requested only while it remains the current nonterminal
+// attempt. A durable exact replay is a no-op.
+func (s *Store) FailForgeEventBatch(ctx context.Context, eventIDs []string, cause error) error {
+	if err := validateForgeEventIDs(eventIDs); err != nil {
+		return err
+	}
+	if cause == nil || strings.TrimSpace(cause.Error()) == "" {
+		return errors.New("forge event permanent error is empty")
+	}
+	message := boundedForgeEventError(cause)
+	return s.immediateTransaction(ctx, "forge event batch failure", func(conn *sql.Conn) error {
+		events, err := readForgeEventsByIDs(ctx, conn, eventIDs)
+		if err != nil {
+			return err
+		}
+		if replay, err := forgeEventBatchFailureReplay(ctx, conn, events, message); replay || err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		outcome, err := validateForgeEventOutcomeBatch(ctx, conn, events, now)
+		if err != nil {
+			return err
+		}
+		timestamp := stamp(now)
+		if outcome.status == ForgeEventRunning {
+			if _, err := conn.ExecContext(ctx, `
+				UPDATE tasks SET cancellation_requested = 1, updated_at = ?
+				WHERE id = ? AND current_attempt_id = ? AND state NOT IN (?, ?, ?)`,
+				timestamp, outcome.taskID, outcome.attemptID, task.READY, task.FAILED, task.CANCELLED); err != nil {
+				return fmt.Errorf("request forge event batch cancellation: %w", err)
+			}
+		}
+		args := make([]any, 0, forgeEventBatchSize+3)
+		args = append(args, message, timestamp, timestamp)
+		for _, id := range eventIDs {
+			args = append(args, id)
+		}
+		for range forgeEventBatchSize - len(eventIDs) {
+			args = append(args, nil)
+		}
+		query := `
+			UPDATE forge_events
+			SET status = 'failed', attempts = attempts + 1, last_error = ?,
+			    next_attempt_at = NULL, failed_at = ?, updated_at = ?
+			WHERE id IN (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) AND status = 'pending'
+			  AND task_id IS NULL AND attempt_id IS NULL`
+		if outcome.status == ForgeEventRunning {
+			query = `
+				UPDATE forge_events
+				SET status = 'failed', attempts = attempts + 1, last_error = ?,
+				    next_attempt_at = NULL, failed_at = ?, updated_at = ?
+				WHERE id IN (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) AND status = 'running'
+				  AND task_id = ? AND attempt_id = ?`
+			args = append(args, outcome.taskID, outcome.attemptID)
+		}
+		result, err := conn.ExecContext(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("fail forge event batch: %w", err)
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return fmt.Errorf("confirm forge event batch failure: %w", err)
+		} else if affected != int64(len(eventIDs)) {
+			return fmt.Errorf("%w: forge event batch changed while failing", ErrConflict)
+		}
+		return nil
+	})
+}
+
+func forgeEventBatchFailureReplay(ctx context.Context, conn *sql.Conn, events []ForgeEvent, message string) (bool, error) {
+	first := events[0]
+	if first.Status != ForgeEventFailed || first.FailedAt == nil || first.LastError != message || first.NextAttemptAt != nil {
+		return false, nil
+	}
+	associated := first.TaskID != "" && first.AttemptID != ""
+	if !associated && (first.TaskID != "" || first.AttemptID != "") {
+		return false, fmt.Errorf("%w: forge event batch failure replay has an invalid association", ErrConflict)
+	}
+	for _, event := range events[1:] {
+		if event.Status != ForgeEventFailed || event.TaskID != first.TaskID || event.AttemptID != first.AttemptID || event.FailedAt == nil || event.LastError != message ||
+			event.NextAttemptAt != nil || !event.FailedAt.Equal(*first.FailedAt) || !event.UpdatedAt.Equal(first.UpdatedAt) {
+			return false, fmt.Errorf("%w: forge event batch failure replay has different diagnostics", ErrConflict)
+		}
+	}
+	count, err := forgeEventOutcomeReplayCount(ctx, conn, first, message)
 	if err != nil {
-		return fmt.Errorf("mark forge event %q failed: %w", id, err)
+		return false, fmt.Errorf("confirm forge event batch failure replay: %w", err)
 	}
-	if affected, err := result.RowsAffected(); err != nil {
-		return fmt.Errorf("confirm forge event %q failed: %w", id, err)
-	} else if affected != 1 {
-		return fmt.Errorf("%w: incomplete forge event %s", ErrNotFound, id)
+	if count != len(events) {
+		return false, fmt.Errorf("%w: forge event batch failure replay has different members", ErrConflict)
 	}
-	return nil
+	return true, nil
+}
+
+type forgeEventBatchOutcome struct {
+	status    string
+	taskID    string
+	attemptID string
+}
+
+func validateForgeEventOutcomeBatch(ctx context.Context, conn *sql.Conn, events []ForgeEvent, now time.Time) (forgeEventBatchOutcome, error) {
+	first := events[0]
+	if first.Kind != "review_comment" && len(events) != 1 {
+		return forgeEventBatchOutcome{}, fmt.Errorf("%w: non-review forge events cannot be batched", ErrConflict)
+	}
+	for _, event := range events[1:] {
+		if event.Kind != "review_comment" || !sameForgeEventBatch(first, event) {
+			return forgeEventBatchOutcome{}, fmt.Errorf("%w: forge review events do not share batch coordinates", ErrConflict)
+		}
+	}
+
+	outcome := forgeEventBatchOutcome{status: first.Status, taskID: first.TaskID, attemptID: first.AttemptID}
+	for _, event := range events {
+		if event.Status != outcome.status || event.TaskID != outcome.taskID || event.AttemptID != outcome.attemptID {
+			return forgeEventBatchOutcome{}, fmt.Errorf("%w: forge event batch has mixed outcomes or associations", ErrConflict)
+		}
+		if outcome.status == ForgeEventPending && event.NextAttemptAt != nil && event.NextAttemptAt.After(now) {
+			return forgeEventBatchOutcome{}, fmt.Errorf("%w: forge event %q is deferred until %s", ErrConflict, event.ID, event.NextAttemptAt.Format(time.RFC3339Nano))
+		}
+	}
+	if outcome.status == ForgeEventPending {
+		if outcome.taskID != "" || outcome.attemptID != "" {
+			return forgeEventBatchOutcome{}, fmt.Errorf("%w: pending forge event batch is already associated", ErrConflict)
+		}
+		return outcome, nil
+	}
+	if outcome.status != ForgeEventRunning || outcome.taskID == "" || outcome.attemptID == "" {
+		return forgeEventBatchOutcome{}, fmt.Errorf("%w: forge event batch is not pending or completely associated running work", ErrConflict)
+	}
+	var associated, validAttempt int
+	if err := conn.QueryRowContext(ctx, `
+		SELECT COUNT(*), EXISTS(SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ?)
+		FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`,
+		outcome.attemptID, outcome.taskID, outcome.taskID, outcome.attemptID).Scan(&associated, &validAttempt); err != nil {
+		return forgeEventBatchOutcome{}, fmt.Errorf("confirm exact running forge event batch: %w", err)
+	}
+	if validAttempt != 1 {
+		return forgeEventBatchOutcome{}, fmt.Errorf("%w: running forge event batch has a mismatched task and attempt", ErrConflict)
+	}
+	if associated != len(events) {
+		return forgeEventBatchOutcome{}, fmt.Errorf("%w: running forge event batch has unselected associated siblings", ErrConflict)
+	}
+	return outcome, nil
+}
+
+func forgeEventOutcomeReplayCount(ctx context.Context, conn *sql.Conn, first ForgeEvent, message string) (int, error) {
+	var count int
+	if first.TaskID != "" && first.AttemptID != "" {
+		var validAttempt int
+		query := `
+			SELECT COUNT(*), EXISTS(SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ?)
+			FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`
+		args := []any{first.AttemptID, first.TaskID, first.TaskID, first.AttemptID}
+		if first.Status == ForgeEventFailed {
+			query = `
+				SELECT COUNT(*), EXISTS(SELECT 1 FROM task_attempts WHERE id = ? AND task_id = ?)
+				FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'failed'
+				  AND last_error = ? AND failed_at = ? AND updated_at = ? AND next_attempt_at IS NULL`
+			args = append(args, message, stamp(*first.FailedAt), stamp(first.UpdatedAt))
+		}
+		err := conn.QueryRowContext(ctx, query, args...).Scan(&count, &validAttempt)
+		if err != nil {
+			return 0, fmt.Errorf("count associated forge event replay members: %w", err)
+		}
+		if validAttempt != 1 {
+			return 0, fmt.Errorf("%w: associated forge event replay has a mismatched task and attempt", ErrConflict)
+		}
+		return count, nil
+	}
+	if first.Status == ForgeEventPending {
+		err := conn.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM forge_events
+			WHERE status = 'pending' AND task_id IS NULL AND attempt_id IS NULL
+			  AND attempts > 0 AND last_error = ? AND updated_at = ? AND next_attempt_at = ?`,
+			message, stamp(first.UpdatedAt), stamp(*first.NextAttemptAt)).Scan(&count)
+		if err != nil {
+			return 0, fmt.Errorf("count pending forge event replay members: %w", err)
+		}
+		return count, nil
+	}
+	err := conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM forge_events
+		WHERE status = 'failed' AND task_id IS NULL AND attempt_id IS NULL
+		  AND last_error = ? AND failed_at = ? AND updated_at = ? AND next_attempt_at IS NULL`,
+		message, stamp(*first.FailedAt), stamp(first.UpdatedAt)).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count failed forge event replay members: %w", err)
+	}
+	return count, nil
+}
+
+func boundedForgeEventError(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	message := strings.ToValidUTF8(cause.Error(), "")
+	if len(message) <= forgeEventErrorMaxBytes {
+		return message
+	}
+	return strings.ToValidUTF8(message[:forgeEventErrorMaxBytes], "")
 }
 
 // ForgeEventAttemptPlan reserves no durable state. It supplies the identity
@@ -405,14 +757,14 @@ func (s *Store) PlanForgeEventAttempt(ctx context.Context, eventIDs []string, ta
 		}
 		return ForgeEventAttemptPlan{Attempt: attempt, EventIDs: append([]string(nil), eventIDs...)}, nil
 	}
-	var currentAttemptID, headBranch string
+	var currentAttemptID, headBranch, baseBranch string
 	var number int
 	err = s.db.QueryRowContext(ctx, `
-		SELECT tasks.current_attempt_id, pull_requests.head_branch,
+		SELECT tasks.current_attempt_id, pull_requests.head_branch, pull_requests.base_branch,
 		       (SELECT COALESCE(MAX(number), 0) + 1 FROM task_attempts WHERE task_id = tasks.id)
 		FROM tasks
 		JOIN pull_requests ON pull_requests.attempt_id = tasks.current_attempt_id
-		WHERE tasks.id = ?`, taskID).Scan(&currentAttemptID, &headBranch, &number)
+		WHERE tasks.id = ?`, taskID).Scan(&currentAttemptID, &headBranch, &baseBranch, &number)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ForgeEventAttemptPlan{}, fmt.Errorf("%w: task %s with current pull request", ErrNotFound, taskID)
 	}
@@ -428,7 +780,7 @@ func (s *Store) PlanForgeEventAttempt(ctx context.Context, eventIDs []string, ta
 		EventIDs:          append([]string(nil), eventIDs...),
 		Attempt: Attempt{
 			ID: attemptID, TaskID: taskID, Number: number, Immutable: true,
-			State: task.QUEUED, Prompt: prompt, BaseBranch: headBranch, TaskBranch: headBranch,
+			State: task.QUEUED, Prompt: prompt, BaseBranch: baseBranch, TaskBranch: headBranch,
 		},
 	}, nil
 }
@@ -560,7 +912,7 @@ func validateForgeFollowUpTask(ctx context.Context, tx *sql.Tx, taskID string, c
 	if pullRequest.State != "open" || pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.HeadBranch) == "" {
 		return fmt.Errorf("%w: task %q current attempt has no open pull request", ErrConflict, taskID)
 	}
-	if current.attemptID != previousAttemptID || baseBranch != pullRequest.HeadBranch || taskBranch != pullRequest.HeadBranch {
+	if current.attemptID != previousAttemptID || baseBranch != pullRequest.BaseBranch || taskBranch != pullRequest.HeadBranch {
 		return fmt.Errorf("%w: task %q current pull request changed while planning forge follow-up", ErrConflict, taskID)
 	}
 	if err := (task.Machine{}).ForgeFollowUp(task.State(current.state), task.QUEUED); err != nil {
@@ -568,6 +920,13 @@ func validateForgeFollowUpTask(ctx context.Context, tx *sql.Tx, taskID string, c
 	}
 	if current.logsExhausted != 1 {
 		return fmt.Errorf("%w: current attempt %q logs are not exhausted", ErrConflict, current.attemptID)
+	}
+	var pendingWorkerEvents int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_log_events WHERE task_id = ? AND attempt_id = ? AND processed = 0)`, taskID, current.attemptID).Scan(&pendingWorkerEvents); err != nil {
+		return fmt.Errorf("check pending worker events for forge follow-up: %w", err)
+	}
+	if pendingWorkerEvents == 1 {
+		return fmt.Errorf("%w: current attempt %q has pending durable worker events", ErrConflict, current.attemptID)
 	}
 	if current.cancellationRequested == 1 {
 		return fmt.Errorf("%w: task %q has cancellation requested", ErrConflict, taskID)
@@ -599,7 +958,7 @@ func writeForgeFollowUpAttempt(ctx context.Context, tx *sql.Tx, eventIDs []strin
 			(id, task_id, number, immutable, state, prompt, base_branch, task_branch,
 			 manifest_json, resource_snapshot, config_digest, created_at)
 		VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		attempt.ID, attempt.TaskID, attemptNumber, task.QUEUED, attempt.Prompt, current.pullRequest.HeadBranch, current.pullRequest.HeadBranch,
+		attempt.ID, attempt.TaskID, attemptNumber, task.QUEUED, attempt.Prompt, attempt.BaseBranch, attempt.TaskBranch,
 		attempt.ManifestJSON, attempt.ResourceSnapshot, attempt.ConfigDigest, stamp(now)); err != nil {
 		return fmt.Errorf("insert forge follow-up attempt: %w", err)
 	}

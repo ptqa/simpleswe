@@ -27,13 +27,6 @@ import (
 
 type cleanupPullRequests struct{}
 
-func (cleanupPullRequests) CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error) {
-	return forge.PullRequest{}, errors.New("unexpected pull request creation")
-}
-
-func (cleanupPullRequests) FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error) {
-	return forge.PullRequest{}, false, nil
-}
 func (cleanupPullRequests) GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error) {
 	return forge.PullRequestState{}, errors.New("unexpected pull request inspection")
 }

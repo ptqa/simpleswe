@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,7 +14,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
@@ -39,9 +43,6 @@ func TestProcessForgeEventsIgnoresUnownedPullRequest(t *testing.T) {
 	jobList, err := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
 	if err != nil || len(jobList.Items) != 0 {
 		t.Fatalf("Jobs for unowned event = %d, %v; want none", len(jobList.Items), err)
-	}
-	if len(fixture.pullRequests.calls) != 0 {
-		t.Fatalf("unowned event created %d pull requests", len(fixture.pullRequests.calls))
 	}
 }
 
@@ -76,6 +77,318 @@ func TestProcessForgeEventsDurablyDefersOneFailureAndContinues(t *testing.T) {
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, unrelated.ID)
 	if err != nil || handled.Status != store.ForgeEventHandled {
 		t.Fatalf("unrelated due event = %#v, %v; want handled", handled, err)
+	}
+}
+
+func TestProcessForgeEventsAtomicallyDefersExactSelectedStartFailureBatch(t *testing.T) {
+	fixture := newFixture(t)
+	_, _, branch := createOwnedOpenPullRequest(t, fixture)
+	active := controllerForgeEvent("atomic-active-follow-up", "review_comment", 42)
+	active.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("start active event: %v", err)
+	}
+
+	first := controllerForgeEvent("atomic-blocked-first", "review_comment", 42)
+	first.Branch, first.CommentID = branch, 701
+	second := first
+	second.ID, second.CommentID = "atomic-blocked-second", 702
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("persist selected start failure batch: %v", err)
+	}
+	firstStored, err := fixture.store.GetForgeEvent(fixture.ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStored, err := fixture.store.GetForgeEvent(fixture.ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []store.ForgeEvent{firstStored, secondStored} {
+		if event.Status != store.ForgeEventPending || event.TaskID != "" || event.AttemptID != "" || event.Attempts != 1 || event.LastError == "" || event.NextAttemptAt == nil {
+			t.Fatalf("atomically deferred selected member = %#v", event)
+		}
+	}
+	if !firstStored.NextAttemptAt.Equal(*secondStored.NextAttemptAt) || !firstStored.UpdatedAt.Equal(secondStored.UpdatedAt) || firstStored.LastError != secondStored.LastError {
+		t.Fatalf("selected batch diagnostics differ: first=%#v second=%#v", firstStored, secondStored)
+	}
+	seed, err := fixture.store.GetForgeEvent(fixture.ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regrouped, err := fixture.store.ListDueForgeEventBatch(fixture.ctx, seed); err != nil || len(regrouped) != 0 {
+		t.Fatalf("deferred selected siblings can regroup early: %#v, %v", regrouped, err)
+	}
+}
+
+func TestProcessForgeEventsAtomicallyFailsExactSelectedPermanentStartFailureBatch(t *testing.T) {
+	fixture := newFixture(t)
+	record, attempt, branch := createOwnedOpenPullRequest(t, fixture)
+	execFixtureSQL(t, fixture, `UPDATE pull_requests SET url = '' WHERE attempt_id = ?`, attempt.ID)
+	first := controllerForgeEvent("atomic-permanent-first", "review_comment", 42)
+	first.Branch, first.CommentID = branch, 801
+	second := first
+	second.ID, second.CommentID = "atomic-permanent-second", 802
+	for _, event := range []store.ForgeEvent{first, second} {
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("persist permanent selected start failure: %v", err)
+	}
+	firstStored, err := fixture.store.GetForgeEvent(fixture.ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStored, err := fixture.store.GetForgeEvent(fixture.ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []store.ForgeEvent{firstStored, secondStored} {
+		if event.Status != store.ForgeEventFailed || event.TaskID != "" || event.AttemptID != "" || event.Attempts != 1 || event.LastError == "" || event.FailedAt == nil || event.NextAttemptAt != nil {
+			t.Fatalf("atomically failed selected member = %#v", event)
+		}
+	}
+	if !firstStored.FailedAt.Equal(*secondStored.FailedAt) || !firstStored.UpdatedAt.Equal(secondStored.UpdatedAt) || firstStored.LastError != secondStored.LastError {
+		t.Fatalf("selected permanent diagnostics differ: first=%#v second=%#v", firstStored, secondStored)
+	}
+	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
+	if err != nil || len(attempts) != 1 {
+		t.Fatalf("permanent pre-start failure created a follow-up: %#v, %v", attempts, err)
+	}
+}
+
+func TestProcessForgeEventsDefersAssociatedBatchAfterTransientKubernetesStartupFailure(t *testing.T) {
+	fixture := newFixture(t)
+	record, original, branch := createOwnedOpenPullRequest(t, fixture)
+	failJobCreate := true
+	fixture.kube.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if failJobCreate {
+			return true, nil, apierrors.NewTimeoutError("temporary follow-up Job create", 1)
+		}
+		return false, nil, nil
+	})
+	events := make([]store.ForgeEvent, 32)
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("transient-associated-%02d", i), "review_comment", 42)
+		events[i].Branch, events[i].CommentID = branch, 811+i
+		event := events[i]
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("transient startup outcome: %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || followUp.ID == original.ID || followUp.State != task.CREATING_JOB {
+		t.Fatalf("transient follow-up = %#v, %v", followUp, err)
+	}
+	stored := make([]store.ForgeEvent, len(events))
+	for i, event := range events {
+		stored[i], err = fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored[i].Status != store.ForgeEventRunning || stored[i].TaskID != record.ID || stored[i].AttemptID != followUp.ID || stored[i].Attempts != 2 || stored[i].NextAttemptAt == nil {
+			t.Fatalf("transient associated member = %#v, %v", stored[i], err)
+		}
+	}
+	for _, event := range stored[1:] {
+		if !stored[0].NextAttemptAt.Equal(*event.NextAttemptAt) || !stored[0].UpdatedAt.Equal(event.UpdatedAt) || stored[0].LastError != event.LastError {
+			t.Fatalf("transient associated backoff differs: first=%#v sibling=%#v", stored[0], event)
+		}
+	}
+
+	failJobCreate = false
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE attempt_id = ?`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), followUp.ID)
+	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("recover transient startup after restart: %v", err)
+	}
+	recovered, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || recovered.ID != followUp.ID || recovered.State != task.JOB_PENDING {
+		t.Fatalf("recovered same follow-up = %#v, %v; want %q", recovered, err, followUp.ID)
+	}
+	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("transient recovery attempts = %#v, %v", attempts, err)
+	}
+	if _, err := fixture.kube.BatchV1().Jobs(workerNamespace).Get(fixture.ctx, jobs.Name(record.ID, followUp.Number), metav1.GetOptions{}); err != nil {
+		t.Fatalf("recovered follow-up Job: %v", err)
+	}
+}
+
+func TestProcessForgeEventsRecoveryBatchPersistenceFailureChangesNoMember(t *testing.T) {
+	fixture := newFixture(t)
+	_, _, followUp, _, events := startRunningForgeEventBatch(t, fixture, "recovery-persistence")
+	fixture.pullRequests.getErr = errors.New("temporary provider inspection failure")
+	execFixtureSQL(t, fixture, `CREATE TRIGGER reject_recovery_batch_backoff BEFORE UPDATE OF attempts ON forge_events BEGIN SELECT RAISE(FAIL, 'forced recovery batch persistence failure'); END`)
+
+	err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx)
+	var persistenceErr forgeEventPersistenceError
+	if !errors.As(err, &persistenceErr) || !strings.Contains(err.Error(), "forced recovery batch persistence failure") {
+		t.Fatalf("recovery persistence error = %v", err)
+	}
+	for i, event := range events {
+		stored, getErr := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if getErr != nil || stored.Status != store.ForgeEventRunning || stored.AttemptID != followUp.ID || stored.Attempts != 1 || stored.LastError != "" || stored.NextAttemptAt != nil {
+			t.Fatalf("recovery persistence failure changed member %d: %#v, %v", i, stored, getErr)
+		}
+	}
+}
+
+func TestProcessForgeEventsAtomicallyDefersCompleteRecoveryBatch(t *testing.T) {
+	fixture := newFixture(t)
+	record, original, followUp, _, events := startRunningForgeEventBatch(t, fixture, "recovery-atomic")
+	fixture.pullRequests.getErr = errors.New("temporary provider inspection failure")
+
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("defer running recovery batch: %v", err)
+	}
+	deferred := make([]store.ForgeEvent, len(events))
+	for i, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventRunning || stored.TaskID != record.ID || stored.AttemptID != followUp.ID || stored.Attempts != 2 || stored.LastError == "" || stored.NextAttemptAt == nil {
+			t.Fatalf("deferred recovery member %d = %#v, %v", i, stored, err)
+		}
+		deferred[i] = stored
+	}
+	for _, event := range deferred[1:] {
+		if event.LastError != deferred[0].LastError || !event.UpdatedAt.Equal(deferred[0].UpdatedAt) || !event.NextAttemptAt.Equal(*deferred[0].NextAttemptAt) {
+			t.Fatalf("recovery diagnostics differ: first=%#v sibling=%#v", deferred[0], event)
+		}
+	}
+
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE attempt_id = ?`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), followUp.ID)
+	fixture.pullRequests.getErr = nil
+	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("retry recovery batch after restart: %v", err)
+	}
+	current, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || current.ID != followUp.ID || current.ID == original.ID {
+		t.Fatalf("restart replaced recovery attempt: %#v, %v", current, err)
+	}
+	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("restart duplicated recovery attempt: %#v, %v", attempts, err)
+	}
+	for _, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventRunning || stored.AttemptID != followUp.ID || stored.Attempts != 2 {
+			t.Fatalf("restarted recovery member = %#v, %v", stored, err)
+		}
+	}
+}
+
+func TestProcessForgeEventsRecoveryIgnoresHistoricalTerminalSiblings(t *testing.T) {
+	fixture := newFixture(t)
+	_, _, followUp, _, events := startRunningForgeEventBatch(t, fixture, "recovery-mixed")
+	if err := fixture.store.MarkForgeEventHandled(fixture.ctx, events[len(events)-1].ID); err != nil {
+		t.Fatal(err)
+	}
+	historicalAt := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET status = 'failed', attempts = 7, last_error = 'historical failure', failed_at = ?, updated_at = ?, next_attempt_at = NULL WHERE id = ?`, historicalAt, historicalAt, events[len(events)-2].ID)
+	handledBefore, err := fixture.store.GetForgeEvent(fixture.ctx, events[len(events)-1].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedBefore, err := fixture.store.GetForgeEvent(fixture.ctx, events[len(events)-2].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.pullRequests.getErr = errors.New("temporary provider inspection failure")
+	providerCalls := fixture.pullRequests.getCalls
+
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("partial terminal recovery: %v", err)
+	}
+	for i, event := range events {
+		stored, getErr := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		wantStatus := store.ForgeEventRunning
+		switch i {
+		case len(events) - 1:
+			wantStatus = store.ForgeEventHandled
+			if !reflect.DeepEqual(stored, handledBefore) {
+				t.Fatalf("historical handled member changed: before=%#v after=%#v", handledBefore, stored)
+			}
+		case len(events) - 2:
+			wantStatus = store.ForgeEventFailed
+			if !reflect.DeepEqual(stored, failedBefore) {
+				t.Fatalf("historical failed member changed: before=%#v after=%#v", failedBefore, stored)
+			}
+		}
+		if getErr != nil || stored.Status != wantStatus || stored.AttemptID != followUp.ID {
+			t.Fatalf("partial terminal recovery member %d: %#v, %v", i, stored, getErr)
+		}
+		if wantStatus == store.ForgeEventRunning && (stored.Attempts != 2 || stored.LastError == "" || stored.NextAttemptAt == nil) {
+			t.Fatalf("running recovery member was not deferred %d: %#v", i, stored)
+		}
+	}
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("immediate recovery replay: %v", err)
+	}
+	if fixture.pullRequests.getCalls != providerCalls+1 {
+		t.Fatalf("provider calls = %d, want %d; deferred running members must not loop", fixture.pullRequests.getCalls, providerCalls+1)
+	}
+}
+
+func TestProcessForgeEventsFailsAssociatedBatchAfterPermanentKubernetesStartupFailure(t *testing.T) {
+	fixture := newFixture(t)
+	record, original, branch := createOwnedOpenPullRequest(t, fixture)
+	fixture.kube.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInvalid(schema.GroupKind{Group: "batch", Kind: "Job"}, "bad-follow-up", nil)
+	})
+	events := make([]store.ForgeEvent, 32)
+	ids := make([]string, len(events))
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("permanent-associated-%02d", i), "review_comment", 42)
+		events[i].Branch, events[i].CommentID = branch, 900+i
+		ids[i] = events[i].ID
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("permanent startup outcome: %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || followUp.ID == original.ID {
+		t.Fatalf("permanent follow-up = %#v, %v", followUp, err)
+	}
+	failed := make([]store.ForgeEvent, len(ids))
+	for i, id := range ids {
+		failed[i], err = fixture.store.GetForgeEvent(fixture.ctx, id)
+		if err != nil || failed[i].Status != store.ForgeEventFailed || failed[i].TaskID != record.ID || failed[i].AttemptID != followUp.ID || failed[i].Attempts != 2 || failed[i].FailedAt == nil {
+			t.Fatalf("permanent associated member = %#v, %v", failed[i], err)
+		}
+	}
+	current := getTask(t, fixture, record.ID)
+	if current.State != task.FAILED || current.CancellationRequested {
+		t.Fatalf("permanent startup task = %#v; want terminal without cancellation", current)
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("terminal startup replay looped: %v", err)
+	}
+	replayed, err := fixture.store.GetForgeEvent(fixture.ctx, ids[0])
+	if err != nil || replayed.Attempts != failed[0].Attempts || !replayed.UpdatedAt.Equal(failed[0].UpdatedAt) {
+		t.Fatalf("terminal startup replay changed outcome: before=%#v after=%#v err=%v", failed[0], replayed, err)
 	}
 }
 
@@ -116,7 +429,7 @@ func TestForgeEventPersistenceFailureIsNotReclassified(t *testing.T) {
 	}
 }
 
-func TestPermanentRunningForgeFailureRequiresDurableCancellation(t *testing.T) {
+func TestPermanentRunningForgeFailureIsAtomic(t *testing.T) {
 	fixture := newFixture(t)
 	record, _, branch := createOwnedOpenPullRequest(t, fixture)
 	event := controllerForgeEvent("cancellation-persistence-error", "review_comment", 42)
@@ -132,12 +445,12 @@ func TestPermanentRunningForgeFailureRequiresDurableCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	execFixtureSQL(t, fixture, `CREATE TRIGGER reject_forge_cancellation BEFORE UPDATE OF cancellation_requested ON tasks WHEN NEW.cancellation_requested = 1 BEGIN SELECT RAISE(FAIL, 'forced cancellation persistence failure'); END`)
+	execFixtureSQL(t, fixture, `CREATE TRIGGER reject_forge_failure BEFORE UPDATE ON forge_events BEGIN SELECT RAISE(FAIL, 'forced forge failure update'); END`)
 	cause := forge.MarkPermanent(errors.New("provider ownership lost"))
 	err = control.persistForgeEventFailure(fixture.ctx, running, "recover", cause)
 	var persistenceErr forgeEventPersistenceError
-	if !errors.As(err, &persistenceErr) || !errors.Is(err, cause) || !strings.Contains(err.Error(), "forced cancellation persistence failure") {
-		t.Fatalf("persistForgeEventFailure() = %v; want cancellation persistence error", err)
+	if !errors.As(err, &persistenceErr) || !errors.Is(err, cause) || !strings.Contains(err.Error(), "forced forge failure update") {
+		t.Fatalf("persistForgeEventFailure() = %v; want atomic failure persistence error", err)
 	}
 	stored, getErr := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	current := getTask(t, fixture, record.ID)
@@ -321,8 +634,8 @@ func TestRunningForgeEventRecoveryKeepsAtomicSnapshotAndDoesNotDuplicateWork(t *
 	}
 	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
 	jobsList, jobsErr := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
-	if err != nil || jobsErr != nil || len(attempts) != 2 || attempts[0].ID != original.ID || attempts[1].ID != attempt.ID || len(jobsList.Items) != 2 || len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("recovery duplicated lifecycle: attempts=%#v Jobs=%d PR creates=%d errors=%v/%v", attempts, len(jobsList.Items), len(fixture.pullRequests.calls), err, jobsErr)
+	if err != nil || jobsErr != nil || len(attempts) != 2 || attempts[0].ID != original.ID || attempts[1].ID != attempt.ID || len(jobsList.Items) != 2 {
+		t.Fatalf("recovery duplicated lifecycle: attempts=%#v Jobs=%d errors=%v/%v", attempts, len(jobsList.Items), err, jobsErr)
 	}
 	manifest := followUpManifest(t, fixture, record.ID, recovered)
 	if manifest.Prompt != attempt.Prompt || manifest.TaskBranch != attempt.TaskBranch {
@@ -342,7 +655,7 @@ func execFixtureSQL(t *testing.T, fixture *fixture, statement string, args ...an
 	}
 }
 
-func TestProviderCommitMatchesDurable(t *testing.T) {
+func TestWebhookCommitMatchesDurable(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		provider string
@@ -357,16 +670,50 @@ func TestProviderCommitMatchesDurable(t *testing.T) {
 		{name: "non hex", provider: "not-a-commit", durable: fullCommitSHA},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := providerCommitMatchesDurable(test.provider, test.durable); got != test.want {
-				t.Fatalf("providerCommitMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
+			if got := webhookCommitMatchesDurable(test.provider, test.durable); got != test.want {
+				t.Fatalf("webhookCommitMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
 			}
 		})
 	}
 }
 
+func TestLiveProviderCommitExactlyMatchesDurable(t *testing.T) {
+	for _, test := range []struct {
+		provider string
+		durable  string
+		want     bool
+	}{
+		{provider: fullCommitSHA, durable: fullCommitSHA, want: true},
+		{provider: strings.ToUpper(fullCommitSHA), durable: fullCommitSHA, want: true},
+		{provider: strings.ToUpper(strings.Repeat("ab", 32)), durable: strings.Repeat("ab", 32), want: true},
+		{provider: fullCommitSHA[:12], durable: fullCommitSHA},
+		{provider: strings.Repeat("g", 40), durable: strings.Repeat("g", 40)},
+	} {
+		if got := liveProviderCommitExactlyMatchesDurable(test.provider, test.durable); got != test.want {
+			t.Errorf("liveProviderCommitExactlyMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
+		}
+	}
+}
+
 func recordPushedFollowUp(t *testing.T, fixture *fixture, attempt store.Attempt) {
 	t.Helper()
-	if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: attempt.ID, State: "pushed", Branch: attempt.TaskBranch, CommitSHA: fullCommitSHA}); err != nil {
+	recordPushedFollowUpWithSHA(t, fixture, attempt, fullCommitSHA)
+}
+
+func recordPushedFollowUpWithSHA(t *testing.T, fixture *fixture, attempt store.Attempt, commitSHA string) {
+	t.Helper()
+	pullRequest, err := fixture.store.GetPullRequest(fixture.ctx, attempt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := store.GitResult{AttemptID: attempt.ID, State: "candidate", Branch: attempt.TaskBranch, CommitSHA: commitSHA}
+	reported := pullRequest
+	reported.State, reported.URL, reported.Title = "reported", "", ""
+	if err := fixture.store.RecordPullRequestCandidate(fixture.ctx, git, reported); err != nil {
+		t.Fatal(err)
+	}
+	git.State = "pushed"
+	if err := fixture.store.RecordVerifiedPullRequest(fixture.ctx, git, pullRequest); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -493,7 +840,7 @@ func TestDurablePullRequestURLValidation(t *testing.T) {
 		want        bool
 	}{
 		{name: "HTTPS", value: "https://github.com/acme/widget/pull/42", want: true},
-		{name: "self hosted HTTP", value: "http://forge.internal:8080/acme/widget/pull/42", want: true},
+		{name: "self hosted HTTP", value: "http://forge.internal:8080/acme/widget/pull/42"},
 		{name: "malformed", value: "https://forge.example/%zz"},
 		{name: "credentials", value: "https://user:secret@forge.example/pull/42"},
 		{name: "hostless", value: "https:///pull/42"},
@@ -503,8 +850,9 @@ func TestDurablePullRequestURLValidation(t *testing.T) {
 		{name: "too long", value: "https://forge.example/" + strings.Repeat("x", 4<<10)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := validDurablePullRequestURL(test.value); got != test.want {
-				t.Fatalf("validDurablePullRequestURL(%q) = %t, want %t", test.value, got, test.want)
+			got := forge.ValidatePullRequestMetadata(test.value, "durable pull request") == nil
+			if got != test.want {
+				t.Fatalf("ValidatePullRequestMetadata(%q) validity = %t, want %t", test.value, got, test.want)
 			}
 		})
 	}
@@ -605,7 +953,7 @@ func TestProcessForgeEventsStartsOneOwnedFollowUpWithCurrentPRContext(t *testing
 			if err != nil {
 				t.Fatalf("current follow-up attempt: %v", err)
 			}
-			if followUp.ID == originalAttempt.ID || followUp.Number != 2 || followUp.State != task.JOB_PENDING || followUp.BaseBranch != branch || followUp.TaskBranch != branch {
+			if followUp.ID == originalAttempt.ID || followUp.Number != 2 || followUp.State != task.JOB_PENDING || followUp.BaseBranch != "main" || followUp.TaskBranch != branch {
 				t.Fatalf("follow-up attempt = %#v; want attempt 2 on current PR head %q", followUp, branch)
 			}
 			for _, value := range append(test.want, event.Title, event.CommitSHA, event.Branch) {
@@ -617,7 +965,7 @@ func TestProcessForgeEventsStartsOneOwnedFollowUpWithCurrentPRContext(t *testing
 				assertForgeReviewPrompt(t, followUp.Prompt, event)
 			}
 			manifest := followUpManifest(t, fixture, record.ID, followUp)
-			if manifest.BaseBranch != branch || manifest.TaskBranch != branch || manifest.Prompt != followUp.Prompt {
+			if manifest.BaseBranch != "main" || manifest.TaskBranch != branch || manifest.Prompt != followUp.Prompt || manifest.ExistingPullRequestNumber != 42 || manifest.ExistingPullRequestHeadSHA != fullCommitSHA {
 				t.Fatalf("follow-up manifest = %#v; want current PR branch and immutable attempt prompt", manifest)
 			}
 			jobsList, err := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
@@ -634,8 +982,8 @@ func TestProcessForgeEventsStartsOneOwnedFollowUpWithCurrentPRContext(t *testing
 			}
 			jobsList, _ = fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})
 			attempts, _ = fixture.store.ListAttempts(fixture.ctx, record.ID)
-			if len(jobsList.Items) != 2 || len(attempts) != 2 || len(fixture.pullRequests.calls) != 1 {
-				t.Fatalf("replayed processing duplicated resources: Jobs=%d attempts=%d PR creates=%d", len(jobsList.Items), len(attempts), len(fixture.pullRequests.calls))
+			if len(jobsList.Items) != 2 || len(attempts) != 2 {
+				t.Fatalf("replayed processing duplicated resources: Jobs=%d attempts=%d", len(jobsList.Items), len(attempts))
 			}
 		})
 	}
@@ -652,6 +1000,7 @@ func TestForgeFollowUpRejectsPullRequestThatIsNoLongerExactAndOpen(t *testing.T)
 		{name: "changed head", mutate: func(state *forge.PullRequestState) { state.SourceBranch = "other/head" }},
 		{name: "changed source repository", mutate: func(state *forge.PullRequestState) { state.SourceRepository = "fork" }},
 		{name: "changed head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("f", 40) }},
+		{name: "abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = fullCommitSHA[:12] }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t)
@@ -662,7 +1011,7 @@ func TestForgeFollowUpRejectsPullRequestThatIsNoLongerExactAndOpen(t *testing.T)
 				t.Fatal(err)
 			}
 			state := forge.PullRequestState{
-				Number: 42, State: "open", SourceOwner: "acme", SourceRepository: "widget",
+				Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
 				SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
 			}
 			test.mutate(&state)
@@ -796,14 +1145,12 @@ func TestForgeCompletionDefersPriorHeadLagThenRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	newSHA := strings.Repeat("1", 40)
-	if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: followUp.ID, State: "pushed", Branch: branch, CommitSHA: newSHA}); err != nil {
-		t.Fatal(err)
-	}
+	recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
 	fixture.pullRequests.getResult = &forge.PullRequestState{
-		Number: 42, State: "open", SourceOwner: "acme", SourceRepository: "widget",
+		Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
 		SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
 	}
-	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp); err != nil {
+	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
 		t.Fatalf("complete during provider lag: %v", err)
 	}
 	lagged, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
@@ -816,8 +1163,144 @@ func TestForgeCompletionDefersPriorHeadLagThenRecovers(t *testing.T) {
 		t.Fatalf("recover completion after provider catches up: %v", err)
 	}
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
-	if err != nil || handled.Status != store.ForgeEventHandled {
+	if err != nil || handled.Status != store.ForgeEventHandled || handled.NextAttemptAt != nil {
 		t.Fatalf("recovered completion = %#v, %v", handled, err)
+	}
+}
+
+func TestForgeCompletionAtomicallyDefersCompleteRunningBatch(t *testing.T) {
+	fixture := newFixture(t)
+	record, original, followUp, branch, events := startRunningForgeEventBatch(t, fixture, "completion-atomic")
+	newSHA := strings.Repeat("6", 40)
+	recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
+	fixture.pullRequests.getResult = &forge.PullRequestState{
+		Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
+		SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
+	}
+
+	nonDue := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, nonDue, events[len(events)-1].ID)
+	unrelated := controllerForgeEvent("completion-unrelated-attempt", "review_comment", 42)
+	unrelated.Branch, unrelated.CommentID = branch, 9099
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, unrelated); err != nil {
+		t.Fatal(err)
+	}
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET status = 'running', task_id = ?, attempt_id = ?, attempts = 4, next_attempt_at = ? WHERE id = ?`, record.ID, original.ID, nonDue, unrelated.ID)
+
+	control := fixture.controller.(*Controller)
+	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
+		t.Fatalf("defer completion batch: %v", err)
+	}
+	deferred := make([]store.ForgeEvent, len(events))
+	for i, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventRunning || stored.TaskID != record.ID || stored.AttemptID != followUp.ID || stored.Attempts != 2 || stored.LastError == "" || stored.NextAttemptAt == nil {
+			t.Fatalf("deferred completion member %d = %#v, %v", i, stored, err)
+		}
+		deferred[i] = stored
+	}
+	for _, event := range deferred[1:] {
+		if event.LastError != deferred[0].LastError || !event.UpdatedAt.Equal(deferred[0].UpdatedAt) || !event.NextAttemptAt.Equal(*deferred[0].NextAttemptAt) {
+			t.Fatalf("completion diagnostics differ: first=%#v sibling=%#v", deferred[0], event)
+		}
+	}
+	unrelatedStored, err := fixture.store.GetForgeEvent(fixture.ctx, unrelated.ID)
+	if err != nil || unrelatedStored.Status != store.ForgeEventRunning || unrelatedStored.AttemptID != original.ID || unrelatedStored.Attempts != 4 || unrelatedStored.LastError != "" || unrelatedStored.NextAttemptAt == nil || unrelatedStored.NextAttemptAt.Format(time.RFC3339Nano) != nonDue {
+		t.Fatalf("unrelated attempt changed: %#v, %v", unrelatedStored, err)
+	}
+
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE attempt_id = ?`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), followUp.ID)
+	fixture.pullRequests.getResult.HeadSHA = newSHA
+	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("retry completion batch after restart: %v", err)
+	}
+	for _, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventHandled || stored.AttemptID != followUp.ID || stored.Attempts != 2 || stored.NextAttemptAt != nil {
+			t.Fatalf("restarted completion member = %#v, %v", stored, err)
+		}
+	}
+	current, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || current.ID != followUp.ID {
+		t.Fatalf("restart replaced follow-up attempt: %#v, %v", current, err)
+	}
+}
+
+func TestForgeCompletionBatchPersistenceFailureChangesNoMember(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, followUp, branch, events := startRunningForgeEventBatch(t, fixture, "completion-persistence")
+	newSHA := strings.Repeat("7", 40)
+	recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
+	fixture.pullRequests.getResult = &forge.PullRequestState{
+		Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
+		SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
+	}
+	nonDue := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, nonDue, events[len(events)-1].ID)
+	execFixtureSQL(t, fixture, `CREATE TRIGGER reject_completion_batch_backoff BEFORE UPDATE OF attempts ON forge_events BEGIN SELECT RAISE(FAIL, 'forced completion batch persistence failure'); END`)
+
+	err := fixture.controller.(*Controller).completeForgeEventLocked(fixture.ctx, record, followUp, false)
+	var persistenceErr forgeEventPersistenceError
+	if !errors.As(err, &persistenceErr) || !strings.Contains(err.Error(), "forced completion batch persistence failure") {
+		t.Fatalf("completion persistence error = %v", err)
+	}
+	for i, event := range events {
+		stored, getErr := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		wantDeferred := i == len(events)-1
+		if getErr != nil || stored.Status != store.ForgeEventRunning || stored.Attempts != 1 || stored.LastError != "" || (stored.NextAttemptAt != nil) != wantDeferred {
+			t.Fatalf("completion persistence failure changed member %d: %#v, %v", i, stored, getErr)
+		}
+		if wantDeferred && stored.NextAttemptAt.Format(time.RFC3339Nano) != nonDue {
+			t.Fatalf("completion persistence failure changed non-due deadline: %#v", stored)
+		}
+	}
+}
+
+func TestDirectReadyCompletesFutureDeferredSiblingWhilePollingDoesNot(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	event := controllerForgeEvent("direct-completion-deferred", "review_comment", 42)
+	event.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	followUp := startCurrentAttemptWorker(t, fixture, record.ID)
+	jobName, podName := jobs.Name(record.ID, followUp.Number), "worker-pod-a2"
+	newSHA := strings.Repeat("2", 40)
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: record.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: newSHA})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: record.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationResult, TaskID: record.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationSucceeded, TaskID: record.ID})
+	pullRequest, err := fixture.store.GetPullRequest(fixture.ctx, followUp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.RecordVerifiedPullRequest(fixture.ctx, store.GitResult{AttemptID: followUp.ID, State: "pushed", Branch: branch, CommitSHA: newSHA}, pullRequest); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, future, event.ID)
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: newSHA}
+	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
+		t.Fatal(err)
+	}
+	deferred, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || deferred.Status != store.ForgeEventRunning {
+		t.Fatalf("polling completed deferred sibling: %#v, %v", deferred, err)
+	}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: newSHA})
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled {
+		t.Fatalf("direct ready did not complete deferred sibling: %#v, %v", handled, err)
 	}
 }
 
@@ -830,6 +1313,7 @@ func TestForgeCompletionPermanentlyRejectsProviderOwnershipDrift(t *testing.T) {
 		{name: "retargeted base", mutate: func(state *forge.PullRequestState) { state.DestinationBranch = "release" }},
 		{name: "changed head ref", mutate: func(state *forge.PullRequestState) { state.SourceBranch = "external/head" }},
 		{name: "unrelated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("f", 40) }},
+		{name: "abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("1", 12) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t)
@@ -848,16 +1332,14 @@ func TestForgeCompletionPermanentlyRejectsProviderOwnershipDrift(t *testing.T) {
 				t.Fatal(err)
 			}
 			newSHA := strings.Repeat("1", 40)
-			if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: followUp.ID, State: "pushed", Branch: branch, CommitSHA: newSHA}); err != nil {
-				t.Fatal(err)
-			}
+			recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
 			live := forge.PullRequestState{
-				Number: 42, State: "open", SourceOwner: "acme", SourceRepository: "widget",
+				Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
 				SourceBranch: branch, DestinationBranch: "main", HeadSHA: newSHA,
 			}
 			test.mutate(&live)
 			fixture.pullRequests.getResult = &live
-			if err := control.completeForgeEventLocked(fixture.ctx, record, followUp); err != nil {
+			if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
 				t.Fatalf("complete drift: %v", err)
 			}
 			failed, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
@@ -865,6 +1347,35 @@ func TestForgeCompletionPermanentlyRejectsProviderOwnershipDrift(t *testing.T) {
 				t.Fatalf("drifted completion = %#v, %v", failed, err)
 			}
 		})
+	}
+}
+
+func TestForgeFollowUpStartAndCompletionAcceptFullUppercaseProviderSHA(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	fixture.pullRequests.getResult.HeadSHA = strings.ToUpper(fullCommitSHA)
+	event := controllerForgeEvent("uppercase-live-provider-sha", "review_comment", 42)
+	event.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSHA := strings.Repeat("a1", 20)
+	recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
+	fixture.pullRequests.getResult.HeadSHA = strings.ToUpper(newSHA)
+	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
+		t.Fatal(err)
+	}
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled {
+		t.Fatalf("uppercase exact live SHA outcome = %#v, %v", handled, err)
 	}
 }
 
@@ -889,7 +1400,7 @@ func TestRunningForgeFollowUpRejectsClosureOrRefDriftBeforeMoreWork(t *testing.T
 				t.Fatal(err)
 			}
 			live := forge.PullRequestState{
-				Number: 42, State: "open", SourceOwner: "acme", SourceRepository: "widget",
+				Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
 				SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
 			}
 			test.mutate(&live)
@@ -909,14 +1420,69 @@ func TestRunningForgeFollowUpRejectsClosureOrRefDriftBeforeMoreWork(t *testing.T
 	}
 }
 
+func TestRunningForgeFollowUpRecoveryUsesPublishedCandidateLineage(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		headSHA    string
+		exhausted  bool
+		wantStatus string
+	}{
+		{name: "candidate", headSHA: strings.Repeat("4", 40), wantStatus: store.ForgeEventRunning},
+		{name: "prior settling", headSHA: fullCommitSHA, wantStatus: store.ForgeEventRunning},
+		{name: "active replacement settling", headSHA: strings.Repeat("f", 40), wantStatus: store.ForgeEventRunning},
+		{name: "exhausted unrelated drift", headSHA: strings.Repeat("f", 40), exhausted: true, wantStatus: store.ForgeEventFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t)
+			record, _, branch := createOwnedOpenPullRequest(t, fixture)
+			event := controllerForgeEvent("candidate-recovery-"+strings.ReplaceAll(test.name, " ", "-"), "review_comment", 42)
+			event.Branch = branch
+			if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+				t.Fatal(err)
+			}
+			control := fixture.controller.(*Controller)
+			if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+			followUp := startCurrentAttemptWorker(t, fixture, record.ID)
+			jobName, podName := jobs.Name(record.ID, followUp.Number), "worker-pod-a2"
+			candidateSHA := strings.Repeat("4", 40)
+			handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: record.ID})
+			handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: candidateSHA})
+			if test.exhausted {
+				exhaustAttemptLogs(t, fixture, record.ID, followUp.ID)
+			}
+			fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: test.headSHA}
+			if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+				t.Fatalf("recover candidate follow-up: %v", err)
+			}
+			stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+			if err != nil || stored.Status != test.wantStatus {
+				t.Fatalf("candidate recovery event = %#v, %v; want %q", stored, err, test.wantStatus)
+			}
+			git, err := fixture.store.GetGitResult(fixture.ctx, followUp.ID)
+			if err != nil || git.State != "candidate" || git.CommitSHA != candidateSHA {
+				t.Fatalf("candidate recovery Git = %#v, %v", git, err)
+			}
+			if test.wantStatus == store.ForgeEventRunning && getTask(t, fixture, record.ID).State == task.PR_OPEN {
+				t.Fatal("candidate recovery completed follow-up before ready")
+			}
+		})
+	}
+}
+
 func TestPermanentRunningForgeFailureCancelsAttemptAndReconciliationRemovesResources(t *testing.T) {
 	fixture := newFixture(t)
 	record, _, branch := createOwnedOpenPullRequest(t, fixture)
-	event := controllerForgeEvent("running-orphan-prevention", "review_comment", 42)
-	event.Branch = branch
-	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
-		t.Fatal(err)
+	events := make([]store.ForgeEvent, 32)
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("running-orphan-prevention-%02d", i), "review_comment", 42)
+		events[i].Branch, events[i].CommentID = branch, 5000+i
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[i]); err != nil {
+			t.Fatal(err)
+		}
 	}
+	event := events[0]
 	control := fixture.controller.(*Controller)
 	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
 		t.Fatal(err)
@@ -939,7 +1505,7 @@ func TestPermanentRunningForgeFailureCancelsAttemptAndReconciliationRemovesResou
 	}
 	secretName := job.Spec.Template.Spec.Volumes[0].Secret.SecretName
 	fixture.pullRequests.getResult = &forge.PullRequestState{
-		Number: 42, State: "declined", SourceOwner: "acme", SourceRepository: "widget",
+		Number: 42, State: "declined", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
 		SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA,
 	}
 
@@ -948,21 +1514,34 @@ func TestPermanentRunningForgeFailureCancelsAttemptAndReconciliationRemovesResou
 	}
 	failed, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	current := getTask(t, fixture, record.ID)
-	if err != nil || failed.Status != store.ForgeEventFailed || !current.CancellationRequested || current.State != task.RUNNING {
+	if err != nil || failed.Status != store.ForgeEventFailed || failed.FailedAt == nil || !current.CancellationRequested || current.State != task.RUNNING {
 		t.Fatalf("permanent failure outcomes: event=%#v task=%#v err=%v", failed, current, err)
 	}
-	if err := control.HandleWorkerEvent(fixture.ctx, jobName, "late-pod", protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: strings.Repeat("1", 40)}); err != nil {
-		t.Fatalf("late branch_pushed: %v", err)
+	failedBatch, err := fixture.store.ListForgeEventsByAttempt(fixture.ctx, followUp.ID)
+	if err != nil || len(failedBatch) != len(events) {
+		t.Fatalf("permanent failure batch = %#v, %v", failedBatch, err)
+	}
+	for _, sibling := range failedBatch {
+		if sibling.Status != store.ForgeEventFailed || sibling.LastError != failed.LastError || sibling.FailedAt == nil || !sibling.FailedAt.Equal(*failed.FailedAt) {
+			t.Fatalf("permanent failure sibling = %#v; first=%#v", sibling, failed)
+		}
+	}
+	if err := control.HandleWorkerEvent(fixture.ctx, jobName, "late-pod", protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: strings.Repeat("1", 40)}); err == nil || !strings.Contains(err.Error(), "get worker Pod") {
+		t.Fatalf("unauthorized late pull_request_ready error = %v", err)
 	}
 	current = getTask(t, fixture, record.ID)
 	if current.State != task.RUNNING {
-		t.Fatalf("late branch_pushed changed cancelled follow-up: task=%#v", current)
+		t.Fatalf("late pull_request_ready changed cancelled follow-up: task=%#v", current)
 	}
 	if _, err := fixture.store.GetGitResult(fixture.ctx, followUp.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("late branch_pushed Git result error = %v; want not found", err)
+		t.Fatalf("late pull_request_ready Git result error = %v; want not found", err)
 	}
 
-	if err := control.Reconcile(fixture.ctx); err != nil {
+	restarted, err := New(fixture.store, fixture.kube, fixture.config, fixture.pullRequests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Reconcile(fixture.ctx); err != nil {
 		t.Fatalf("Reconcile cancellation: %v", err)
 	}
 	current = getTask(t, fixture, record.ID)
@@ -975,9 +1554,14 @@ func TestPermanentRunningForgeFailureCancelsAttemptAndReconciliationRemovesResou
 	if _, err := fixture.kube.CoreV1().Secrets(workerNamespace).Get(fixture.ctx, secretName, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("cancelled follow-up Secret still exists: %v", err)
 	}
-	failed, err = fixture.store.GetForgeEvent(fixture.ctx, event.ID)
-	if err != nil || failed.Status != store.ForgeEventFailed {
-		t.Fatalf("reconciled failed event = %#v, %v", failed, err)
+	failedBatch, err = fixture.store.ListForgeEventsByAttempt(fixture.ctx, followUp.ID)
+	if err != nil || len(failedBatch) != len(events) {
+		t.Fatalf("reconciled failed batch = %#v, %v", failedBatch, err)
+	}
+	for _, sibling := range failedBatch {
+		if sibling.Status != store.ForgeEventFailed || sibling.HandledAt != nil {
+			t.Fatalf("reconciliation handled failed sibling: %#v", sibling)
+		}
 	}
 }
 
@@ -1024,27 +1608,24 @@ func TestForgeFollowUpBranchPushReusesPullRequestAndRepliesOnce(t *testing.T) {
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_started", TaskID: record.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_result", TaskID: record.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_succeeded", TaskID: record.ID})
-	branchPushed := protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA}
-	handleEvent(t, fixture, jobName, podName, branchPushed)
+	pullRequestReady := protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA}
+	handleEvent(t, fixture, jobName, podName, pullRequestReady)
 
 	if got := getTask(t, fixture, record.ID).State; got != task.PR_OPEN {
 		t.Fatalf("follow-up branch state = %q; want %q", got, task.PR_OPEN)
-	}
-	if len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("pull request create calls = %d; want original PR only", len(fixture.pullRequests.calls))
 	}
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	if err != nil || handled.Status != "handled" || handled.AttemptID != followUp.ID || handled.HandledAt == nil {
 		t.Fatalf("handled forge event = %#v, %v", handled, err)
 	}
 
-	handleEvent(t, fixture, jobName, podName, branchPushed)
+	handleEvent(t, fixture, jobName, podName, pullRequestReady)
 	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
 		t.Fatalf("replay handled forge event: %v", err)
 	}
 	attempts, err := fixture.store.ListAttempts(fixture.ctx, record.ID)
-	if err != nil || len(attempts) != 2 || len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("event replay duplicated lifecycle: attempts=%d PR creates=%d err=%v", len(attempts), len(fixture.pullRequests.calls), err)
+	if err != nil || len(attempts) != 2 {
+		t.Fatalf("event replay duplicated lifecycle: attempts=%d err=%v", len(attempts), err)
 	}
 }
 
@@ -1178,6 +1759,100 @@ func TestProcessForgeEventsExpandsBatchBeyondGlobalSeedWindow(t *testing.T) {
 	}
 }
 
+func TestRunningForgeEventBatchYieldsGlobalWindowToUnrelatedWork(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	events := make([]store.ForgeEvent, 33)
+	for i := range 32 {
+		events[i] = controllerForgeEvent(fmt.Sprintf("running-yield-%02d", i), "review_comment", 42)
+		events[i].Branch, events[i].CommentID = branch, 4000+i
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events[32] = controllerForgeEvent("running-yield-32", "review_comment", 42)
+	events[32].Branch, events[32].CommentID = branch, 4032
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[32]); err != nil {
+		t.Fatal(err)
+	}
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET status = 'running', task_id = ?, attempt_id = ?, attempts = 1 WHERE id = ?`, record.ID, followUp.ID, events[32].ID)
+	unrelated := controllerForgeEvent("running-yield-unrelated", "review_comment", 777)
+	unrelated.Owner = "unrelated"
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, unrelated); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("recover running window: %v", err)
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("process unrelated work after running window yielded: %v", err)
+	}
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, unrelated.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled {
+		t.Fatalf("unrelated event = %#v, %v; want handled", handled, err)
+	}
+	for _, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventRunning || stored.AttemptID != followUp.ID || stored.Attempts != 1 || stored.LastError != "" || stored.NextAttemptAt == nil || !stored.NextAttemptAt.After(time.Now().UTC()) {
+			t.Fatalf("yielded running sibling %q = %#v, %v", event.ID, stored, err)
+		}
+	}
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE attempt_id = ? AND status = 'running'`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano), followUp.ID)
+	due, err := fixture.store.ListIncompleteForgeEvents(fixture.ctx)
+	if err != nil || len(due) != 32 || due[0].Status != store.ForgeEventRunning {
+		t.Fatalf("running siblings after deadline = %#v, %v; want durable and eligible", due, err)
+	}
+}
+
+func TestSettlingForgeEventsYieldGlobalWindowToUnrelatedWork(t *testing.T) {
+	fixture := newFixture(t)
+	_ = createRunningTask(t, fixture, "settling work", "settling-window")
+	events := make([]store.ForgeEvent, 33)
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("settling-yield-%02d", i), "quality_gate_failed", 0)
+		events[i].Branch, events[i].CommentID, events[i].CommentKind = "", 0, ""
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unrelated := controllerForgeEvent("settling-yield-unrelated", "review_comment", 777)
+	unrelated.Owner = "unrelated"
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, unrelated); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("defer first settling window: %v", err)
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("process unrelated work after settling window yielded: %v", err)
+	}
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, unrelated.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled {
+		t.Fatalf("unrelated event = %#v, %v; want handled", handled, err)
+	}
+	for _, event := range events {
+		stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+		if err != nil || stored.Status != store.ForgeEventPending || stored.Attempts != 0 || stored.LastError != "" || stored.TaskID != "" || stored.AttemptID != "" || stored.NextAttemptAt == nil || !stored.NextAttemptAt.After(time.Now().UTC()) {
+			t.Fatalf("yielded settling event %q = %#v, %v", event.ID, stored, err)
+		}
+	}
+	execFixtureSQL(t, fixture, `UPDATE forge_events SET next_attempt_at = ? WHERE status = 'pending' AND id LIKE 'settling-yield-%'`, time.Now().Add(-time.Second).UTC().Format(time.RFC3339Nano))
+	due, err := fixture.store.ListIncompleteForgeEvents(fixture.ctx)
+	if err != nil || len(due) != 32 || due[0].Status != store.ForgeEventPending {
+		t.Fatalf("settling events after deadline = %#v, %v; want durable and eligible", due, err)
+	}
+}
+
 func TestForgeFollowUpChangesRequestRepliesGenerallyOnce(t *testing.T) {
 	fixture := newFixture(t)
 	record, _, branch := createOwnedOpenPullRequest(t, fixture)
@@ -1203,15 +1878,15 @@ func TestForgeFollowUpChangesRequestRepliesGenerallyOnce(t *testing.T) {
 	} {
 		handleEvent(t, fixture, jobName, podName, workerEvent)
 	}
-	branchPushed := protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA}
-	handleEvent(t, fixture, jobName, podName, branchPushed)
+	pullRequestReady := protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA}
+	handleEvent(t, fixture, jobName, podName, pullRequestReady)
 
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	if err != nil || handled.Status != store.ForgeEventHandled || handled.HandledAt == nil {
 		t.Fatalf("handled changes-request event = %#v, %v", handled, err)
 	}
 
-	handleEvent(t, fixture, jobName, podName, branchPushed)
+	handleEvent(t, fixture, jobName, podName, pullRequestReady)
 	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
 		t.Fatalf("replay handled changes-request event: %v", err)
 	}
@@ -1240,15 +1915,13 @@ func TestFailedForgeFollowUpRetryReusesPromptBranchAndPullRequest(t *testing.T) 
 	if err != nil {
 		t.Fatalf("RetryWithKey: %v", err)
 	}
-	if retry.Number != 3 || retry.Prompt != failed.Prompt || retry.BaseBranch != branch || retry.TaskBranch != branch {
+	if retry.Number != 3 || retry.Prompt != failed.Prompt || retry.BaseBranch != "main" || retry.TaskBranch != branch {
 		t.Fatalf("retry attempt = %#v; want attempt 3 with failed follow-up context", retry)
 	}
 	manifest := followUpManifest(t, fixture, record.ID, retry)
-	if manifest.Prompt != failed.Prompt || manifest.BaseBranch != branch || manifest.TaskBranch != branch {
+	failedManifest := followUpManifest(t, fixture, record.ID, failed)
+	if manifest.Prompt != failed.Prompt || manifest.BaseBranch != "main" || manifest.TaskBranch != branch || manifest.ExistingPullRequestNumber != 42 || manifest.ExistingPullRequestHeadSHA != fullCommitSHA || manifest.ExistingPullRequestHeadSHA != failedManifest.ExistingPullRequestHeadSHA {
 		t.Fatalf("retry manifest = %#v; want same follow-up prompt and PR head", manifest)
-	}
-	if len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("pull request creates before retry push = %d; want original only", len(fixture.pullRequests.calls))
 	}
 
 	startCurrentAttemptWorker(t, fixture, record.ID)
@@ -1257,13 +1930,98 @@ func TestFailedForgeFollowUpRetryReusesPromptBranchAndPullRequest(t *testing.T) 
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_started", TaskID: record.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_result", TaskID: record.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_succeeded", TaskID: record.ID})
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA})
-	if len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("retry completion pull request creates = %d; want original only", len(fixture.pullRequests.calls))
-	}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA})
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	if err != nil || handled.Status != store.ForgeEventHandled || handled.AttemptID != retry.ID {
 		t.Fatalf("retried forge event = %#v, %v", handled, err)
+	}
+}
+
+func TestFailedValidationFollowUpRetryStartsFromPublishedCandidate(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	event := controllerForgeEvent("candidate-validation-retry", "review_comment", 42)
+	event.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatal(err)
+	}
+	failed := startCurrentAttemptWorker(t, fixture, record.ID)
+	jobName, podName := jobs.Name(record.ID, failed.Number), "worker-pod-a2"
+	candidateSHA := strings.Repeat("3", 40)
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: record.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: candidateSHA})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: record.ID, Command: []string{"go", "test", "./..."}})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationResult, TaskID: record.ID, Command: []string{"go", "test", "./..."}, ExitCode: 1})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationFailed, TaskID: record.ID, Command: []string{"go", "test", "./..."}, ExitCode: 1, Message: "failed"})
+	exhaustAttemptLogs(t, fixture, record.ID, failed.ID)
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: candidateSHA}
+	retry, err := control.RetryWithKey(fixture.ctx, record.ID, "retry-candidate-validation")
+	if err != nil {
+		t.Fatalf("retry candidate validation failure: %v", err)
+	}
+	manifest := followUpManifest(t, fixture, record.ID, retry)
+	if manifest.ExistingPullRequestHeadSHA != candidateSHA || manifest.ExistingPullRequestNumber != 42 || manifest.TaskBranch != branch {
+		t.Fatalf("retry manifest = %#v; want published candidate head %s", manifest, candidateSHA)
+	}
+	stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || stored.Status != store.ForgeEventRunning || stored.AttemptID != retry.ID {
+		t.Fatalf("running forge event retry = %#v, %v", stored, err)
+	}
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("recover retry against candidate provider head: %v", err)
+	}
+}
+
+func TestLegacyFollowUpRetryRepairsBaseBranchFromDurablePullRequest(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	event := controllerForgeEvent("legacy-follow-up-retry", "review_comment", 42)
+	event.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("start follow-up: %v", err)
+	}
+	legacy := startCurrentAttemptWorker(t, fixture, record.ID)
+	db, err := sql.Open("sqlite", fixture.databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(fixture.ctx, `UPDATE task_attempts SET base_branch = ?, task_branch = ? WHERE id = ?`, branch, branch, legacy.ID); err != nil {
+		t.Fatalf("shape legacy follow-up branches: %v", err)
+	}
+	legacyPrompt := legacy.Prompt
+	jobName := jobs.Name(record.ID, legacy.Number)
+	legacyEvent := protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: fullCommitSHA}
+	if err := control.HandleWorkerEvent(fixture.ctx, jobName, "worker-pod-a2", legacyEvent); err != nil {
+		t.Fatalf("legacy branch_pushed: %v", err)
+	}
+	if getTask(t, fixture, record.ID).State != task.FAILED {
+		t.Fatalf("legacy follow-up state = %q, want FAILED", getTask(t, fixture, record.ID).State)
+	}
+	exhaustAttemptLogs(t, fixture, record.ID, legacy.ID)
+
+	retry, err := control.RetryWithKey(fixture.ctx, record.ID, "upgrade-legacy-follow-up")
+	if err != nil {
+		t.Fatalf("RetryWithKey: %v", err)
+	}
+	if !retry.Immutable || retry.Prompt != legacyPrompt || retry.BaseBranch != "main" || retry.TaskBranch != branch {
+		t.Fatalf("repaired retry = %#v", retry)
+	}
+	manifest := followUpManifest(t, fixture, record.ID, retry)
+	if manifest.BaseBranch != "main" || manifest.TaskBranch != branch || manifest.Prompt != legacyPrompt || manifest.ExistingPullRequestNumber != 42 || manifest.ExistingPullRequestHeadSHA != fullCommitSHA {
+		t.Fatalf("repaired retry manifest = %#v", manifest)
+	}
+	copied, err := fixture.store.GetPullRequest(fixture.ctx, retry.ID)
+	if err != nil || copied.State != "open" || copied.Number != 42 || copied.BaseBranch != "main" || copied.HeadBranch != branch {
+		t.Fatalf("repaired retry pull request = %#v, %v", copied, err)
 	}
 }
 
@@ -1332,7 +2090,8 @@ func TestQualityGateRequiresLatestPushedSHAWithAndWithoutPullRequestNumber(t *te
 		handleEvent(t, fixture, jobName, podName, workerEvent)
 	}
 	newSHA := strings.Repeat("1", 40)
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: branch, CommitSHA: newSHA})
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: newSHA}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: newSHA})
 
 	for _, pullRequestNumber := range []int{0, 42} {
 		delayed := controllerForgeEvent("delayed", "quality_gate_failed", pullRequestNumber)
@@ -1360,6 +2119,27 @@ func TestQualityGateRequiresLatestPushedSHAWithAndWithoutPullRequestNumber(t *te
 	if err != nil || matched != forgeDefinitelyUnowned {
 		t.Fatalf("blank quality identity matched=%v, err=%v", matched, err)
 	}
+}
+
+func startRunningForgeEventBatch(t *testing.T, fixture *fixture, prefix string) (store.Task, store.Attempt, store.Attempt, string, []store.ForgeEvent) {
+	t.Helper()
+	record, original, branch := createOwnedOpenPullRequest(t, fixture)
+	events := make([]store.ForgeEvent, 32)
+	for i := range events {
+		events[i] = controllerForgeEvent(fmt.Sprintf("%s-%02d", prefix, i), "review_comment", 42)
+		events[i].Branch, events[i].CommentID = branch, 6000+i
+		if _, err := fixture.store.PutForgeEvent(fixture.ctx, events[i]); err != nil {
+			t.Fatalf("put running batch member %d: %v", i, err)
+		}
+	}
+	if err := fixture.controller.(*Controller).ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("start running forge event batch: %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil || followUp.ID == original.ID {
+		t.Fatalf("running forge event attempt = %#v, %v", followUp, err)
+	}
+	return record, original, followUp, branch, events
 }
 
 func controllerForgeEvent(id, kind string, pullRequestNumber int) store.ForgeEvent {
@@ -1396,14 +2176,7 @@ func storedForgeEvent(event forge.Event) store.ForgeEvent {
 func prepareAttemptForPush(t *testing.T, fixture *fixture, record store.Task) (store.Attempt, string) {
 	t.Helper()
 	jobName, podName := jobs.Name(record.ID, 1), "worker-pod-a1"
-	for _, workerEvent := range []protocol.Event{
-		{Type: "agent_started", TaskID: record.ID},
-		{Type: "validation_started", TaskID: record.ID},
-		{Type: "validation_result", TaskID: record.ID},
-		{Type: "validation_succeeded", TaskID: record.ID},
-	} {
-		handleEvent(t, fixture, jobName, podName, workerEvent)
-	}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "agent_started", TaskID: record.ID})
 	attempt, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
 	if err != nil {
 		t.Fatalf("current attempt: %v", err)
@@ -1411,6 +2184,14 @@ func prepareAttemptForPush(t *testing.T, fixture *fixture, record store.Task) (s
 	manifest, err := attemptManifest(attempt)
 	if err != nil {
 		t.Fatalf("attempt manifest: %v", err)
+	}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: record.ID, PullRequestNumber: 42, Branch: manifest.TaskBranch, CommitSHA: fullCommitSHA})
+	for _, workerEvent := range []protocol.Event{
+		{Type: "validation_started", TaskID: record.ID},
+		{Type: "validation_result", TaskID: record.ID},
+		{Type: "validation_succeeded", TaskID: record.ID},
+	} {
+		handleEvent(t, fixture, jobName, podName, workerEvent)
 	}
 	return attempt, manifest.TaskBranch
 }
@@ -1431,8 +2212,14 @@ func createOwnedOpenPullRequest(t *testing.T, fixture *fixture) (store.Task, sto
 	if err != nil {
 		t.Fatalf("original attempt manifest: %v", err)
 	}
-	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: record.ID, Branch: manifest.TaskBranch, CommitSHA: fullCommitSHA})
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: manifest.TaskBranch, DestinationBranch: manifest.BaseBranch, HeadSHA: fullCommitSHA}
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: manifest.TaskBranch, CommitSHA: fullCommitSHA})
 	exhaustAttemptLogs(t, fixture, record.ID, attempt.ID)
+	fixture.pullRequests.mu.Lock()
+	fixture.pullRequests.getCalls = 0
+	fixture.pullRequests.getTargets = nil
+	fixture.pullRequests.getNumbers = nil
+	fixture.pullRequests.mu.Unlock()
 	return record, attempt, manifest.TaskBranch
 }
 

@@ -2,7 +2,6 @@ package bitbucket
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -21,183 +20,48 @@ const (
 	testAppPassword = "app-password"
 )
 
-func TestCreatePullRequest(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Errorf("method = %s, want POST", r.Method)
-		}
-		if r.URL.Path != "/2.0/repositories/workspace/repository/pullrequests" {
-			t.Errorf("path = %q, want /2.0/repositories/workspace/repository/pullrequests", r.URL.Path)
-		}
-		if r.URL.RawQuery != "" {
-			t.Errorf("query = %q, want empty", r.URL.RawQuery)
-		}
-		if r.URL.User != nil {
-			t.Errorf("URL user info contains credentials: %v", r.URL.User)
-		}
-		if strings.Contains(r.RequestURI, testUsername) || strings.Contains(r.RequestURI, testAppPassword) {
-			t.Errorf("request URI contains credentials: %q", r.RequestURI)
-		}
-
-		username, password, ok := r.BasicAuth()
-		if !ok || username != testUsername || password != testAppPassword {
-			t.Errorf("BasicAuth() = (%q, %q, %t), want (%q, %q, true)", username, password, ok, testUsername, testAppPassword)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Errorf("Content-Type = %q, want application/json", got)
-		}
-
-		var body struct {
-			Title             string    `json:"title"`
-			Description       string    `json:"description"`
-			Source            branchRef `json:"source"`
-			Destination       branchRef `json:"destination"`
-			CloseSourceBranch *bool     `json:"close_source_branch"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode request body: %v", err)
-			return
-		}
-		if body.Title != "Fix flaky test" {
-			t.Errorf("title = %q, want Fix flaky test", body.Title)
-		}
-		if body.Description != "Details from the worker" {
-			t.Errorf("description = %q, want Details from the worker", body.Description)
-		}
-		if body.Source.Branch.Name != "feature/fix-flaky-test" {
-			t.Errorf("source branch = %q, want feature/fix-flaky-test", body.Source.Branch.Name)
-		}
-		if body.Destination.Branch.Name != "main" {
-			t.Errorf("destination branch = %q, want main", body.Destination.Branch.Name)
-		}
-		if body.CloseSourceBranch == nil || *body.CloseSourceBranch {
-			t.Errorf("close_source_branch = %v, want explicit false", body.CloseSourceBranch)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"id":42,"links":{"html":{"href":"https://bitbucket.example/pull-requests/42"}}}`)
-	}))
-	defer server.Close()
-
-	client := newTestClient(t, server.URL, testUsername, testAppPassword)
-	got, err := client.CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{
-		Title:             "Fix flaky test",
-		Description:       "Details from the worker",
-		SourceBranch:      "feature/fix-flaky-test",
-		DestinationBranch: "main",
-	})
-	if err != nil {
-		t.Fatalf("CreatePullRequest: %v", err)
-	}
-	if got.ID != 42 {
-		t.Errorf("ID = %d, want 42", got.ID)
-	}
-	if got.HTMLURL != "https://bitbucket.example/pull-requests/42" {
-		t.Errorf("HTMLURL = %q, want https://bitbucket.example/pull-requests/42", got.HTMLURL)
-	}
-}
-
-func TestFindPullRequestMatchesTargetRepositorySourceBaseAndTaskMarker(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("method = %s, want GET", r.Method)
-		}
-		if r.URL.Query().Get("state") != "OPEN" {
-			t.Errorf("state query = %q, want OPEN", r.URL.Query().Get("state"))
-		}
-		io.WriteString(w, `{"values":[`+
-			`{"id":40,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"other"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/40"}}},`+
-			`{"id":41,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"release"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/41"}}},`+
-			`{"id":42,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"other/fork"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/42"}}},`+
-			`{"id":43,"state":"OPEN","description":"Created by simpleswe task other","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/43"}}},`+
-			`{"id":44,"state":"OPEN","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/44"}}}`+
-			`]}`)
-	}))
-	defer server.Close()
-
-	client := newTestClient(t, server.URL, testUsername, testAppPassword)
-	got, found, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
-	if err != nil {
-		t.Fatalf("FindPullRequest: %v", err)
-	}
-	if !found || got.ID != 44 || !strings.HasSuffix(got.HTMLURL, "/44") {
-		t.Fatalf("FindPullRequest = %#v, %t; want pull request 44", got, found)
-	}
-}
-
-func TestFindPullRequestIgnoresClosedAndMergedMatches(t *testing.T) {
-	for _, state := range []string{"DECLINED", "MERGED"} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			io.WriteString(w, `{"values":[{"id":44,"state":"`+state+`","description":"Created by simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/44"}}}]}`)
-		}))
-		got, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
-		server.Close()
-		if err != nil || found || got != (forge.PullRequest{}) {
-			t.Fatalf("FindPullRequest %s candidate = %#v, %t, %v; want no match", state, got, found, err)
-		}
-	}
-}
-
-func TestGetPullRequestParsesStateAndRefsFromTargetScopedEndpoint(t *testing.T) {
+func TestGetPullRequestParsesTargetScopedProviderState(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.EscapedPath() != "/2.0/repositories/workspace/repository/pullrequests/42" || r.URL.RawQuery != "" {
-			t.Fatalf("request = %s %s; want GET target pull request 42", r.Method, r.URL.RequestURI())
+			t.Fatalf("request = %s %s; want target pull request 42", r.Method, r.URL.RequestURI())
 		}
-		io.WriteString(w, `{"id":42,"state":"OPEN","source":{"branch":{"name":"feature/task"},"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`)
+		username, password, ok := r.BasicAuth()
+		if !ok || username != testUsername || password != testAppPassword {
+			t.Fatalf("BasicAuth = %q/%q/%t", username, password, ok)
+		}
+		_, _ = io.WriteString(w, `{"id":42,"state":"OPEN","title":"Fix flaky validation","links":{"html":{"href":"https://bitbucket.example/workspace/repository/pull-requests/42"}},"source":{"branch":{"name":"feature/task"},"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`)
 	}))
 	defer server.Close()
 
-	got, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
-	want := forge.PullRequestState{Number: 42, State: "open", SourceOwner: "workspace", SourceRepository: "repository", SourceBranch: "feature/task", DestinationBranch: "main", HeadSHA: "0123456789abcdef0123456789abcdef01234567"}
+	got, err := newTestClient(t, server.URL, testUsername, testAppPassword).GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
+	want := forge.PullRequestState{Number: 42, State: "open", HTMLURL: "https://bitbucket.example/workspace/repository/pull-requests/42", Title: "Fix flaky validation", SourceOwner: "workspace", SourceRepository: "repository", SourceBranch: "feature/task", DestinationBranch: "main", HeadSHA: "0123456789abcdef0123456789abcdef01234567"}
 	if err != nil || got != want {
 		t.Fatalf("GetPullRequest = %#v, %v; want %#v", got, err, want)
 	}
 }
 
-func TestGetPullRequestRejectsMissingHeadSHA(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		io.WriteString(w, `{"id":42,"state":"OPEN","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`)
-	}))
-	defer server.Close()
-
-	if _, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42); err == nil || !forge.IsPermanent(err) {
-		t.Fatalf("GetPullRequest missing head SHA error = %v; want permanent", err)
+func TestGetPullRequestRejectsInvalidProviderMetadata(t *testing.T) {
+	valid := `{"id":42,"state":"OPEN","title":"Fix it","links":{"html":{"href":"%s"}},"source":{"branch":{"name":"feature/task"},"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}}}`
+	for name, body := range map[string]string{
+		"missing head SHA": strings.Replace(valid, `"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},`, "", 1),
+		"missing title":    strings.Replace(valid, `"title":"Fix it",`, "", 1),
+		"insecure URL":     strings.Replace(valid, "%s", "http://bitbucket.example/workspace/repository/pull-requests/42", 1),
+		"credentials":      strings.Replace(valid, "%s", "https://user@bitbucket.example/workspace/repository/pull-requests/42", 1),
+		"query":            strings.Replace(valid, "%s", "https://bitbucket.example/workspace/repository/pull-requests/42?token=x", 1),
+		"fragment":         strings.Replace(valid, "%s", "https://bitbucket.example/workspace/repository/pull-requests/42#details", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			body = strings.Replace(body, "%s", "https://bitbucket.example/workspace/repository/pull-requests/42", 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+			defer server.Close()
+			if _, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42); err == nil || !forge.IsPermanent(err) {
+				t.Fatalf("GetPullRequest error = %v; want permanent", err)
+			}
+		})
 	}
 }
 
-func TestCreatePullRequestPropagatesErrorBodyWithoutCredentialLeak(t *testing.T) {
-	const responseBody = "bitbucket rejected this pull request"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnprocessableEntity)
-		io.WriteString(w, responseBody)
-	}))
-	defer server.Close()
-
-	client := newTestClient(t, server.URL, testUsername, testAppPassword)
-	_, err := client.CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{
-		Title:             "Fix flaky test",
-		Description:       "Details from the worker",
-		SourceBranch:      "feature/fix-flaky-test",
-		DestinationBranch: "main",
-	})
-	if err == nil {
-		t.Fatal("CreatePullRequest returned nil error for 422 response")
-	}
-	if !strings.Contains(err.Error(), responseBody) {
-		t.Errorf("error = %q, want response body %q", err, responseBody)
-	}
-	if !strings.Contains(err.Error(), "422") {
-		t.Errorf("error = %q, want HTTP status 422", err)
-	}
-	if strings.Contains(err.Error(), testUsername) || strings.Contains(err.Error(), testAppPassword) {
-		t.Errorf("error leaks credentials: %q", err)
-	}
-	if !IsPermanent(err) {
-		t.Errorf("422 error was not classified permanent: %v", err)
-	}
-}
-
-func TestProviderErrorClassificationRetriesOnlyTransientStatuses(t *testing.T) {
+func TestGetPullRequestClassifiesProviderErrors(t *testing.T) {
 	for _, test := range []struct {
 		status    int
 		permanent bool
@@ -205,7 +69,7 @@ func TestProviderErrorClassificationRetriesOnlyTransientStatuses(t *testing.T) {
 		t.Run(http.StatusText(test.status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(test.status) }))
 			defer server.Close()
-			_, err := newTestClient(t, server.URL, "", "").CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
+			_, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
 			if err == nil || IsPermanent(err) != test.permanent {
 				t.Fatalf("status %d error/permanent = %v/%t; want error/%t", test.status, err, IsPermanent(err), test.permanent)
 			}
@@ -213,198 +77,96 @@ func TestProviderErrorClassificationRetriesOnlyTransientStatuses(t *testing.T) {
 	}
 }
 
-func TestCreatePullRequestContextCancellation(t *testing.T) {
+func TestGetPullRequestHandlesProviderBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name, body, want string
+		status           int
+		transport        error
+		permanent        bool
+		forbidden        []string
+	}{
+		{name: "transport failure", transport: errors.New("transport unavailable"), want: "transport unavailable"},
+		{name: "oversized response", body: strings.Repeat("x", maxResponseBody+1), want: "response body exceeds"},
+		{name: "malformed response", body: "not-json", want: "decode Bitbucket pull request response", permanent: true},
+		{name: "incomplete response", body: `{}`, want: "incomplete pull request", permanent: true},
+		{name: "credential redaction", status: http.StatusBadRequest, body: testUsername + " rejected " + testAppPassword, want: "rejected", permanent: true, forbidden: []string{testUsername, testAppPassword}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
+			if test.transport != nil {
+				client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, test.transport })}
+			} else {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					if test.status != 0 {
+						w.WriteHeader(test.status)
+					}
+					_, _ = io.WriteString(w, test.body)
+				}))
+				defer server.Close()
+				client = newTestClient(t, server.URL, testUsername, testAppPassword)
+			}
+			_, err := client.GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
+			if err == nil || !strings.Contains(err.Error(), test.want) || IsPermanent(err) != test.permanent {
+				t.Fatalf("GetPullRequest error/permanent = %v/%t; want %q/%t", err, IsPermanent(err), test.want, test.permanent)
+			}
+			for _, secret := range test.forbidden {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("GetPullRequest error leaks credential %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestGetPullRequestContextCancellation(t *testing.T) {
 	started := make(chan struct{})
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-r.Context().Done()
 	}))
 	defer server.Close()
 
-	client := newTestClient(t, server.URL, testUsername, testAppPassword)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
+	done := make(chan error, 1)
 	go func() {
-		_, err := client.CreatePullRequest(ctx, testWorkspace, testRepository, CreatePullRequestRequest{})
-		errCh <- err
+		_, err := newTestClient(t, server.URL, testUsername, testAppPassword).GetPullRequest(ctx, testWorkspace, testRepository, 42)
+		done <- err
 	}()
-
-	select {
-	case <-started:
-	case <-ctx.Done():
-		t.Fatal("context canceled before request reached server")
-	}
+	<-started
 	cancel()
-
 	select {
-	case err := <-errCh:
+	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Errorf("error = %v, want context.Canceled", err)
+			t.Fatalf("GetPullRequest cancellation error = %v, want context.Canceled", err)
 		}
-		if err != nil && (strings.Contains(err.Error(), testUsername) || strings.Contains(err.Error(), testAppPassword)) {
-			t.Errorf("error leaks credentials: %q", err)
+		if strings.Contains(err.Error(), testUsername) || strings.Contains(err.Error(), testAppPassword) {
+			t.Fatalf("GetPullRequest cancellation error leaks credentials: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("CreatePullRequest did not return after cancellation")
+		t.Fatal("GetPullRequest did not return after context cancellation")
 	}
 }
 
-func TestHTTPErrorWithoutMessage(t *testing.T) {
-	err := (&HTTPError{Status: "500 Internal Server Error"}).Error()
-	if err != "Bitbucket returned 500 Internal Server Error" {
-		t.Fatalf("HTTPError.Error() = %q", err)
-	}
-}
-
-func TestCreatePullRequestRejectsInvalidEndpointAndContext(t *testing.T) {
-	client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
-	if _, err := client.CreatePullRequest(context.Background(), "", testRepository, CreatePullRequestRequest{}); err == nil {
-		t.Fatal("CreatePullRequest accepted an empty workspace")
-	}
-	var nilContext context.Context
-	if _, err := client.CreatePullRequest(nilContext, testWorkspace, testRepository, CreatePullRequestRequest{}); err == nil || !strings.Contains(err.Error(), "create Bitbucket request") {
-		t.Fatalf("CreatePullRequest(nil context) error = %v; want request creation error", err)
-	}
-}
-
-func TestCreatePullRequestHandlesTransportAndResponseErrors(t *testing.T) {
-	tests := []struct {
-		name   string
-		client func(t *testing.T) *Client
-		want   string
-	}{
-		{
-			name: "transport",
-			client: func(t *testing.T) *Client {
-				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
-				client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-					return nil, errors.New("network down")
-				})}
-				return client
-			},
-			want: "Bitbucket request failed",
-		},
-		{
-			name: "read failure",
-			client: func(t *testing.T) *Client {
-				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
-				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: failingReadCloser{}})
-				return client
-			},
-			want: "read Bitbucket response",
-		},
-		{
-			name: "oversized body",
-			client: func(t *testing.T) *Client {
-				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
-				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(strings.Repeat("x", maxResponseBody+1)))})
-				return client
-			},
-			want: "response body exceeds",
-		},
-		{
-			name: "malformed JSON",
-			client: func(t *testing.T) *Client {
-				client := newTestClient(t, "https://bitbucket.example", testUsername, testAppPassword)
-				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader("not-json"))})
-				return client
-			},
-			want: "decode Bitbucket response",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			_, err := test.client(t).CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("CreatePullRequest error = %v; want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestCreatePullRequestValidatesResponse(t *testing.T) {
+func TestGetPullRequestBitbucketRateLimitsHonorRetryAfter(t *testing.T) {
 	for _, test := range []struct {
-		name string
-		body string
-		want string
+		name   string
+		status int
+		header string
+		delay  time.Duration
 	}{
-		{name: "missing ID", body: `{"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}`, want: "missing pull request id"},
-		{name: "missing URL", body: `{"id":1}`, want: "missing pull request URL"},
-		{name: "invalid URL", body: `{"id":1,"links":{"html":{"href":"/pull-requests/1"}}}`, want: "invalid pull request URL"},
+		{name: "retry after", status: http.StatusForbidden, header: "60", delay: time.Minute},
+		{name: "rate limit", status: http.StatusTooManyRequests},
+		{name: "rate limit retry after", status: http.StatusTooManyRequests, header: "120", delay: 2 * time.Minute},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, test.body) }))
-			defer server.Close()
-			_, err := newTestClient(t, server.URL, "", "").CreatePullRequest(context.Background(), testWorkspace, testRepository, CreatePullRequestRequest{})
-			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
-				t.Fatalf("CreatePullRequest error = %v; want permanent %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestFindPullRequestHandlesLookupErrorsAndNoMatch(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		code int
-		want string
-	}{
-		{name: "status", body: "denied", code: http.StatusForbidden, want: "denied"},
-		{name: "malformed JSON", body: "not-json", code: http.StatusOK, want: "decode Bitbucket lookup response"},
-		{name: "incomplete match", body: `{"values":[{"id":0,"state":"OPEN","description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK, want: "incomplete pull request"},
-		{name: "invalid URL", body: `{"values":[{"id":1,"state":"OPEN","description":"simpleswe task swe-123","source":{"branch":{"name":"feature/task"},"repository":{"full_name":"workspace/repository"}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"/pull-requests/1"}}}]}`, code: http.StatusOK, want: "invalid pull request URL"},
-		{name: "no match", body: `{"values":[{"id":1,"description":"other","source":{"branch":{"name":"other"}},"links":{"html":{"href":"https://bitbucket.example/pull-requests/1"}}}]}`, code: http.StatusOK},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("pagelen") != "50" || r.URL.Query().Get("q") != `source.branch.name="feature/task" AND destination.branch.name="main"` {
-					t.Errorf("lookup query = %q; want pagelen=50 and exact branch filters", r.URL.RawQuery)
-				}
-				w.WriteHeader(test.code)
-				io.WriteString(w, test.body)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Retry-After", test.header)
+				w.WriteHeader(test.status)
 			}))
 			defer server.Close()
-			_, found, err := newTestClient(t, server.URL, "", "").FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
-			if test.want == "" {
-				if err != nil || found {
-					t.Fatalf("FindPullRequest = found %t, error %v; want no match", found, err)
-				}
-				return
-			}
-			if err == nil || !strings.Contains(err.Error(), test.want) || !IsPermanent(err) {
-				t.Fatalf("FindPullRequest error = %v; want permanent %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestFindPullRequestHandlesTransportAndReadErrors(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		body io.ReadCloser
-		want string
-	}{
-		{name: "transport", want: "Bitbucket lookup failed"},
-		{name: "read", body: failingReadCloser{}, want: "read Bitbucket lookup response"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			client := newTestClient(t, "https://bitbucket.example", "", "")
-			if test.body != nil {
-				client.httpClient = responseClient(&http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: test.body})
-			} else {
-				client.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-					return nil, errors.New("lookup unavailable")
-				})}
-			}
-			_, _, err := client.FindPullRequest(context.Background(), testWorkspace, testRepository, "feature/task", "main", "swe-123")
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("FindPullRequest error = %v; want %q", err, test.want)
+			_, err := newTestClient(t, server.URL, "", "").GetPullRequest(context.Background(), testWorkspace, testRepository, 42)
+			if err == nil || IsPermanent(err) || forge.RetryDelay(err) != test.delay {
+				t.Fatalf("GetPullRequest error/permanent/delay = %v/%t/%v; want retryable/%v", err, IsPermanent(err), forge.RetryDelay(err), test.delay)
 			}
 		})
 	}
@@ -413,15 +175,12 @@ func TestFindPullRequestHandlesTransportAndReadErrors(t *testing.T) {
 func TestEndpointAndRedactionHandleNilAndEscapedValues(t *testing.T) {
 	var nilClient *Client
 	if got := nilClient.redact("message"); got != "message" {
-		t.Fatalf("nil Client.redact() = %q; want message", got)
+		t.Fatalf("nil Client.redact() = %q", got)
 	}
 	client := newTestClient(t, "https://bitbucket.example/api/", "user", "pass")
 	endpoint, err := client.endpoint("team name", "repo/name")
-	if err != nil {
-		t.Fatalf("endpoint() error = %v", err)
-	}
-	if !strings.Contains(endpoint, "/api/2.0/repositories/team%20name/repo%2Fname/pullrequests") {
-		t.Fatalf("endpoint() = %q; want escaped path", endpoint)
+	if err != nil || !strings.Contains(endpoint, "/api/2.0/repositories/team%20name/repo%2Fname/pullrequests") {
+		t.Fatalf("endpoint() = %q, %v", endpoint, err)
 	}
 	if got := client.redact("user pass"); got != "[REDACTED] [REDACTED]" {
 		t.Fatalf("redact() = %q", got)
@@ -429,7 +188,7 @@ func TestEndpointAndRedactionHandleNilAndEscapedValues(t *testing.T) {
 }
 
 func TestNewClientRequiresHTTPSExceptLoopback(t *testing.T) {
-	for _, baseURL := range []string{"http://bitbucket.example", "ftp://bitbucket.example", "https://user:password@bitbucket.example", "https://bitbucket.example?password=secret"} {
+	for _, baseURL := range []string{"http://bitbucket.example", "ftp://bitbucket.example", "https://user:password@bitbucket.example", "https://bitbucket.example?password=secret", "https://bitbucket.example#fragment"} {
 		if _, err := NewClient(baseURL, "", ""); err == nil {
 			t.Errorf("NewClient(%q) accepted unsafe base URL", baseURL)
 		}
@@ -450,26 +209,8 @@ func newTestClient(t *testing.T, baseURL, username, appPassword string) *Client 
 	return client
 }
 
-type branchRef struct {
-	Branch branch `json:"branch"`
-}
-
-type branch struct {
-	Name string `json:"name"`
-}
-
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
-}
-
-type failingReadCloser struct{}
-
-func (failingReadCloser) Read([]byte) (int, error) { return 0, errors.New("read failed") }
-
-func (failingReadCloser) Close() error { return nil }
-
-func responseClient(response *http.Response) *http.Client {
-	return &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { return response, nil })}
 }

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const maxFixAttempts = 10
@@ -12,16 +13,22 @@ const maxFixAttempts = 10
 // TaskManifest is the worker's trusted, serialized task boundary. Commands
 // are argv vectors, never shell snippets.
 type TaskManifest struct {
-	TaskID             string     `json:"task_id"`
-	Repository         string     `json:"repository,omitempty"`
-	CloneURL           string     `json:"clone_url,omitempty"`
-	BaseBranch         string     `json:"base_branch,omitempty"`
-	TaskBranch         string     `json:"task_branch,omitempty"`
-	Prompt             string     `json:"prompt"`
-	OpenCodeCommand    []string   `json:"opencode_command,omitempty"`
-	ValidationCommand  []string   `json:"validation_command,omitempty"`
-	ValidationCommands [][]string `json:"validation_commands,omitempty"`
-	MaxFixAttempts     int        `json:"max_fix_attempts"`
+	TaskID                     string     `json:"task_id"`
+	Repository                 string     `json:"repository,omitempty"`
+	CloneURL                   string     `json:"clone_url,omitempty"`
+	BaseBranch                 string     `json:"base_branch,omitempty"`
+	TaskBranch                 string     `json:"task_branch,omitempty"`
+	Prompt                     string     `json:"prompt"`
+	OpenCodeCommand            []string   `json:"opencode_command,omitempty"`
+	ValidationCommand          []string   `json:"validation_command,omitempty"`
+	ValidationCommands         [][]string `json:"validation_commands,omitempty"`
+	MaxFixAttempts             int        `json:"max_fix_attempts"`
+	ForgeProvider              string     `json:"forge_provider"`
+	ForgeOwner                 string     `json:"forge_owner"`
+	ForgeRepository            string     `json:"forge_repository"`
+	RequestedPullRequestTitle  string     `json:"requested_pull_request_title,omitempty"`
+	ExistingPullRequestNumber  int        `json:"existing_pull_request_number,omitempty"`
+	ExistingPullRequestHeadSHA string     `json:"existing_pull_request_head_sha,omitempty"`
 }
 
 // ValidateManifest checks values crossing into the worker. It deliberately
@@ -48,6 +55,38 @@ func ValidateManifest(manifest TaskManifest) error {
 	}
 	if err := validateBranch("task_branch", manifest.TaskBranch); err != nil {
 		return err
+	}
+	if manifest.ForgeProvider != "bitbucket" && manifest.ForgeProvider != "github" {
+		return fmt.Errorf("forge_provider %q is not supported", manifest.ForgeProvider)
+	}
+	if err := validateText("forge_owner", manifest.ForgeOwner, 256, true); err != nil {
+		return err
+	}
+	if manifest.ForgeOwner != strings.TrimSpace(manifest.ForgeOwner) {
+		return fmt.Errorf("forge_owner must not have surrounding whitespace")
+	}
+	if err := validateText("forge_repository", manifest.ForgeRepository, 256, true); err != nil {
+		return err
+	}
+	if manifest.ForgeRepository != strings.TrimSpace(manifest.ForgeRepository) {
+		return fmt.Errorf("forge_repository must not have surrounding whitespace")
+	}
+	if manifest.RequestedPullRequestTitle != "" {
+		if err := validateText("requested_pull_request_title", manifest.RequestedPullRequestTitle, 1024, true); err != nil {
+			return err
+		}
+		if utf8.RuneCountInString(manifest.RequestedPullRequestTitle) > 256 {
+			return fmt.Errorf("requested_pull_request_title is too long")
+		}
+	}
+	if manifest.ExistingPullRequestNumber < 0 {
+		return fmt.Errorf("existing_pull_request_number must not be negative")
+	}
+	if manifest.ExistingPullRequestNumber > 0 && !FullLowerGitObjectID(manifest.ExistingPullRequestHeadSHA) {
+		return fmt.Errorf("existing_pull_request_head_sha must be a full lowercase Git object ID when existing_pull_request_number is positive")
+	}
+	if manifest.ExistingPullRequestNumber == 0 && manifest.ExistingPullRequestHeadSHA != "" {
+		return fmt.Errorf("existing_pull_request_head_sha must be empty when existing_pull_request_number is zero")
 	}
 	if err := validateCommand("opencode_command", manifest.OpenCodeCommand); err != nil {
 		return err
@@ -109,6 +148,11 @@ func validateBranch(name, value string) error {
 		return fmt.Errorf("%s is not a safe branch name", name)
 	}
 	return nil
+}
+
+// ValidateBranch checks a branch name crossing a protocol boundary.
+func ValidateBranch(value string) error {
+	return validateBranch("branch", value)
 }
 
 func validateCommand(name string, command []string) error {

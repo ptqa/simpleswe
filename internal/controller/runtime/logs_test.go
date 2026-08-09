@@ -163,8 +163,113 @@ func TestPodLogScannerRejectsMismatchedJobOwnerUID(t *testing.T) {
 		t.Fatalf("NewRuntime(): %v", err)
 	}
 	pod := managedPod("simpleswe-workers", "spoof", job.Name, taskRecord.ID, "1", attempt.ID, types.UID("other-job"))
+	if _, err := db.AppendPodLog(context.Background(), store.AppendPodLogParams{
+		TaskID: taskRecord.ID, AttemptID: attempt.ID, PodUID: string(pod.UID), Content: []byte("saved\n"),
+	}, 1<<20, 64); err != nil {
+		t.Fatalf("seed Pod cursor: %v", err)
+	}
+	if err := db.MarkLogsExhausted(context.Background(), taskRecord.ID, attempt.ID); err != nil {
+		t.Fatalf("mark attempt logs exhausted: %v", err)
+	}
 	if err := runtime.CollectPodLogs(context.Background(), pod); err == nil {
 		t.Fatal("Pod owned by another Job UID was accepted")
+	}
+	cursor, err := db.GetPodLogCursor(context.Background(), string(pod.UID))
+	if err != nil || cursor.Exhausted {
+		t.Fatalf("unowned Pod closed cursor = %#v, %v", cursor, err)
+	}
+}
+
+func TestPodLogRecoveryClosesOwnedCursorAfterAttemptExhaustion(t *testing.T) {
+	db, taskRecord, attempt, _ := backendStore(t)
+	controller := &failAfterAttemptExhaustionController{
+		fakeController: newFakeController(db), taskID: taskRecord.ID, attemptID: attempt.ID,
+	}
+	jobUID := types.UID("recovery-job-uid")
+	job := runtimeJob("simpleswe-workers", "recovery-job", taskRecord.ID, attempt.ID, jobUID)
+	logs := &fakePodLogs{content: map[string][]string{"recovery-pod": {
+		"2026-08-06T12:00:00Z final line\n",
+		"2026-08-06T12:00:00Z final line\n",
+	}}}
+	r, err := NewRuntime(fake.NewSimpleClientset(job), db, controller, NewBackend(db, controller), Options{
+		Namespace: job.Namespace, PodLogs: logs, MaxLogBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	pod := managedPod(job.Namespace, "recovery-pod", job.Name, taskRecord.ID, "1", attempt.ID, jobUID)
+	if err := r.CollectPodLogs(context.Background(), pod); err == nil || !strings.Contains(err.Error(), "injected failure after attempt exhaustion") {
+		t.Fatalf("first collection error = %v, want injected exhaustion failure", err)
+	}
+	cursor, err := db.GetPodLogCursor(context.Background(), string(pod.UID))
+	if err != nil || cursor.Exhausted {
+		t.Fatalf("cursor after injected failure = %#v, %v", cursor, err)
+	}
+	if err := r.CollectPodLogs(context.Background(), pod); err != nil {
+		t.Fatalf("recovery collection: %v", err)
+	}
+	cursor, err = db.GetPodLogCursor(context.Background(), string(pod.UID))
+	if err != nil || !cursor.Exhausted {
+		t.Fatalf("recovered cursor = %#v, %v", cursor, err)
+	}
+	logs.mu.Lock()
+	opens := logs.counts[pod.Name]
+	logs.mu.Unlock()
+	if opens != 1 || controller.exhaustionCalls != 1 {
+		t.Fatalf("recovery replayed logs or exhaustion callback: opens/calls = %d/%d, want 1/1", opens, controller.exhaustionCalls)
+	}
+	got, err := db.ReadLogTail(context.Background(), taskRecord.ID, attempt.ID, 10)
+	if err != nil || got != "final line\n" {
+		t.Fatalf("recovered logs = %q, %v; want final line once", got, err)
+	}
+}
+
+func TestPodLogRecoveryDrainsPendingEventsBeforeClosingCursor(t *testing.T) {
+	db, taskRecord, attempt, _ := backendStore(t)
+	controller := newFakeController(db)
+	jobUID := types.UID("pending-recovery-job-uid")
+	job := runtimeJob("simpleswe-workers", "pending-recovery-job", taskRecord.ID, attempt.ID, jobUID)
+	pod := managedPod(job.Namespace, "pending-recovery-pod", job.Name, taskRecord.ID, "1", attempt.ID, jobUID)
+	event, err := protocol.EncodeEvent(protocol.Event{Type: protocol.EventAgentStarted, TaskID: taskRecord.ID})
+	if err != nil {
+		t.Fatalf("encode pending event: %v", err)
+	}
+	if _, err := db.AppendPodLog(context.Background(), store.AppendPodLogParams{
+		TaskID: taskRecord.ID, AttemptID: attempt.ID, PodUID: string(pod.UID), JobName: job.Name, PodName: pod.Name,
+		Content: []byte(event + "\n"), WorkerEventID: string(pod.UID) + "/event", WorkerEvent: event,
+	}, 1<<20, 64); err != nil {
+		t.Fatalf("seed pending worker event: %v", err)
+	}
+	if err := db.MarkLogsExhausted(context.Background(), taskRecord.ID, attempt.ID); err != nil {
+		t.Fatalf("mark attempt logs exhausted: %v", err)
+	}
+	logs := &fakePodLogs{content: map[string][]string{pod.Name: {"must not open\n"}}}
+	r, err := NewRuntime(fake.NewSimpleClientset(job), db, controller, NewBackend(db, controller), Options{
+		Namespace: job.Namespace, PodLogs: logs, MaxLogBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	if err := r.CollectPodLogs(context.Background(), pod); err != nil {
+		t.Fatalf("recover pending event: %v", err)
+	}
+	_, _, _, calls := controller.snapshot()
+	if len(calls) != 1 || calls[0].event.Type != protocol.EventAgentStarted {
+		t.Fatalf("recovered worker events = %#v, want pending agent_started", calls)
+	}
+	pending, err := db.ListPendingWorkerEvents(context.Background(), string(pod.UID))
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending worker events after recovery = %#v, %v", pending, err)
+	}
+	cursor, err := db.GetPodLogCursor(context.Background(), string(pod.UID))
+	if err != nil || !cursor.Exhausted {
+		t.Fatalf("cursor after pending event recovery = %#v, %v", cursor, err)
+	}
+	logs.mu.Lock()
+	opens := logs.counts[pod.Name]
+	logs.mu.Unlock()
+	if opens != 0 {
+		t.Fatalf("recovery opened Kubernetes logs %d times, want 0", opens)
 	}
 }
 
@@ -322,4 +427,18 @@ func runtimeJob(namespace, name, taskID, attemptID string, uid types.UID) *batch
 		"app.kubernetes.io/managed-by": "simpleswe", "simpleswe.dev/task-id": taskID,
 		"simpleswe.dev/attempt": "1", "simpleswe.dev/attempt-id": attemptID,
 	}}, Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: "True"}}}}
+}
+
+type failAfterAttemptExhaustionController struct {
+	*fakeController
+	taskID, attemptID string
+	exhaustionCalls   int
+}
+
+func (c *failAfterAttemptExhaustionController) WorkerLogsExhausted(ctx context.Context, _, _ string) error {
+	c.exhaustionCalls++
+	if err := c.store.MarkLogsExhausted(ctx, c.taskID, c.attemptID); err != nil {
+		return fmt.Errorf("mark attempt logs exhausted: %w", err)
+	}
+	return errors.New("injected failure after attempt exhaustion")
 }

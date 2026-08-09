@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -345,11 +348,13 @@ func TestLogProtocolValidationAndBoundedReads(t *testing.T) {
 	}{
 		{name: "empty task", event: protocol.Event{Type: protocol.EventAgentStarted}, wantErr: true},
 		{name: "agent started", event: protocol.Event{Type: protocol.EventAgentStarted, TaskID: "task"}},
-		{name: "worker failed", event: protocol.Event{Type: "worker_failed", TaskID: "task"}},
+		{name: "worker failed", event: protocol.Event{Type: protocol.EventWorkerFailed, TaskID: "task", Message: "OpenCode failed"}},
 		{name: "validation command required", event: protocol.Event{Type: protocol.EventValidationResult, TaskID: "task"}, wantErr: true},
 		{name: "validation command", event: protocol.Event{Type: protocol.EventValidationFailed, TaskID: "task", Command: []string{"go", "test"}}},
-		{name: "branch", event: protocol.Event{Type: protocol.EventBranchPushed, TaskID: "task", Branch: "branch", CommitSHA: validCommit}},
-		{name: "bad branch commit", event: protocol.Event{Type: protocol.EventBranchPushed, TaskID: "task", Branch: "branch", CommitSHA: "short"}, wantErr: true},
+		{name: "pull request ready", event: protocol.Event{Type: protocol.EventPullRequestReady, TaskID: "task", PullRequestNumber: 42, Branch: "branch", CommitSHA: validCommit}},
+		{name: "legacy branch pushed", event: protocol.Event{Type: protocol.EventBranchPushed, TaskID: "task", Branch: "branch", CommitSHA: validCommit}},
+		{name: "legacy branch pushed extra fields", event: protocol.Event{Type: protocol.EventBranchPushed, TaskID: "task", Branch: "branch", CommitSHA: validCommit, Message: "unexpected"}, wantErr: true},
+		{name: "bad ready commit", event: protocol.Event{Type: protocol.EventPullRequestReady, TaskID: "task", PullRequestNumber: 42, Branch: "branch", CommitSHA: "short"}, wantErr: true},
 		{name: "unsupported", event: protocol.Event{Type: "mystery", TaskID: "task"}, wantErr: true},
 	}
 	for _, test := range tests {
@@ -406,6 +411,130 @@ func TestDrainWorkerEventsPreservesFailedDispatchForRetry(t *testing.T) {
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending events after retry = %#v, %v", pending, err)
 	}
+}
+
+func TestDrainWorkerEventsConsumesReceiptAfterFailureReplay(t *testing.T) {
+	db, taskRecord, attempt, _ := backendStore(t)
+	ready, err := protocol.EncodeEvent(protocol.Event{
+		Type: protocol.EventPullRequestReady, TaskID: taskRecord.ID, PullRequestNumber: 42,
+		Branch: "simpleswe/task", CommitSHA: strings.Repeat("a", 40),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AppendPodLog(context.Background(), store.AppendPodLogParams{
+		TaskID: taskRecord.ID, AttemptID: attempt.ID, PodUID: "receipt-pod", JobName: "job", PodName: "pod",
+		Content: []byte(ready), WorkerEventID: "conflicting-receipt", WorkerEvent: ready,
+	}, 1<<20, 64); err != nil {
+		t.Fatal(err)
+	}
+	control := &receiptReplayController{fakeController: newFakeController(db)}
+	runtime, err := NewRuntime(fake.NewSimpleClientset(), db, control, NewBackend(db, control), Options{Namespace: "workers", PodLogs: &fakePodLogs{content: map[string][]string{}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.drainWorkerEvents(context.Background(), "receipt-pod"); err == nil || !strings.Contains(err.Error(), "durable receipt conflict") {
+		t.Fatalf("first receipt drain error = %v", err)
+	}
+	if err := runtime.drainWorkerEvents(context.Background(), "receipt-pod"); err != nil {
+		t.Fatalf("replayed receipt drain: %v", err)
+	}
+	pending, err := db.ListPendingWorkerEvents(context.Background(), "receipt-pod")
+	if err != nil || len(pending) != 0 || control.calls != 2 {
+		t.Fatalf("replayed receipt pending/calls = %#v/%d, %v", pending, control.calls, err)
+	}
+}
+
+func TestRecoverWorkerEventsContinuesAcrossPodsAndPreservesPodOrder(t *testing.T) {
+	db, firstTask, firstAttempt, _ := backendStore(t)
+	secondTask, err := db.CreateTask(context.Background(), store.CreateTaskParams{Repository: "repo", Prompt: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := protocol.EncodeEvent(protocol.Event{Type: protocol.EventPullRequestReady, TaskID: firstTask.ID, PullRequestNumber: 42, Branch: "simpleswe/first", CommitSHA: strings.Repeat("a", 40)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEvents := []protocol.Event{
+		{Type: protocol.EventAgentStarted, TaskID: secondTask.ID},
+		{Type: protocol.EventValidationStarted, TaskID: secondTask.ID, Command: []string{"go", "test"}},
+	}
+	appendEvent := func(taskID, attemptID, podUID, id, job, pod, content string) {
+		t.Helper()
+		if _, err := db.AppendPodLog(context.Background(), store.AppendPodLogParams{
+			TaskID: taskID, AttemptID: attemptID, PodUID: podUID, JobName: job, PodName: pod,
+			Content: []byte(content), WorkerEventID: id, WorkerEvent: content,
+		}, 1<<20, 64); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendEvent(firstTask.ID, firstAttempt.ID, "blocked-pod-uid", "blocked", "blocked-job", "blocked-pod", first)
+	for i, event := range secondEvents {
+		content, err := protocol.EncodeEvent(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendEvent(secondTask.ID, secondTask.CurrentAttemptID, "ready-pod-uid", fmt.Sprintf("ready-%d", i), "ready-job", "ready-pod", content)
+	}
+	control := &podSelectiveErrorController{fakeController: newFakeController(db), blockedPod: "blocked-pod"}
+	forgeCalls := 0
+	var logs bytes.Buffer
+	runtime, err := NewRuntime(fake.NewSimpleClientset(), db, control, NewBackend(db, control), Options{
+		Namespace: "workers", PodLogs: &fakePodLogs{content: map[string][]string{}},
+		Logger:             slog.New(slog.NewTextHandler(&logs, nil)),
+		ProcessForgeEvents: func(context.Context) error { forgeCalls++; return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := runtime.recoverOnce(context.Background()); err != nil {
+			t.Fatalf("worker event recovery entered global backoff path: %v", err)
+		}
+	}
+	blocked, err := db.ListPendingWorkerEvents(context.Background(), "blocked-pod-uid")
+	if err != nil || len(blocked) != 1 {
+		t.Fatalf("blocked Pod pending events = %#v, %v", blocked, err)
+	}
+	ready, err := db.ListPendingWorkerEvents(context.Background(), "ready-pod-uid")
+	if err != nil || len(ready) != 0 {
+		t.Fatalf("independent Pod pending events = %#v, %v", ready, err)
+	}
+	_, _, reconciles, calls := control.snapshot()
+	if len(calls) != 2 || calls[0].event.Type != protocol.EventAgentStarted || calls[1].event.Type != protocol.EventValidationStarted {
+		t.Fatalf("independent Pod calls out of order: %#v", calls)
+	}
+	if forgeCalls != 2 || reconciles != 2 {
+		t.Fatalf("blocked recovery forge/reconcile calls = %d/%d; want 2/2", forgeCalls, reconciles)
+	}
+	if logText := logs.String(); !strings.Contains(logText, "recover pending worker events") || !strings.Contains(logText, "blocked-pod-uid") || !strings.Contains(logText, "provider temporarily unavailable") {
+		t.Fatalf("worker recovery log = %q; want operation, Pod, and transient error context", logText)
+	}
+}
+
+type receiptReplayController struct {
+	*fakeController
+	calls int
+}
+
+type podSelectiveErrorController struct {
+	*fakeController
+	blockedPod string
+}
+
+func (c *podSelectiveErrorController) HandleWorkerEvent(ctx context.Context, job, pod string, event protocol.Event) error {
+	if pod == c.blockedPod {
+		return errors.New("provider temporarily unavailable")
+	}
+	return c.fakeController.HandleWorkerEvent(ctx, job, pod, event)
+}
+
+func (c *receiptReplayController) HandleWorkerEventOnce(ctx context.Context, _ string, job, pod string, event protocol.Event) error {
+	c.calls++
+	if c.calls == 1 {
+		return errors.New("durable receipt conflict")
+	}
+	return c.HandleWorkerEvent(ctx, job, pod, event)
 }
 
 type workerEventErrorController struct {

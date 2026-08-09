@@ -9,11 +9,14 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
 
 var ErrNoChanges = errors.New("no changes detected")
+
+var errCommandOutputDrain = errors.New("drain command output: deadline exceeded")
 
 const (
 	DefaultCommandOutputLimit = 64 << 10
@@ -31,13 +34,6 @@ type ValidationResult struct {
 	Runs []CommandResult
 }
 
-func RequireChanges(changed bool) error {
-	if !changed {
-		return ErrNoChanges
-	}
-	return nil
-}
-
 // RunCommand executes argv directly. It never joins argv into a shell
 // command, and gives each command its own process group so cancellation can
 // terminate descendants when the platform supports it.
@@ -50,10 +46,14 @@ func runCommandInDir(ctx context.Context, dir string, argv []string) (CommandRes
 }
 
 func runCommandInDirWithOutput(ctx context.Context, dir string, argv []string, stdoutWriter, stderrWriter io.Writer, outputLimit int) (CommandResult, error) {
-	return runCommandInDirWithOutputEnv(ctx, dir, argv, stdoutWriter, stderrWriter, outputLimit, nil)
+	return runCommandInDirWithOutputEnvMode(ctx, dir, argv, stdoutWriter, stderrWriter, outputLimit, nil, false)
 }
 
-func runCommandInDirWithOutputEnv(ctx context.Context, dir string, argv []string, stdoutWriter, stderrWriter io.Writer, outputLimit int, environment map[string]string) (CommandResult, error) {
+func runContainedCommandInDirWithOutputEnv(ctx context.Context, dir string, argv []string, stdoutWriter, stderrWriter io.Writer, outputLimit int, environment map[string]string) (CommandResult, error) {
+	return runCommandInDirWithOutputEnvMode(ctx, dir, argv, stdoutWriter, stderrWriter, outputLimit, environment, true)
+}
+
+func runCommandInDirWithOutputEnvMode(ctx context.Context, dir string, argv []string, stdoutWriter, stderrWriter io.Writer, outputLimit int, environment map[string]string, containDescendants bool) (CommandResult, error) {
 	command := append([]string(nil), argv...)
 	result := CommandResult{Command: command, ExitCode: -1}
 	if len(argv) == 0 || argv[0] == "" {
@@ -75,35 +75,114 @@ func runCommandInDirWithOutputEnv(ctx context.Context, dir string, argv []string
 	}
 	stdout := newTailBuffer(outputLimit)
 	stderr := newTailBuffer(outputLimit)
-	cmd.Stdout = stdout
-	if stdoutWriter != nil {
-		cmd.Stdout = io.MultiWriter(stdout, stdoutWriter)
-	}
-	cmd.Stderr = stderr
-	if stderrWriter != nil {
-		cmd.Stderr = io.MultiWriter(stderr, stderrWriter)
-	}
-	if err := cmd.Start(); err != nil {
-		result.Stdout = stdout.String()
-		result.Stderr = stderr.String()
+	stdoutPipe, err := newCommandOutputPipe("stdout", stdout, stdoutWriter)
+	if err != nil {
 		return result, err
 	}
-
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	var err error
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		killProcessGroup(cmd.Process.Pid)
-		<-done
-		err = ctx.Err()
+	stderrPipe, err := newCommandOutputPipe("stderr", stderr, stderrWriter)
+	if err != nil {
+		return result, errors.Join(err, stdoutPipe.close())
 	}
+	cmd.Stdout = stdoutPipe.child
+	cmd.Stderr = stderrPipe.child
+	if err := cmd.Start(); err != nil {
+		closeErr := errors.Join(stdoutPipe.close(), stderrPipe.close())
+		result.Stdout = stdout.String()
+		result.Stderr = stderr.String()
+		return result, errors.Join(err, closeErr)
+	}
+	stdoutPipe.start()
+	stderrPipe.start()
+	closeErr := errors.Join(stdoutPipe.closeChild(), stderrPipe.closeChild())
 
-	result.ExitCode = commandExitCode(cmd, err)
-	result.Stdout = stdout.String()
-	result.Stderr = stderr.String()
-	return result, err
+	waitErr := waitCommandWithGroupCleanup(ctx, cmd, containDescendants)
+	drained, copyErr := waitCommandOutput(stdoutPipe, stderrPipe)
+
+	result.ExitCode = commandExitCode(cmd, waitErr)
+	if drained {
+		result.Stdout = stdout.String()
+		result.Stderr = stderr.String()
+	}
+	return result, errors.Join(waitErr, closeErr, copyErr)
+}
+
+type commandOutputPipe struct {
+	name   string
+	reader *os.File
+	child  *os.File
+	tail   *tailBuffer
+	writer io.Writer
+	done   chan error
+}
+
+func newCommandOutputPipe(name string, tail *tailBuffer, writer io.Writer) (*commandOutputPipe, error) {
+	reader, child, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create command %s pipe: %w", name, err)
+	}
+	return &commandOutputPipe{name: name, reader: reader, child: child, tail: tail, writer: writer, done: make(chan error, 1)}, nil
+}
+
+func (p *commandOutputPipe) start() {
+	go func() { p.done <- p.copy() }()
+}
+
+func (p *commandOutputPipe) copy() (copyErr error) {
+	defer func() { copyErr = errors.Join(copyErr, p.reader.Close()) }()
+	buffer := make([]byte, 32<<10)
+	writer := p.writer
+	for {
+		read, err := p.reader.Read(buffer)
+		if read > 0 {
+			_, _ = p.tail.Write(buffer[:read])
+			if writer != nil {
+				written, writeErr := writer.Write(buffer[:read])
+				if writeErr == nil && written != read {
+					writeErr = io.ErrShortWrite
+				}
+				if writeErr != nil {
+					copyErr = errors.Join(copyErr, fmt.Errorf("write command %s: %w", p.name, writeErr))
+					writer = nil
+				}
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return copyErr
+		}
+		if err != nil {
+			return errors.Join(copyErr, fmt.Errorf("read command %s: %w", p.name, err))
+		}
+	}
+}
+
+func (p *commandOutputPipe) closeChild() error {
+	if err := p.child.Close(); err != nil {
+		return fmt.Errorf("close command %s child pipe: %w", p.name, err)
+	}
+	return nil
+}
+
+func (p *commandOutputPipe) close() error {
+	return errors.Join(p.reader.Close(), p.child.Close())
+}
+
+func waitCommandOutput(pipes ...*commandOutputPipe) (bool, error) {
+	const drainLimit = 2 * time.Second
+	timer := time.NewTimer(drainLimit)
+	defer timer.Stop()
+	var copyErr error
+	for _, pipe := range pipes {
+		select {
+		case err := <-pipe.done:
+			copyErr = errors.Join(copyErr, err)
+		case <-timer.C:
+			for _, pending := range pipes {
+				_ = pending.reader.Close()
+			}
+			return false, errors.Join(copyErr, errCommandOutputDrain)
+		}
+	}
+	return true, copyErr
 }
 
 func commandEnvironment(overrides map[string]string) []string {

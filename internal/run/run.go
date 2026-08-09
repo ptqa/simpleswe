@@ -42,6 +42,7 @@ func Dependencies() app.Dependencies {
 		RunController: RunController,
 		NewWorkspace:  newWorkspace,
 		RunWorker:     RunWorker,
+		ReportWorker:  worker.Report,
 		RunTUI:        runTUI,
 		PortForward:   portForward,
 		CreateTask: func(ctx context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {
@@ -321,8 +322,6 @@ func readGithubToken(root, secretName string) (string, error) {
 }
 
 type pullRequestClient interface {
-	CreatePullRequest(context.Context, string, string, forge.CreatePullRequestRequest) (forge.PullRequest, error)
-	FindPullRequest(context.Context, string, string, string, string, string) (forge.PullRequest, bool, error)
 	GetPullRequest(context.Context, string, string, int) (forge.PullRequestState, error)
 }
 
@@ -404,30 +403,6 @@ func newForgeRouter(cfg config.Config, bitbucketRoot, githubRoot string) (forgeR
 		credentials[coordinate] = key.CredentialsSecret
 	}
 	return router, nil
-}
-
-func (r forgeRouter) CreatePullRequest(ctx context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
-	client, err := r.client(target)
-	if err != nil {
-		return forge.PullRequest{}, err
-	}
-	pullRequest, err := client.CreatePullRequest(ctx, target.Owner, target.Repository, input)
-	if err != nil {
-		return forge.PullRequest{}, fmt.Errorf("create pull request for %s/%s: %w", target.Owner, target.Repository, err)
-	}
-	return pullRequest, nil
-}
-
-func (r forgeRouter) FindPullRequest(ctx context.Context, target forge.Target, sourceBranch, destinationBranch, taskMarker string) (forge.PullRequest, bool, error) {
-	client, err := r.client(target)
-	if err != nil {
-		return forge.PullRequest{}, false, err
-	}
-	pullRequest, found, err := client.FindPullRequest(ctx, target.Owner, target.Repository, sourceBranch, destinationBranch, taskMarker)
-	if err != nil {
-		return forge.PullRequest{}, false, fmt.Errorf("find pull request for %s/%s: %w", target.Owner, target.Repository, err)
-	}
-	return pullRequest, found, nil
 }
 
 func (r forgeRouter) GetPullRequest(ctx context.Context, target forge.Target, number int) (forge.PullRequestState, error) {

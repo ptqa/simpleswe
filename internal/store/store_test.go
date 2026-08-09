@@ -3,14 +3,20 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/simpleswe/simpleswe/internal/task"
+	"modernc.org/sqlite"
 )
 
 func TestRetryCreatesAttemptTwoWithoutChangingAttemptOne(t *testing.T) {
@@ -101,7 +107,7 @@ func TestRetryCreatesAttemptTwoWithoutChangingAttemptOne(t *testing.T) {
 	}
 }
 
-func TestRetryWaitsForFailedCurrentAttemptLogsAndOldAttemptCanStillBeMarked(t *testing.T) {
+func TestRetryWaitsForFailedCurrentAttemptLogsAndPendingWorkerEvents(t *testing.T) {
 	db := openTestStore(t)
 	ctx := context.Background()
 	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "prompt"})
@@ -115,8 +121,23 @@ func TestRetryWaitsForFailedCurrentAttemptLogsAndOldAttemptCanStillBeMarked(t *t
 	if _, _, err := db.RetryTaskOnce(ctx, created.ID, "retry-after-eof"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("retry before logs exhausted = %v, want ErrConflict", err)
 	}
+	if _, err := db.AppendPodLog(ctx, AppendPodLogParams{
+		TaskID: created.ID, AttemptID: first.ID, PodUID: "pending-retry-pod", JobName: "job", PodName: "pod",
+		Content: []byte("pending event"), WorkerEventID: "pending-retry-event", WorkerEvent: "pending event",
+	}, 256, 64); err != nil {
+		t.Fatalf("append pending worker event: %v", err)
+	}
 	if err := db.MarkLogsExhausted(ctx, created.ID, first.ID); err != nil {
 		t.Fatalf("mark first attempt logs exhausted: %v", err)
+	}
+	if _, _, err := db.PlanRetryAttempt(ctx, created.ID, "retry-after-eof"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("plan retry with pending worker event = %v, want ErrConflict", err)
+	}
+	if _, _, err := db.RetryTaskOnce(ctx, created.ID, "retry-after-eof"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry with pending worker event = %v, want ErrConflict", err)
+	}
+	if err := db.MarkWorkerEventProcessed(ctx, "pending-retry-event"); err != nil {
+		t.Fatalf("process pending worker event: %v", err)
 	}
 	second, _, err := db.RetryTaskOnce(ctx, created.ID, "retry-after-eof")
 	if err != nil {
@@ -127,6 +148,51 @@ func TestRetryWaitsForFailedCurrentAttemptLogsAndOldAttemptCanStillBeMarked(t *t
 	}
 	if err := db.MarkLogsExhausted(ctx, created.ID, first.ID); err != nil {
 		t.Fatalf("idempotently mark immutable old attempt after retry: %v", err)
+	}
+}
+
+func TestRetrySelectionMakesOldAttemptLogAppendConflict(t *testing.T) {
+	db := openTestStore(t)
+	ctx := context.Background()
+	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "retry append race"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAttempt := created.CurrentAttemptID
+	if err := db.Transition(ctx, created.ID, task.RECEIVED, task.FAILED, TransitionParams{Reason: "failed", Trigger: "system"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkLogsExhausted(ctx, created.ID, oldAttempt); err != nil {
+		t.Fatal(err)
+	}
+
+	retryGate, appendGate := make(chan struct{}), make(chan struct{})
+	retryResult := make(chan error, 1)
+	appendResult := make(chan error, 1)
+	go func() {
+		<-retryGate
+		_, _, err := db.RetryTaskOnce(ctx, created.ID, "selected-first")
+		retryResult <- err
+	}()
+	go func() {
+		<-appendGate
+		_, err := db.AppendPodLog(ctx, AppendPodLogParams{
+			TaskID: created.ID, AttemptID: oldAttempt, PodUID: "stale-pod", JobName: "old-job", PodName: "old-pod",
+			Content: []byte("late worker failure"), WorkerEventID: "late-old-event", WorkerEvent: "late worker failure",
+		}, 256, 64)
+		appendResult <- err
+	}()
+	close(retryGate)
+	if err := <-retryResult; err != nil {
+		t.Fatalf("retry selection: %v", err)
+	}
+	close(appendGate)
+	if err := <-appendResult; !errors.Is(err, ErrConflict) {
+		t.Fatalf("old-attempt append after retry selection = %v, want ErrConflict", err)
+	}
+	pending, err := db.HasPendingWorkerEvents(ctx, created.ID, oldAttempt)
+	if err != nil || pending {
+		t.Fatalf("stale attempt pending event = %t, %v; want false", pending, err)
 	}
 }
 
@@ -274,35 +340,6 @@ func TestRejectedTransitionLeavesTaskAndEventHistoryUnchanged(t *testing.T) {
 	}
 }
 
-func TestGitResultReplayCannotReplaceDurableBranch(t *testing.T) {
-	db := openTestStore(t)
-	ctx := context.Background()
-	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "prompt"})
-	if err != nil {
-		t.Fatalf("create task: %v", err)
-	}
-	attempt, err := db.CurrentAttempt(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("current attempt: %v", err)
-	}
-	first := GitResult{AttemptID: attempt.ID, State: "pushed", Branch: "work/task-a1", CommitSHA: "abc"}
-	if err := db.RecordGitResult(ctx, first); err != nil {
-		t.Fatalf("record Git result: %v", err)
-	}
-	if err := db.RecordGitResult(ctx, first); err != nil {
-		t.Fatalf("replay identical Git result: %v", err)
-	}
-	replacement := first
-	replacement.Branch = "work/other"
-	if err := db.RecordGitResult(ctx, replacement); err == nil {
-		t.Fatal("replacement durable Git branch was accepted")
-	}
-	got, err := db.GetGitResult(ctx, attempt.ID)
-	if err != nil || got != first {
-		t.Fatalf("durable Git result = %#v, %v; want %#v", got, err, first)
-	}
-}
-
 func TestPullRequestStateRequiresDurableGitAndOpenPullRequest(t *testing.T) {
 	db := openTestStore(t)
 	ctx := context.Background()
@@ -323,17 +360,125 @@ func TestPullRequestStateRequiresDurableGitAndOpenPullRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current attempt: %v", err)
 	}
-	if err := db.RecordGitResult(ctx, GitResult{AttemptID: attempt.ID, State: "pushed", Branch: "work/task-a1", CommitSHA: "abc"}); err != nil {
-		t.Fatalf("record Git result: %v", err)
+	git := GitResult{AttemptID: attempt.ID, State: "pushed", Branch: "work/task-a1", CommitSHA: "0123456789abcdef0123456789abcdef01234567"}
+	pr := PullRequest{AttemptID: attempt.ID, State: "open", Number: 42, URL: "https://bitbucket.example/pr/42", Title: "Provider title", HeadBranch: git.Branch, BaseBranch: "main"}
+	if _, err := db.db.ExecContext(ctx, `UPDATE task_attempts SET base_branch = ?, task_branch = ? WHERE id = ?`, pr.BaseBranch, git.Branch, attempt.ID); err != nil {
+		t.Fatalf("set attempt branch identity: %v", err)
 	}
-	if _, err := db.ReservePullRequest(ctx, attempt.ID, "prompt", "work/task-a1", "main"); err != nil {
-		t.Fatalf("reserve pull request: %v", err)
-	}
-	if err := db.CompletePullRequest(ctx, attempt.ID, 42, "https://bitbucket.example/pr/42"); err != nil {
-		t.Fatalf("complete pull request: %v", err)
+	recordCandidateForTest(t, db, git, pr)
+	if err := db.RecordVerifiedPullRequest(ctx, git, pr); err != nil {
+		t.Fatalf("record verified Git and pull request result: %v", err)
 	}
 	if err := db.Transition(ctx, created.ID, task.CREATING_PR, task.PR_OPEN, TransitionParams{Reason: "durable", Trigger: "system"}); err != nil {
 		t.Fatalf("PR_OPEN with durable results: %v", err)
+	}
+}
+
+func TestRecordPullRequestCandidateCommitFailureRollsBackAndReusesConnection(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := GitResult{AttemptID: created.CurrentAttemptID, State: "candidate", Branch: "work/candidate", CommitSHA: strings.Repeat("a", 40)}
+	pullRequest := PullRequest{AttemptID: git.AttemptID, State: "reported", Number: 42, HeadBranch: git.Branch, BaseBranch: "main"}
+	setAttemptBranches(t, db, git.AttemptID, pullRequest.BaseBranch, git.Branch)
+	if _, err := db.db.ExecContext(ctx, `
+		CREATE TABLE forced_candidate_commit_failure (
+			attempt_id TEXT REFERENCES task_attempts(id) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE TRIGGER reject_candidate_commit AFTER INSERT ON git_results
+		WHEN NEW.state = 'candidate'
+		BEGIN
+			INSERT INTO forced_candidate_commit_failure(attempt_id) VALUES ('missing-attempt');
+		END;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.RecordPullRequestCandidate(ctx, git, pullRequest)
+	if err == nil || !strings.Contains(err.Error(), "commit pull request candidate") {
+		t.Fatalf("RecordPullRequestCandidate() = %v, want commit failure", err)
+	}
+	if got, err := db.GetGitResult(ctx, git.AttemptID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Git result after failed commit = %#v, %v; want absent", got, err)
+	}
+	if got, err := db.GetPullRequest(ctx, pullRequest.AttemptID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("pull request after failed commit = %#v, %v; want absent", got, err)
+	}
+	var forcedRows int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM forced_candidate_commit_failure`).Scan(&forcedRows); err != nil || forcedRows != 0 {
+		t.Errorf("forced rows after failed commit = %d, %v; want 0", forcedRows, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER reject_candidate_commit`); err != nil {
+		t.Fatalf("reuse connection to drop trigger: %v", err)
+	}
+	if err := db.RecordPullRequestCandidate(ctx, git, pullRequest); err != nil {
+		t.Fatalf("valid candidate after failed commit: %v", err)
+	}
+	if got, err := db.GetGitResult(ctx, git.AttemptID); err != nil || got != git {
+		t.Fatalf("Git result after valid retry = %#v, %v; want %#v", got, err, git)
+	}
+	if got, err := db.GetPullRequest(ctx, pullRequest.AttemptID); err != nil || got != pullRequest {
+		t.Fatalf("pull request after valid retry = %#v, %v; want %#v", got, err, pullRequest)
+	}
+}
+
+func TestRecordVerifiedPullRequestCommitFailureRollsBackAndReusesConnection(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "prompt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	git := GitResult{AttemptID: created.CurrentAttemptID, State: "pushed", Branch: "work/verified", CommitSHA: strings.Repeat("b", 40)}
+	pullRequest := PullRequest{AttemptID: git.AttemptID, State: "open", Number: 42, URL: "https://github.example/acme/repo/pull/42", Title: "Provider title", HeadBranch: git.Branch, BaseBranch: "main"}
+	setAttemptBranches(t, db, git.AttemptID, pullRequest.BaseBranch, git.Branch)
+	recordCandidateForTest(t, db, git, pullRequest)
+	wantGit, gitErr := db.GetGitResult(ctx, git.AttemptID)
+	wantPullRequest, pullRequestErr := db.GetPullRequest(ctx, pullRequest.AttemptID)
+	if gitErr != nil || pullRequestErr != nil {
+		t.Fatalf("read candidate rows: %v / %v", gitErr, pullRequestErr)
+	}
+	if _, err := db.db.ExecContext(ctx, `
+		CREATE TABLE forced_verified_commit_failure (
+			attempt_id TEXT REFERENCES task_attempts(id) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE TRIGGER reject_verified_commit AFTER UPDATE OF state ON git_results
+		WHEN NEW.state = 'pushed'
+		BEGIN
+			INSERT INTO forced_verified_commit_failure(attempt_id) VALUES ('missing-attempt');
+		END;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.RecordVerifiedPullRequest(ctx, git, pullRequest)
+	if err == nil || !strings.Contains(err.Error(), "commit verified pull request") {
+		t.Fatalf("RecordVerifiedPullRequest() = %v, want commit failure", err)
+	}
+	if got, err := db.GetGitResult(ctx, git.AttemptID); err != nil || got != wantGit {
+		t.Errorf("Git result after failed commit = %#v, %v; want unchanged %#v", got, err, wantGit)
+	}
+	if got, err := db.GetPullRequest(ctx, pullRequest.AttemptID); err != nil || got != wantPullRequest {
+		t.Errorf("pull request after failed commit = %#v, %v; want unchanged %#v", got, err, wantPullRequest)
+	}
+	var forcedRows int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM forced_verified_commit_failure`).Scan(&forcedRows); err != nil || forcedRows != 0 {
+		t.Errorf("forced rows after failed commit = %d, %v; want 0", forcedRows, err)
+	}
+	if _, err := db.db.ExecContext(ctx, `DROP TRIGGER reject_verified_commit`); err != nil {
+		t.Fatalf("reuse connection to drop trigger: %v", err)
+	}
+	if err := db.RecordVerifiedPullRequest(ctx, git, pullRequest); err != nil {
+		t.Fatalf("valid verification after failed commit: %v", err)
+	}
+	if got, err := db.GetGitResult(ctx, git.AttemptID); err != nil || got != git {
+		t.Fatalf("Git result after valid retry = %#v, %v; want %#v", got, err, git)
+	}
+	if got, err := db.GetPullRequest(ctx, pullRequest.AttemptID); err != nil || got != pullRequest {
+		t.Fatalf("pull request after valid retry = %#v, %v; want %#v", got, err, pullRequest)
 	}
 }
 
@@ -349,8 +494,48 @@ func TestOpenEnablesRequiredSQLitePragmas(t *testing.T) {
 	if !pragmas.ForeignKeys {
 		t.Fatal("foreign_keys is disabled")
 	}
-	if pragmas.BusyTimeout <= 0 {
-		t.Fatalf("busy_timeout = %d; want enabled", pragmas.BusyTimeout)
+	if pragmas.BusyTimeout != 5000 {
+		t.Fatalf("busy_timeout = %d; want 5000", pragmas.BusyTimeout)
+	}
+}
+
+func TestOpenPreservesSpecialFilesystemPaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("question marks are not valid Windows filename characters")
+	}
+	for _, relative := range []bool{false, true} {
+		name := "absolute"
+		if relative {
+			name = "relative"
+		}
+		t.Run(name, func(t *testing.T) {
+			absolutePath := filepath.Join(t.TempDir(), "store with spaces ?#% sqlite")
+			path := absolutePath
+			if relative {
+				workingDirectory, err := os.Getwd()
+				if err != nil {
+					t.Fatalf("get working directory: %v", err)
+				}
+				path, err = filepath.Rel(workingDirectory, absolutePath)
+				if err != nil {
+					t.Fatalf("make relative path: %v", err)
+				}
+			}
+			db, err := Open(t.Context(), path)
+			if err != nil {
+				t.Fatalf("open store at %q using %q: %v", path, sqliteDSN(path), err)
+			}
+			if _, err := db.CreateTask(t.Context(), CreateTaskParams{Repository: "repo", Prompt: "special path"}); err != nil {
+				_ = db.Close()
+				t.Fatalf("use store at %q: %v", path, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close store at %q: %v", path, err)
+			}
+			if _, err := os.Stat(absolutePath); err != nil {
+				t.Fatalf("stat exact store path %q: %v", absolutePath, err)
+			}
+		})
 	}
 }
 
@@ -530,6 +715,134 @@ func TestFailedAttemptFollowRemainsOpenForTrailingLogsUntilExhausted(t *testing.
 	if err != nil || !complete {
 		t.Fatalf("follow complete after exhaustion = %t, %v; want true", complete, err)
 	}
+}
+
+func TestImmediateTransactionDiscardsConnectionWhenRollbackFails(t *testing.T) {
+	wrapped := &rollbackFailureDriver{inner: &sqlite.Driver{}}
+	db := sql.OpenDB(sqliteConnector{driver: wrapped, dsn: sqliteDSN(filepath.Join(t.TempDir(), "rollback.sqlite"))})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(t.Context(), `
+		CREATE TABLE rollback_parents (id INTEGER PRIMARY KEY);
+		CREATE TABLE rollback_children (parent_id INTEGER NOT NULL REFERENCES rollback_parents(id));
+		CREATE TABLE values_for_rollback_test (value INTEGER NOT NULL);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	wrapped.failRollback.Store(true)
+	primary := errors.New("primary transaction failure")
+	store := &Store{db: db}
+	err := store.immediateTransaction(t.Context(), "forced rollback", func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(t.Context(), `INSERT INTO values_for_rollback_test(value) VALUES (1)`); err != nil {
+			return fmt.Errorf("insert rollback test value: %w", err)
+		}
+		return primary
+	})
+	if !errors.Is(err, primary) || !strings.Contains(err.Error(), "forced rollback failure") {
+		t.Fatalf("immediateTransaction() = %v; want joined primary and rollback errors", err)
+	}
+	var foreignKeys, busyTimeout int
+	if err := db.QueryRowContext(t.Context(), `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+		t.Fatalf("read replacement foreign_keys: %v", err)
+	}
+	if err := db.QueryRowContext(t.Context(), `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+		t.Fatalf("read replacement busy_timeout: %v", err)
+	}
+	if foreignKeys != 1 || busyTimeout != 5000 {
+		t.Fatalf("replacement pragmas = foreign_keys %d, busy_timeout %d; want 1 and 5000", foreignKeys, busyTimeout)
+	}
+	if _, err := db.ExecContext(t.Context(), `INSERT INTO rollback_children(parent_id) VALUES (404)`); err == nil || !strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed") {
+		t.Fatalf("replacement connection foreign-key violation = %v; want constraint failure", err)
+	}
+	if _, err := db.ExecContext(t.Context(), `
+		INSERT INTO rollback_parents(id) VALUES (1);
+		INSERT INTO rollback_children(parent_id) VALUES (1);
+		INSERT INTO values_for_rollback_test(value) VALUES (2);
+	`); err != nil {
+		t.Fatalf("valid work after rollback failure did not get a fresh connection: %v", err)
+	}
+	var count, value int
+	if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*), MAX(value) FROM values_for_rollback_test`).Scan(&count, &value); err != nil || count != 1 || value != 2 {
+		t.Fatalf("fresh connection values = count %d max %d, %v; want only committed value 2", count, value, err)
+	}
+	if got := wrapped.opens.Load(); got != 2 {
+		t.Fatalf("driver opens = %d; want poisoned singleton replaced exactly once", got)
+	}
+	if got := wrapped.closes.Load(); got < 1 {
+		t.Fatalf("driver closes = %d; want poisoned connection discarded", got)
+	}
+}
+
+type rollbackFailureDriver struct {
+	inner        driver.Driver
+	opens        atomic.Int32
+	closes       atomic.Int32
+	failRollback atomic.Bool
+}
+
+func (d *rollbackFailureDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.inner.Open(name)
+	if err != nil {
+		return nil, fmt.Errorf("open wrapped SQLite connection: %w", err)
+	}
+	d.opens.Add(1)
+	return &rollbackFailureConn{Conn: conn, owner: d}, nil
+}
+
+type rollbackFailureConn struct {
+	driver.Conn
+	owner    *rollbackFailureDriver
+	poisoned bool
+}
+
+func (c *rollbackFailureConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if c.poisoned {
+		return nil, errors.New("poisoned connection reused")
+	}
+	if strings.EqualFold(strings.TrimSpace(query), "ROLLBACK") && c.owner.failRollback.CompareAndSwap(true, false) {
+		c.poisoned = true
+		return nil, errors.New("forced rollback failure")
+	}
+	execer, ok := c.Conn.(driver.ExecerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	result, err := execer.ExecContext(ctx, query, args)
+	if errors.Is(err, driver.ErrBadConn) {
+		return nil, driver.ErrBadConn
+	}
+	if err != nil {
+		return nil, fmt.Errorf("execute wrapped SQLite query: %w", err)
+	}
+	return result, nil
+}
+
+func (c *rollbackFailureConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.poisoned {
+		return nil, errors.New("poisoned connection reused")
+	}
+	queryer, ok := c.Conn.(driver.QueryerContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	rows, err := queryer.QueryContext(ctx, query, args)
+	if errors.Is(err, driver.ErrBadConn) {
+		return nil, driver.ErrBadConn
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query wrapped SQLite connection: %w", err)
+	}
+	return rows, nil
+}
+
+func (c *rollbackFailureConn) Close() error {
+	c.owner.closes.Add(1)
+	if err := c.Conn.Close(); err != nil {
+		return fmt.Errorf("close wrapped SQLite connection: %w", err)
+	}
+	return nil
 }
 
 func openTestStore(t *testing.T) *Store {

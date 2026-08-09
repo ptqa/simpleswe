@@ -337,6 +337,8 @@ func (b *Backend) resultModels(ctx context.Context, attemptID string) (resultSet
 		state := durable.State
 		if state == "pushed" {
 			state = "succeeded"
+		} else if state == "candidate" {
+			state = "running"
 		}
 		git = map[string]any{"state": state}
 		if durable.Branch != "" {
@@ -369,6 +371,8 @@ func (b *Backend) pullRequestModel(ctx context.Context, attemptID string) (map[s
 	state := durable.State
 	if state == "open" {
 		state = "created"
+	} else if state == "reported" {
+		state = "creating"
 	}
 	model := map[string]any{"state": state}
 	if durable.Number > 0 {

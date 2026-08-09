@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -460,6 +461,512 @@ func TestForgeEventTransientFailureDefersOnlyFailedEvent(t *testing.T) {
 	}
 }
 
+func TestForgeEventBatchFailureIsExactBoundedAndReplaySafeAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge-batch-replay.sqlite")
+	db, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := putPendingForgeEventBatch(t, db, "exact-failure", forgeEventBatchSize)
+	cause := errors.New(strings.Repeat("permanent-diagnostic-", 300))
+	before := time.Now().UTC()
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs, cause); err != nil {
+		t.Fatal(err)
+	}
+	failed := readForgeEventBatch(t, db, eventIDs)
+	for _, event := range failed {
+		if event.Status != ForgeEventFailed || event.Attempts != 1 || event.TaskID != "" || event.AttemptID != "" || event.FailedAt == nil ||
+			event.FailedAt.Before(before) || event.NextAttemptAt != nil || len(event.LastError) > forgeEventErrorMaxBytes ||
+			event.LastError != failed[0].LastError || !event.FailedAt.Equal(*failed[0].FailedAt) || !event.UpdatedAt.Equal(failed[0].UpdatedAt) {
+			t.Fatalf("failed exact batch member = %#v; first=%#v", event, failed[0])
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs, cause); err != nil {
+		t.Fatalf("exact replay after restart: %v", err)
+	}
+	replayed := readForgeEventBatch(t, db, eventIDs)
+	if !reflect.DeepEqual(replayed, failed) {
+		t.Fatalf("exact replay rewrote diagnostics: before=%#v after=%#v", failed, replayed)
+	}
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs[:31], cause); !errors.Is(err, ErrConflict) {
+		t.Fatalf("subset replay = %v, want ErrConflict", err)
+	}
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs, errors.New("different permanent diagnostic")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("different replay = %v, want ErrConflict", err)
+	}
+	if due, err := db.ListIncompleteForgeEvents(t.Context()); err != nil || len(due) != 0 {
+		t.Fatalf("failed siblings regrouped after restart: %#v, %v", due, err)
+	}
+}
+
+func TestForgeEventBatchDeferralIsExactCommonAndReplaySafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "forge-batch-deferral.sqlite")
+	db, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := putPendingForgeEventBatch(t, db, "exact-deferral", forgeEventBatchSize)
+	if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET attempts = 2 WHERE id = ?`, eventIDs[17]); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("temporary batch outage")
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, cause, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	deferred := readForgeEventBatch(t, db, eventIDs)
+	for i, event := range deferred {
+		wantAttempts := 1
+		if i == 17 {
+			wantAttempts = 3
+		}
+		if event.Status != ForgeEventPending || event.Attempts != wantAttempts || event.LastError != cause.Error() || event.NextAttemptAt == nil ||
+			!event.NextAttemptAt.Equal(*deferred[0].NextAttemptAt) || !event.UpdatedAt.Equal(deferred[0].UpdatedAt) {
+			t.Fatalf("deferred exact batch member %d = %#v; first=%#v", i, event, deferred[0])
+		}
+	}
+	if got := deferred[0].NextAttemptAt.Sub(deferred[0].UpdatedAt); got != forgeEventRetryDelay(2) {
+		t.Fatalf("common retry delay = %s, want %s", got, forgeEventRetryDelay(2))
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, cause, time.Second); err != nil {
+		t.Fatalf("exact deferral replay after restart: %v", err)
+	}
+	if replayed := readForgeEventBatch(t, db, eventIDs); !reflect.DeepEqual(replayed, deferred) {
+		t.Fatalf("deferral replay rewrote diagnostics: before=%#v after=%#v", deferred, replayed)
+	}
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs[1:], cause, time.Second); !errors.Is(err, ErrConflict) {
+		t.Fatalf("different deferral members = %v, want ErrConflict", err)
+	}
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, cause, time.Minute); !errors.Is(err, ErrConflict) {
+		t.Fatalf("different deferral delay = %v, want ErrConflict", err)
+	}
+	seed, err := db.GetForgeEvent(t.Context(), eventIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if batch, err := db.ListDueForgeEventBatch(t.Context(), seed); err != nil || len(batch) != 0 {
+		t.Fatalf("deferred siblings regrouped before common retry: %#v, %v", batch, err)
+	}
+}
+
+func TestRunningForgeEventBatchDeferralPreservesExactAssociationAndReplaysAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "running-forge-batch-replay.sqlite")
+	db, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := putPendingForgeEventBatch(t, db, "running-deferral", forgeEventBatchSize)
+	attempt, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "fix exact batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("temporary Kubernetes startup failure")
+	if err := db.RecordForgeEventErrorAfter(t.Context(), eventIDs[0], cause, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, cause, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	deferred := readForgeEventBatch(t, db, eventIDs)
+	for _, event := range deferred {
+		if event.Status != ForgeEventRunning || event.TaskID != record.ID || event.AttemptID != attempt.ID || event.Attempts != 3 ||
+			event.LastError != cause.Error() || event.NextAttemptAt == nil || !event.NextAttemptAt.Equal(*deferred[0].NextAttemptAt) || !event.UpdatedAt.Equal(deferred[0].UpdatedAt) {
+			t.Fatalf("deferred running batch member = %#v; first=%#v", event, deferred[0])
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, cause, time.Second); err != nil {
+		t.Fatalf("running exact replay after restart: %v", err)
+	}
+	if replayed := readForgeEventBatch(t, db, eventIDs); !reflect.DeepEqual(replayed, deferred) {
+		t.Fatalf("running replay changed batch: before=%#v after=%#v", deferred, replayed)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET next_attempt_at = ? WHERE attempt_id = ?`, stamp(time.Now().Add(-time.Second)), attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	due, err := db.ListIncompleteForgeEvents(t.Context())
+	if err != nil || len(due) != forgeEventBatchSize || due[0].AttemptID != attempt.ID {
+		t.Fatalf("running batch after deadline = %#v, %v", due, err)
+	}
+}
+
+func TestRunningForgeEventBatchDeferralIgnoresHistoricalTerminalSiblings(t *testing.T) {
+	db := openTestStore(t)
+	_, eventIDs := mixedTerminalRunningForgeEventBatch(t, db, "partial-deferral")
+	historical := readForgeEventBatch(t, db, eventIDs[:2])
+	cause := errors.New("temporary partial batch outage")
+
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs[2:], cause, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	after := readForgeEventBatch(t, db, eventIDs)
+	if !reflect.DeepEqual(after[:2], historical) {
+		t.Fatalf("historical terminal siblings changed: before=%#v after=%#v", historical, after[:2])
+	}
+	for _, event := range after[2:] {
+		if event.Status != ForgeEventRunning || event.Attempts != 2 || event.LastError != cause.Error() || event.NextAttemptAt == nil ||
+			!event.NextAttemptAt.Equal(*after[2].NextAttemptAt) || !event.UpdatedAt.Equal(after[2].UpdatedAt) {
+			t.Fatalf("deferred running sibling = %#v; first=%#v", event, after[2])
+		}
+	}
+
+	beforeConflict := readForgeEventBatch(t, db, eventIDs)
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs[2:3], cause, time.Second); !errors.Is(err, ErrConflict) {
+		t.Fatalf("omitted running member = %v, want ErrConflict", err)
+	}
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), []string{eventIDs[0], eventIDs[2]}, cause, time.Second); !errors.Is(err, ErrConflict) {
+		t.Fatalf("selected handled member = %v, want ErrConflict", err)
+	}
+	if current := readForgeEventBatch(t, db, eventIDs); !reflect.DeepEqual(current, beforeConflict) {
+		t.Fatalf("conflicting selections changed events: before=%#v after=%#v", beforeConflict, current)
+	}
+}
+
+func TestPermanentRunningForgeEventBatchReplayUsesExactFailureFingerprint(t *testing.T) {
+	db := openTestStore(t)
+	record, eventIDs := mixedTerminalRunningForgeEventBatch(t, db, "partial-permanent")
+	historical := readForgeEventBatch(t, db, eventIDs[:2])
+	cause := errors.New("permanent partial batch failure")
+
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs[2:], cause); err != nil {
+		t.Fatal(err)
+	}
+	failed := readForgeEventBatch(t, db, eventIDs)
+	if !reflect.DeepEqual(failed[:2], historical) {
+		t.Fatalf("historical terminal siblings changed: before=%#v after=%#v", historical, failed[:2])
+	}
+	for _, event := range failed[2:] {
+		if event.Status != ForgeEventFailed || event.Attempts != 2 || event.LastError != cause.Error() || event.FailedAt == nil || event.NextAttemptAt != nil ||
+			!event.FailedAt.Equal(*failed[2].FailedAt) || !event.UpdatedAt.Equal(failed[2].UpdatedAt) {
+			t.Fatalf("newly failed running sibling = %#v; first=%#v", event, failed[2])
+		}
+	}
+	current, err := db.GetTask(t.Context(), record.ID)
+	if err != nil || !current.CancellationRequested {
+		t.Fatalf("running owner cancellation = %#v, %v", current, err)
+	}
+
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs[2:], cause); err != nil {
+		t.Fatalf("exact batch replay: %v", err)
+	}
+	if err := db.FailForgeEvent(t.Context(), eventIDs[3], cause); err != nil {
+		t.Fatalf("replay through newly failed sibling: %v", err)
+	}
+	if replayed := readForgeEventBatch(t, db, eventIDs); !reflect.DeepEqual(replayed, failed) {
+		t.Fatalf("exact replay changed events: before=%#v after=%#v", failed, replayed)
+	}
+
+	for name, test := range map[string]struct {
+		ids   []string
+		cause error
+	}{
+		"omitted fingerprint member": {ids: eventIDs[2:3], cause: cause},
+		"unrelated failed member":    {ids: []string{eventIDs[1], eventIDs[2]}, cause: cause},
+		"different cause":            {ids: eventIDs[2:], cause: errors.New("different permanent failure")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := db.FailForgeEventBatch(t.Context(), test.ids, test.cause); !errors.Is(err, ErrConflict) {
+				t.Fatalf("conflicting replay = %v, want ErrConflict", err)
+			}
+			if current := readForgeEventBatch(t, db, eventIDs); !reflect.DeepEqual(current, failed) {
+				t.Fatalf("conflicting replay changed events: before=%#v after=%#v", failed, current)
+			}
+		})
+	}
+}
+
+func TestPermanentRunningForgeEventBatchFailsExactlyWithoutCancellingTerminalTask(t *testing.T) {
+	db := openTestStore(t)
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := putPendingForgeEventBatch(t, db, "running-terminal", forgeEventBatchSize)
+	attempt, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "fix exact batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Transition(t.Context(), record.ID, task.QUEUED, task.FAILED, TransitionParams{Reason: "startup failed", Trigger: "kubernetes"}); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("permanent Kubernetes startup failure")
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs, cause); err != nil {
+		t.Fatal(err)
+	}
+	failed := readForgeEventBatch(t, db, eventIDs)
+	for _, event := range failed {
+		if event.Status != ForgeEventFailed || event.TaskID != record.ID || event.AttemptID != attempt.ID || event.Attempts != 2 || event.LastError != cause.Error() || event.FailedAt == nil {
+			t.Fatalf("terminal running batch member = %#v", event)
+		}
+	}
+	current, err := db.GetTask(t.Context(), record.ID)
+	if err != nil || current.State != task.FAILED || current.CancellationRequested {
+		t.Fatalf("terminal task after batch failure = %#v, %v", current, err)
+	}
+	if err := db.FailForgeEventBatch(t.Context(), eventIDs, cause); err != nil {
+		t.Fatalf("terminal exact replay: %v", err)
+	}
+}
+
+func TestRunningForgeEventBatchOutcomeRejectsNonExactAssociationWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *Store, []string, Task, Attempt)
+		ids    func([]string) []string
+	}{
+		{
+			name: "mixed handled member",
+			mutate: func(t *testing.T, db *Store, ids []string, _ Task, _ Attempt) {
+				if err := db.MarkForgeEventHandled(t.Context(), ids[1]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mismatched attempt",
+			mutate: func(t *testing.T, db *Store, ids []string, _ Task, original Attempt) {
+				if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET attempt_id = ? WHERE id = ?`, original.ID, ids[1]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "mismatched task attempt pair",
+			mutate: func(t *testing.T, db *Store, ids []string, _ Task, _ Attempt) {
+				other, err := db.CreateTask(t.Context(), CreateTaskParams{Repository: "other", Prompt: "other task"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET attempt_id = ? WHERE id IN (?, ?, ?)`, other.CurrentAttemptID, ids[0], ids[1], ids[2]); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unselected running sibling",
+			ids:  func(ids []string) []string { return ids[:2] },
+		},
+		{
+			name: "missing ID",
+			ids: func(ids []string) []string {
+				return append(append([]string(nil), ids[:2]...), "missing-running-member")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openTestStore(t)
+			record, original, _ := createOpenPullRequestTask(t, db)
+			if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+				t.Fatal(err)
+			}
+			eventIDs := putPendingForgeEventBatch(t, db, "running-mismatch-"+strings.ReplaceAll(test.name, " ", "-"), 3)
+			attempt, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "fix exact batch")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.mutate != nil {
+				test.mutate(t, db, eventIDs, record, original)
+			}
+			selected := eventIDs
+			if test.ids != nil {
+				selected = test.ids(eventIDs)
+			}
+			before := readForgeEventBatch(t, db, eventIDs)
+			err = db.RecordForgeEventBatchErrorAfter(t.Context(), selected, errors.New("must remain atomic"), time.Minute)
+			if err == nil || !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
+				t.Fatalf("non-exact running batch = %v; want conflict or not found", err)
+			}
+			after := readForgeEventBatch(t, db, eventIDs)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("non-exact outcome mutated batch on attempt %q: before=%#v after=%#v", attempt.ID, before, after)
+			}
+		})
+	}
+}
+
+func TestRunningForgeEventBatchOutcomeFailuresRollBackEventsAndCancellation(t *testing.T) {
+	for _, test := range []struct {
+		name, setup, want string
+	}{
+		{
+			name: "statement failure",
+			want: "forced running batch statement failure",
+			setup: `CREATE TRIGGER reject_running_batch_update BEFORE UPDATE OF status ON forge_events
+				WHEN NEW.status = 'failed' BEGIN SELECT RAISE(FAIL, 'forced running batch statement failure'); END`,
+		},
+		{
+			name: "commit failure",
+			want: "commit forge event batch failure",
+			setup: `
+				CREATE TABLE forced_running_batch_commit_failure (task_id TEXT REFERENCES tasks(id) DEFERRABLE INITIALLY DEFERRED);
+				CREATE TRIGGER reject_running_batch_commit AFTER UPDATE OF status ON forge_events WHEN NEW.status = 'failed'
+				BEGIN INSERT INTO forced_running_batch_commit_failure(task_id) VALUES ('missing-task'); END;`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := openTestStore(t)
+			record, original, _ := createOpenPullRequestTask(t, db)
+			if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+				t.Fatal(err)
+			}
+			eventIDs := putPendingForgeEventBatch(t, db, "running-rollback-"+strings.ReplaceAll(test.name, " ", "-"), 3)
+			if _, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "fix exact batch"); err != nil {
+				t.Fatal(err)
+			}
+			before := readForgeEventBatch(t, db, eventIDs)
+			if _, err := db.db.ExecContext(t.Context(), test.setup); err != nil {
+				t.Fatal(err)
+			}
+			err := db.FailForgeEventBatch(t.Context(), eventIDs, errors.New("permanent startup failure"))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("running batch %s = %v", test.name, err)
+			}
+			after := readForgeEventBatch(t, db, eventIDs)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("running batch %s partially changed events: before=%#v after=%#v", test.name, before, after)
+			}
+			current, err := db.GetTask(t.Context(), record.ID)
+			if err != nil || current.CancellationRequested {
+				t.Fatalf("running batch %s retained cancellation: %#v, %v", test.name, current, err)
+			}
+		})
+	}
+}
+
+func TestForgeEventBatchMismatchAndStatementFailureRollBackEveryMember(t *testing.T) {
+	t.Run("mismatched member", func(t *testing.T) {
+		db := openTestStore(t)
+		eventIDs := putPendingForgeEventBatch(t, db, "mismatch", 3)
+		if err := db.MarkForgeEventHandled(t.Context(), eventIDs[1]); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.FailForgeEventBatch(t.Context(), eventIDs, errors.New("must be atomic")); !errors.Is(err, ErrConflict) {
+			t.Fatalf("mismatched batch = %v, want ErrConflict", err)
+		}
+		events := readForgeEventBatch(t, db, eventIDs)
+		if events[0].Status != ForgeEventPending || events[0].Attempts != 0 || events[1].Status != ForgeEventHandled || events[2].Status != ForgeEventPending || events[2].Attempts != 0 {
+			t.Fatalf("mismatched batch partially changed: %#v", events)
+		}
+	})
+
+	t.Run("statement failure", func(t *testing.T) {
+		db := openTestStore(t)
+		eventIDs := putPendingForgeEventBatch(t, db, "statement-rollback", 3)
+		if _, err := db.db.ExecContext(t.Context(), `
+			CREATE TRIGGER reject_second_batch_member BEFORE UPDATE ON forge_events
+			WHEN OLD.id = 'statement-rollback-01'
+			BEGIN SELECT RAISE(FAIL, 'forced batch statement failure'); END`); err != nil {
+			t.Fatal(err)
+		}
+		err := db.FailForgeEventBatch(t.Context(), eventIDs, errors.New("must roll back"))
+		if err == nil || !strings.Contains(err.Error(), "forced batch statement failure") {
+			t.Fatalf("statement failure = %v", err)
+		}
+		for _, event := range readForgeEventBatch(t, db, eventIDs) {
+			if event.Status != ForgeEventPending || event.Attempts != 0 || event.LastError != "" || event.FailedAt != nil {
+				t.Fatalf("statement failure partially changed event: %#v", event)
+			}
+		}
+		if _, err := db.db.ExecContext(t.Context(), `DROP TRIGGER reject_second_batch_member`); err != nil {
+			t.Fatalf("connection unusable after statement rollback: %v", err)
+		}
+		if err := db.FailForgeEventBatch(t.Context(), eventIDs, errors.New("must roll back")); err != nil {
+			t.Fatalf("retry after statement rollback: %v", err)
+		}
+	})
+}
+
+func TestForgeEventBatchCommitFailureRollsBackAndReusesConnection(t *testing.T) {
+	db := openTestStore(t)
+	eventIDs := putPendingForgeEventBatch(t, db, "commit-deferral", 3)
+	if _, err := db.db.ExecContext(t.Context(), `
+		CREATE TABLE forced_batch_commit_failure (
+			event_id TEXT REFERENCES forge_events(id) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE TRIGGER reject_batch_commit AFTER UPDATE OF next_attempt_at ON forge_events
+		WHEN NEW.next_attempt_at IS NOT NULL
+		BEGIN INSERT INTO forced_batch_commit_failure(event_id) VALUES ('missing-event'); END;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, errors.New("temporary"), time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "commit forge event batch deferral") {
+		t.Fatalf("commit failure = %v", err)
+	}
+	for _, event := range readForgeEventBatch(t, db, eventIDs) {
+		if event.Status != ForgeEventPending || event.Attempts != 0 || event.LastError != "" || event.NextAttemptAt != nil {
+			t.Fatalf("commit failure partially deferred event: %#v", event)
+		}
+	}
+	var forcedRows int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM forced_batch_commit_failure`).Scan(&forcedRows); err != nil || forcedRows != 0 {
+		t.Fatalf("deferred constraint rows after rollback = %d, %v", forcedRows, err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `DROP TRIGGER reject_batch_commit`); err != nil {
+		t.Fatalf("connection unusable after commit rollback: %v", err)
+	}
+	if err := db.RecordForgeEventBatchErrorAfter(t.Context(), eventIDs, errors.New("temporary"), time.Minute); err != nil {
+		t.Fatalf("retry after commit rollback: %v", err)
+	}
+}
+
+func TestDeferForgeEventYieldsWithoutChangingOutcomeOrDiagnostics(t *testing.T) {
+	db := openTestStore(t)
+	event := testForgeEvent("yield-pending", "review_comment")
+	if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RecordForgeEventError(t.Context(), event.ID, errors.New("real provider error")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET next_attempt_at = ? WHERE id = ?`, stamp(time.Now().Add(-time.Second)), event.ID); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.GetForgeEvent(t.Context(), event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.DeferForgeEvent(t.Context(), event.ID, ForgeEventPending)
+	after, getErr := db.GetForgeEvent(t.Context(), event.ID)
+	if err != nil || getErr != nil || after.Status != ForgeEventPending || after.Attempts != before.Attempts || after.LastError != before.LastError || after.TaskID != before.TaskID || after.AttemptID != before.AttemptID || after.NextAttemptAt == nil || !after.NextAttemptAt.After(time.Now().UTC()) {
+		t.Fatalf("deferred event = %#v, errors %v/%v; before %#v", after, err, getErr, before)
+	}
+	if err := db.MarkForgeEventHandled(t.Context(), event.ID); err != nil {
+		t.Fatal(err)
+	}
+	err = db.DeferForgeEvent(t.Context(), event.ID, ForgeEventPending)
+	handled, getErr := db.GetForgeEvent(t.Context(), event.ID)
+	if err != nil || getErr != nil || handled.Status != ForgeEventHandled || handled.NextAttemptAt != nil {
+		t.Fatalf("status-conditional deferral changed handled event = %#v, errors %v/%v", handled, err, getErr)
+	}
+}
+
 func TestListIncompleteForgeEventsReturnsOrderedDueBatch(t *testing.T) {
 	db := openTestStore(t)
 	const batchSize = 32
@@ -490,7 +997,33 @@ func TestListIncompleteForgeEventsReturnsOrderedDueBatch(t *testing.T) {
 	}
 }
 
-func TestMarkForgeEventFailedIsTerminalAndPreservesAssociation(t *testing.T) {
+func TestListIncompleteForgeEventsOrdersByEligibilityBeforeAcceptance(t *testing.T) {
+	db := openTestStore(t)
+	eligibility := time.Now().UTC()
+	for i := range 32 {
+		event := testForgeEvent(fmt.Sprintf("eligibility-deferred-%02d", i), "review_comment")
+		if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET created_at = ?, next_attempt_at = ? WHERE id = ?`, stamp(eligibility.Add(-time.Hour)), stamp(eligibility.Add(-5*time.Second)), event.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unrelated := testForgeEvent("eligibility-unrelated", "quality_gate_failed")
+	if _, err := db.PutForgeEvent(t.Context(), unrelated); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `UPDATE forge_events SET created_at = ?, next_attempt_at = NULL WHERE id = ?`, stamp(eligibility.Add(-10*time.Second)), unrelated.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	due, err := db.ListIncompleteForgeEvents(t.Context())
+	if err != nil || len(due) != 32 || due[0].ID != unrelated.ID {
+		t.Fatalf("eligibility-ordered events = %#v, %v; want unrelated event first", due, err)
+	}
+}
+
+func TestFailForgeEventIsTerminalCancelsOwnerAndPreservesAssociation(t *testing.T) {
 	db := openTestStore(t)
 	ctx := context.Background()
 	record, original, _ := createOpenPullRequestTask(t, db)
@@ -506,12 +1039,16 @@ func TestMarkForgeEventFailedIsTerminalAndPreservesAssociation(t *testing.T) {
 		t.Fatalf("start forge event: %v", err)
 	}
 	before := time.Now().UTC()
-	if err := db.MarkForgeEventFailed(ctx, event.ID, errors.New("permanent provider rejection")); err != nil {
-		t.Fatalf("mark forge event failed: %v", err)
+	if err := db.FailForgeEvent(ctx, event.ID, errors.New("permanent provider rejection")); err != nil {
+		t.Fatalf("fail forge event: %v", err)
 	}
 	failed, err := db.GetForgeEvent(ctx, event.ID)
-	if err != nil || failed.Status != ForgeEventFailed || failed.TaskID != record.ID || failed.AttemptID != attempt.ID || failed.FailedAt == nil || failed.FailedAt.Before(before) || !strings.Contains(failed.LastError, "permanent provider rejection") {
+	if err != nil || failed.Status != ForgeEventFailed || failed.TaskID != record.ID || failed.AttemptID != attempt.ID || failed.Attempts != 2 || failed.FailedAt == nil || failed.FailedAt.Before(before) || failed.UpdatedAt.Before(before) || failed.NextAttemptAt != nil || !strings.Contains(failed.LastError, "permanent provider rejection") {
 		t.Fatalf("failed forge event = %#v, %v", failed, err)
+	}
+	current, err := db.GetTask(ctx, record.ID)
+	if err != nil || !current.CancellationRequested {
+		t.Fatalf("owned running event cancellation = %#v, %v", current, err)
 	}
 	if failed.HandledAt != nil {
 		t.Fatalf("failed forge event has handled timestamp: %#v", failed)
@@ -523,7 +1060,7 @@ func TestMarkForgeEventFailedIsTerminalAndPreservesAssociation(t *testing.T) {
 	if _, err := db.db.ExecContext(ctx, `UPDATE forge_events SET status = 'unknown' WHERE id = ?`, event.ID); err == nil {
 		t.Fatal("forge_events status CHECK accepted unknown state")
 	}
-	if _, err := db.db.ExecContext(ctx, `UPDATE tasks SET state = ?, current_attempt_id = ? WHERE id = ?`, task.PR_OPEN, original.ID, record.ID); err != nil {
+	if _, err := db.db.ExecContext(ctx, `UPDATE tasks SET state = ?, current_attempt_id = ?, cancellation_requested = 0 WHERE id = ?`, task.PR_OPEN, original.ID, record.ID); err != nil {
 		t.Fatalf("restore task after terminal event: %v", err)
 	}
 	next := testForgeEvent("after-permanent-failure", "review_comment")
@@ -535,7 +1072,61 @@ func TestMarkForgeEventFailedIsTerminalAndPreservesAssociation(t *testing.T) {
 	}
 }
 
-func TestRequestForgeEventCancellationIgnoresMissingStaleAndTerminalAssociations(t *testing.T) {
+func TestFailForgeEventAtomicallyFailsRunningBatchAndReplaysThroughSiblings(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(ctx, record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	const batchSize = 32
+	eventIDs := make([]string, batchSize)
+	for i := range batchSize {
+		event := testForgeEvent(fmt.Sprintf("permanent-batch-%02d", i), "review_comment")
+		event.CommentID = 1000 + i
+		eventIDs[i] = event.ID
+		if _, err := db.PutForgeEvent(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attempt, _, err := startForgeEventBatchForTest(ctx, db, eventIDs, record.ID, "fix every review comment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("permanent batch ownership loss")
+	before := time.Now().UTC()
+	if err := db.FailForgeEvent(ctx, eventIDs[0], cause); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().UTC()
+	failed, err := db.ListForgeEventsByAttempt(ctx, attempt.ID)
+	if err != nil || len(failed) != batchSize {
+		t.Fatalf("failed batch = %#v, %v", failed, err)
+	}
+	for _, event := range failed {
+		if event.Status != ForgeEventFailed || event.TaskID != record.ID || event.AttemptID != attempt.ID || event.Attempts != 2 || event.LastError != cause.Error() || event.NextAttemptAt != nil || event.FailedAt == nil || event.FailedAt.Before(before) || event.FailedAt.After(after) || !event.FailedAt.Equal(*failed[0].FailedAt) || !event.UpdatedAt.Equal(failed[0].UpdatedAt) {
+			t.Fatalf("batch failure event = %#v; first=%#v", event, failed[0])
+		}
+	}
+	if current, err := db.GetTask(ctx, record.ID); err != nil || !current.CancellationRequested {
+		t.Fatalf("batch cancellation = %#v, %v", current, err)
+	}
+
+	for _, replayID := range []string{eventIDs[0], eventIDs[17]} {
+		if err := db.FailForgeEvent(ctx, replayID, cause); err != nil {
+			t.Fatalf("replay through %q: %v", replayID, err)
+		}
+	}
+	if err := db.FailForgeEvent(ctx, eventIDs[31], errors.New("different permanent cause")); !errors.Is(err, ErrConflict) {
+		t.Fatalf("different replay cause = %v; want ErrConflict", err)
+	}
+	replayed, err := db.ListForgeEventsByAttempt(ctx, attempt.ID)
+	if err != nil || !reflect.DeepEqual(replayed, failed) {
+		t.Fatalf("replay changed batch: before=%#v after=%#v err=%v", failed, replayed, err)
+	}
+}
+
+func TestFailForgeEventStillFailsWithMissingStaleAndTerminalAssociations(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate func(*testing.T, *Store, Task, Attempt, Attempt, ForgeEvent)
@@ -581,12 +1172,109 @@ func TestRequestForgeEventCancellationIgnoresMissingStaleAndTerminalAssociations
 			}
 			test.mutate(t, db, record, original, followUp, event)
 
-			requested, err := db.RequestForgeEventCancellation(t.Context(), event.ID)
+			cause := errors.New("permanent association loss")
+			err = db.FailForgeEvent(t.Context(), event.ID, cause)
 			current, getErr := db.GetTask(t.Context(), record.ID)
-			if err != nil || getErr != nil || requested || current.CancellationRequested {
-				t.Fatalf("RequestForgeEventCancellation() = %t, %v; task=%#v, %v", requested, err, current, getErr)
+			failed, eventErr := db.GetForgeEvent(t.Context(), event.ID)
+			if err != nil || getErr != nil || eventErr != nil || current.CancellationRequested || failed.Status != ForgeEventFailed || failed.LastError != cause.Error() || failed.FailedAt == nil {
+				t.Fatalf("FailForgeEvent() = %v; task=%#v, %v; event=%#v, %v", err, current, getErr, failed, eventErr)
 			}
 		})
+	}
+}
+
+func TestFailForgeEventReplayAndMissingRequireIncompleteEvent(t *testing.T) {
+	db := openTestStore(t)
+	event := testForgeEvent("permanent-replay", "review_comment")
+	if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	firstCause := errors.New("first permanent error")
+	if err := db.FailForgeEvent(t.Context(), event.ID, firstCause); err != nil {
+		t.Fatal(err)
+	}
+	first, err := db.GetForgeEvent(t.Context(), event.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FailForgeEvent(t.Context(), event.ID, errors.New("replayed permanent error")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FailForgeEvent() replay = %v, want ErrNotFound", err)
+	}
+	replayed, err := db.GetForgeEvent(t.Context(), event.ID)
+	if err != nil || replayed.Attempts != first.Attempts || replayed.LastError != first.LastError || replayed.UpdatedAt != first.UpdatedAt || replayed.FailedAt == nil || first.FailedAt == nil || !replayed.FailedAt.Equal(*first.FailedAt) {
+		t.Fatalf("replayed failure changed event: first=%#v replayed=%#v err=%v", first, replayed, err)
+	}
+	if err := db.FailForgeEvent(t.Context(), "missing-permanent-event", firstCause); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FailForgeEvent() missing = %v, want ErrNotFound", err)
+	}
+}
+
+func TestFailForgeEventRollsBackCancellationWhenFailureUpdateFails(t *testing.T) {
+	db := openTestStore(t)
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	event := testForgeEvent("permanent-rollback", "review_comment")
+	if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := startForgeEventAttemptForTest(t.Context(), db, event.ID, record.ID, "follow up"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `CREATE TRIGGER reject_forge_failure BEFORE UPDATE ON forge_events BEGIN SELECT RAISE(FAIL, 'forced forge failure update'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err := db.FailForgeEvent(t.Context(), event.ID, errors.New("permanent provider rejection"))
+	if err == nil || !strings.Contains(err.Error(), "forced forge failure update") {
+		t.Fatalf("FailForgeEvent() = %v, want forced second-statement failure", err)
+	}
+	current, taskErr := db.GetTask(t.Context(), record.ID)
+	running, eventErr := db.GetForgeEvent(t.Context(), event.ID)
+	if taskErr != nil || eventErr != nil || current.CancellationRequested || running.Status != ForgeEventRunning || running.Attempts != 1 || running.FailedAt != nil {
+		t.Fatalf("atomic rollback outcomes: task=%#v event=%#v errors=%v/%v", current, running, taskErr, eventErr)
+	}
+}
+
+func TestFailForgeEventCommitFailureRollsBackBatchAndCancellation(t *testing.T) {
+	db := openTestStore(t)
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := []string{"commit-rollback-a", "commit-rollback-b", "commit-rollback-c"}
+	for i, id := range eventIDs {
+		event := testForgeEvent(id, "review_comment")
+		event.CommentID += i
+		if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	attempt, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "follow up")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `CREATE TABLE forced_forge_commit_failure (task_id TEXT REFERENCES tasks(id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.ExecContext(t.Context(), `CREATE TRIGGER reject_forge_failure_commit AFTER UPDATE OF status ON forge_events WHEN NEW.status = 'failed' BEGIN INSERT INTO forced_forge_commit_failure(task_id) VALUES ('missing-task'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.FailForgeEvent(t.Context(), eventIDs[1], errors.New("permanent provider rejection"))
+	if err == nil || !strings.Contains(err.Error(), "commit forge event") {
+		t.Fatalf("FailForgeEvent() = %v, want commit failure", err)
+	}
+	current, taskErr := db.GetTask(t.Context(), record.ID)
+	running, eventErr := db.ListForgeEventsByAttempt(t.Context(), attempt.ID)
+	if taskErr != nil || eventErr != nil || current.CancellationRequested || len(running) != len(eventIDs) {
+		t.Fatalf("commit rollback outcomes after %v: task=%#v events=%#v errors=%v/%v", err, current, running, taskErr, eventErr)
+	}
+	for _, event := range running {
+		if event.Status != ForgeEventRunning || event.Attempts != 1 || event.FailedAt != nil || event.LastError != "" {
+			t.Fatalf("commit failure changed running event: %#v", event)
+		}
 	}
 }
 
@@ -621,8 +1309,8 @@ func TestStartForgeEventAttemptIsAtomicImmutableAndReplaySafe(t *testing.T) {
 	if !inserted || followUp.Number != 2 || followUp.State != task.QUEUED || !followUp.Immutable {
 		t.Fatalf("follow-up attempt = %#v, inserted=%t; want immutable queued attempt 2", followUp, inserted)
 	}
-	if followUp.Prompt != prompt || followUp.BaseBranch != originalPR.HeadBranch || followUp.TaskBranch != originalPR.HeadBranch {
-		t.Fatalf("follow-up overrides = prompt %q base %q task %q; want immutable prompt and existing PR head %q", followUp.Prompt, followUp.BaseBranch, followUp.TaskBranch, originalPR.HeadBranch)
+	if followUp.Prompt != prompt || followUp.BaseBranch != originalPR.BaseBranch || followUp.TaskBranch != originalPR.HeadBranch {
+		t.Fatalf("follow-up overrides = prompt %q base %q task %q; want immutable prompt and existing PR base/head %q/%q", followUp.Prompt, followUp.BaseBranch, followUp.TaskBranch, originalPR.BaseBranch, originalPR.HeadBranch)
 	}
 	if len(followUp.ManifestJSON) == 0 || len(followUp.ResourceSnapshot) == 0 || followUp.ConfigDigest == "" {
 		t.Fatalf("follow-up snapshot is incomplete: %#v", followUp)
@@ -647,7 +1335,7 @@ func TestStartForgeEventAttemptIsAtomicImmutableAndReplaySafe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay forge follow-up: %v", err)
 	}
-	if inserted || replayed.ID != followUp.ID || replayed.Prompt != prompt || replayed.BaseBranch != originalPR.HeadBranch || replayed.TaskBranch != originalPR.HeadBranch ||
+	if inserted || replayed.ID != followUp.ID || replayed.Prompt != prompt || replayed.BaseBranch != originalPR.BaseBranch || replayed.TaskBranch != originalPR.HeadBranch ||
 		string(replayed.ManifestJSON) != string(followUp.ManifestJSON) || string(replayed.ResourceSnapshot) != string(followUp.ResourceSnapshot) || replayed.ConfigDigest != followUp.ConfigDigest {
 		t.Fatalf("replayed follow-up = %#v, inserted=%t; want immutable attempt %q", replayed, inserted, followUp.ID)
 	}
@@ -679,6 +1367,62 @@ func TestStartForgeEventAttemptIsAtomicImmutableAndReplaySafe(t *testing.T) {
 	incomplete, err := db.ListIncompleteForgeEvents(ctx)
 	if err != nil || len(incomplete) != 1 || incomplete[0].ID != concurrent.ID {
 		t.Fatalf("incomplete events after handling = %#v, %v; want concurrent event only", incomplete, err)
+	}
+}
+
+func TestStartForgeEventAttemptWaitsForPendingWorkerEvents(t *testing.T) {
+	db := openTestStore(t)
+	ctx := t.Context()
+	record, originalAttempt, originalPR := createOpenPullRequestTask(t, db)
+	if _, err := db.AppendPodLog(ctx, AppendPodLogParams{
+		TaskID: record.ID, AttemptID: originalAttempt.ID, PodUID: "forge-follow-up-pod", JobName: "job", PodName: "pod",
+		Content: []byte("pending event"), WorkerEventID: "forge-follow-up-worker-event", WorkerEvent: "pending event",
+	}, 256, 64); err != nil {
+		t.Fatalf("append pending worker event: %v", err)
+	}
+	if err := db.MarkLogsExhausted(ctx, record.ID, originalAttempt.ID); err != nil {
+		t.Fatalf("mark original logs exhausted: %v", err)
+	}
+	event := testForgeEvent("forge-follow-up-after-worker-event", "review_comment")
+	if _, err := db.PutForgeEvent(ctx, event); err != nil {
+		t.Fatalf("put forge event: %v", err)
+	}
+	plan, err := db.PlanForgeEventAttempt(ctx, []string{event.ID}, record.ID, "apply durable review feedback")
+	if err != nil {
+		t.Fatalf("plan forge follow-up: %v", err)
+	}
+	plan.Attempt.ManifestJSON = []byte(`{"task_id":"planned"}`)
+	plan.Attempt.ResourceSnapshot = []byte(`{"job":{"metadata":{"name":"planned"}},"secret":{"metadata":{"name":"planned"}}}`)
+	plan.Attempt.ConfigDigest = "sha256:planned"
+
+	if _, _, err := db.StartForgeEventAttempt(ctx, plan); !errors.Is(err, ErrConflict) {
+		t.Fatalf("start follow-up with pending worker event = %v, want ErrConflict", err)
+	}
+	current, err := db.GetTask(ctx, record.ID)
+	if err != nil || current.CurrentAttemptID != originalAttempt.ID || current.State != task.PR_OPEN {
+		t.Fatalf("task after refused follow-up = %#v, %v", current, err)
+	}
+	storedEvent, err := db.GetForgeEvent(ctx, event.ID)
+	if err != nil || storedEvent.Status != ForgeEventPending || storedEvent.TaskID != "" || storedEvent.AttemptID != "" {
+		t.Fatalf("forge event after refused follow-up = %#v, %v", storedEvent, err)
+	}
+
+	if err := db.MarkWorkerEventProcessed(ctx, "forge-follow-up-worker-event"); err != nil {
+		t.Fatalf("mark worker event processed: %v", err)
+	}
+	followUp, inserted, err := db.StartForgeEventAttempt(ctx, plan)
+	if err != nil || !inserted {
+		t.Fatalf("start same follow-up plan after processing event = %#v, %t, %v", followUp, inserted, err)
+	}
+	copiedPR, err := db.GetPullRequest(ctx, followUp.ID)
+	wantPR := originalPR
+	wantPR.AttemptID = followUp.ID
+	if err != nil || !reflect.DeepEqual(copiedPR, wantPR) {
+		t.Fatalf("copied pull request = %#v, %v; want %#v", copiedPR, err, wantPR)
+	}
+	replayed, inserted, err := db.StartForgeEventAttempt(ctx, plan)
+	if err != nil || inserted || !reflect.DeepEqual(replayed, followUp) {
+		t.Fatalf("replayed follow-up = %#v, inserted=%t, err=%v; want %#v", replayed, inserted, err, followUp)
 	}
 }
 
@@ -767,12 +1511,15 @@ func TestRetryTaskOnceRebindsRunningForgeEventBatch(t *testing.T) {
 	if err := db.MarkLogsExhausted(ctx, record.ID, failed.ID); err != nil {
 		t.Fatalf("mark failed follow-up logs exhausted: %v", err)
 	}
+	if _, err := db.db.ExecContext(ctx, `UPDATE task_attempts SET base_branch = task_branch WHERE id = ?`, failed.ID); err != nil {
+		t.Fatalf("make failed follow-up branch fields legacy-shaped: %v", err)
+	}
 
 	retry, inserted, err := retryTaskOnceForForgeTest(ctx, db, record.ID, "retry-forge-follow-up")
 	if err != nil {
 		t.Fatalf("retry forge follow-up: %v", err)
 	}
-	if !inserted || retry.Number != 3 || retry.Prompt != prompt || retry.BaseBranch != originalPR.HeadBranch || retry.TaskBranch != originalPR.HeadBranch {
+	if !inserted || retry.Number != 3 || retry.Prompt != prompt || retry.BaseBranch != originalPR.BaseBranch || retry.TaskBranch != originalPR.HeadBranch {
 		t.Fatalf("forge retry = %#v, inserted=%t; want attempt 3 with immutable follow-up overrides", retry, inserted)
 	}
 	copiedPR, err := db.GetPullRequest(ctx, retry.ID)
@@ -872,6 +1619,59 @@ func testForgeEvent(id, kind string) ForgeEvent {
 	return event
 }
 
+func putPendingForgeEventBatch(t *testing.T, db *Store, prefix string, size int) []string {
+	t.Helper()
+	eventIDs := make([]string, size)
+	for i := range size {
+		event := testForgeEvent(fmt.Sprintf("%s-%02d", prefix, i), "review_comment")
+		event.CommentID += i
+		event.URL = fmt.Sprintf("https://bitbucket.example/acme/widget/pull-requests/42#comment-%d", event.CommentID)
+		if _, err := db.PutForgeEvent(t.Context(), event); err != nil {
+			t.Fatalf("put batch member %d: %v", i, err)
+		}
+		eventIDs[i] = event.ID
+	}
+	return eventIDs
+}
+
+func mixedTerminalRunningForgeEventBatch(t *testing.T, db *Store, prefix string) (Task, []string) {
+	t.Helper()
+	record, original, _ := createOpenPullRequestTask(t, db)
+	if err := db.MarkLogsExhausted(t.Context(), record.ID, original.ID); err != nil {
+		t.Fatal(err)
+	}
+	eventIDs := putPendingForgeEventBatch(t, db, prefix, 4)
+	_, _, err := startForgeEventBatchForTest(t.Context(), db, eventIDs, record.ID, "process partial terminal batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkForgeEventHandled(t.Context(), eventIDs[0]); err != nil {
+		t.Fatal(err)
+	}
+	historicalAt := stamp(time.Now().UTC().Add(-time.Hour))
+	if _, err := db.db.ExecContext(t.Context(), `
+		UPDATE forge_events
+		SET status = 'failed', attempts = 7, last_error = 'unrelated historical failure',
+		    failed_at = ?, updated_at = ?, next_attempt_at = NULL
+		WHERE id = ?`, historicalAt, historicalAt, eventIDs[1]); err != nil {
+		t.Fatal(err)
+	}
+	return record, eventIDs
+}
+
+func readForgeEventBatch(t *testing.T, db *Store, eventIDs []string) []ForgeEvent {
+	t.Helper()
+	events := make([]ForgeEvent, len(eventIDs))
+	for i, id := range eventIDs {
+		event, err := db.GetForgeEvent(t.Context(), id)
+		if err != nil {
+			t.Fatalf("get batch member %q: %v", id, err)
+		}
+		events[i] = event
+	}
+	return events
+}
+
 func assertForgeEventDeadline(t *testing.T, event ForgeEvent, want time.Time) {
 	t.Helper()
 	if event.NextAttemptAt == nil {
@@ -931,19 +1731,19 @@ func createOpenPullRequestTask(t *testing.T, db *Store) (Task, Attempt, PullRequ
 		t.Fatalf("current attempt: %v", err)
 	}
 	branch := "simpleswe/" + record.ID + "-a1"
-	if err := db.RecordGitResult(ctx, GitResult{AttemptID: attempt.ID, State: "pushed", Branch: branch, CommitSHA: "0123456789abcdef0123456789abcdef01234567"}); err != nil {
-		t.Fatalf("record Git result: %v", err)
+	if _, err := db.db.ExecContext(ctx, `UPDATE task_attempts SET base_branch = 'main', task_branch = ? WHERE id = ?`, branch, attempt.ID); err != nil {
+		t.Fatalf("set attempt branch identity: %v", err)
 	}
-	if _, err := db.ReservePullRequest(ctx, attempt.ID, "fix the parser", branch, "main"); err != nil {
-		t.Fatalf("reserve pull request: %v", err)
-	}
-	if err := db.CompletePullRequest(ctx, attempt.ID, 42, "https://bitbucket.example/acme/widget/pull-requests/42"); err != nil {
-		t.Fatalf("complete pull request: %v", err)
+	git := GitResult{AttemptID: attempt.ID, State: "pushed", Branch: branch, CommitSHA: "0123456789abcdef0123456789abcdef01234567"}
+	pullRequest := PullRequest{AttemptID: attempt.ID, State: "open", Number: 42, URL: "https://bitbucket.org/acme/widget/pull-requests/42", Title: "fix the parser", HeadBranch: branch, BaseBranch: "main"}
+	recordCandidateForTest(t, db, git, pullRequest)
+	if err := db.RecordVerifiedPullRequest(ctx, git, pullRequest); err != nil {
+		t.Fatalf("record verified pull request: %v", err)
 	}
 	if err := db.Transition(ctx, record.ID, task.CREATING_PR, task.PR_OPEN, TransitionParams{Reason: "pull request open", Trigger: "system"}); err != nil {
 		t.Fatalf("transition to PR_OPEN: %v", err)
 	}
-	pullRequest, err := db.GetPullRequest(ctx, attempt.ID)
+	pullRequest, err = db.GetPullRequest(ctx, attempt.ID)
 	if err != nil {
 		t.Fatalf("get pull request: %v", err)
 	}

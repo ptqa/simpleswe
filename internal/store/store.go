@@ -4,23 +4,60 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/task"
+	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 
-	// Register the SQLite database/sql driver used by Open.
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 var (
 	ErrNotFound = errors.New("task not found")
 	ErrConflict = errors.New("task state conflict")
 )
+
+type sqliteConnector struct {
+	driver driver.Driver
+	dsn    string
+}
+
+func (c sqliteConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connect SQLite: %w", err)
+	}
+	conn, err := c.driver.Open(c.dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open SQLite connection: %w", err)
+	}
+	return conn, nil
+}
+
+func (c sqliteConnector) Driver() driver.Driver {
+	return c.driver
+}
+
+func sqliteDSN(path string) string {
+	uriPath := filepath.ToSlash(path)
+	absolute := filepath.IsAbs(path)
+	if absolute && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout(5000)")
+	query.Add("_pragma", "foreign_keys(ON)")
+	return (&url.URL{Scheme: "file", Path: uriPath, RawQuery: query.Encode(), OmitHost: !absolute}).String()
+}
 
 // Store is the SQLite-backed task store.
 type Store struct {
@@ -359,12 +396,8 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, errors.New("store path is empty")
 	}
 
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open SQLite store: %w", err)
-	}
-	// The controller is single-replica today. One connection also makes the
-	// connection-local foreign_keys setting apply to every store operation.
+	db := sql.OpenDB(sqliteConnector{driver: &sqlite.Driver{}, dsn: sqliteDSN(path)})
+	// The controller is single-replica today.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -375,11 +408,19 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if err := db.PingContext(ctx); err != nil {
 		return closeOnError(fmt.Errorf("ping SQLite store: %w", err))
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout = 5000"); err != nil {
-		return closeOnError(fmt.Errorf("set SQLite busy timeout: %w", err))
+	var busyTimeout int
+	if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&busyTimeout); err != nil {
+		return closeOnError(fmt.Errorf("read SQLite busy timeout: %w", err))
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		return closeOnError(fmt.Errorf("enable SQLite foreign keys: %w", err))
+	if busyTimeout != 5000 {
+		return closeOnError(fmt.Errorf("SQLite busy timeout is %d, want 5000", busyTimeout))
+	}
+	var foreignKeys int
+	if err := db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+		return closeOnError(fmt.Errorf("read SQLite foreign keys: %w", err))
+	}
+	if foreignKeys != 1 {
+		return closeOnError(fmt.Errorf("SQLite foreign keys is %d, want 1", foreignKeys))
 	}
 	var journalMode string
 	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
@@ -514,6 +555,42 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+// immediateTransaction runs the small set of writes that require SQLite's
+// eager write lock. Cleanup uses a non-cancelled context so a cancelled caller
+// cannot strand the pinned connection in a transaction.
+func (s *Store) immediateTransaction(ctx context.Context, operation string, fn func(*sql.Conn) error) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("begin %s: %w", operation, err)
+	}
+	begun, committed := false, false
+	defer func() {
+		if begun && !committed {
+			if _, err := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("rollback %s: %w", operation, err))
+				if discardErr := conn.Raw(func(any) error { return driver.ErrBadConn }); discardErr != nil && !errors.Is(discardErr, driver.ErrBadConn) {
+					resultErr = errors.Join(resultErr, fmt.Errorf("discard %s connection: %w", operation, discardErr))
+				}
+			}
+		}
+		if err := conn.Close(); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("close %s connection: %w", operation, err))
+		}
+	}()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin %s: %w", operation, err)
+	}
+	begun = true
+	if err := fn(conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit %s: %w", operation, err)
+	}
+	committed = true
+	return nil
 }
 
 func (s *Store) CreateTask(ctx context.Context, params CreateTaskParams) (Task, error) {
@@ -796,19 +873,24 @@ func (s *Store) PlanRetryAttempt(ctx context.Context, taskID, idempotencyKey str
 			return RetryAttemptPlan{}, false, err
 		}
 	}
-	var state, currentAttemptID, prompt, baseBranch, taskBranch string
-	var logsExhausted int
+	var state, currentAttemptID, prompt string
+	var logsExhausted, pendingWorkerEvents int
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT tasks.state, tasks.current_attempt_id, task_attempts.logs_exhausted,
-		       task_attempts.prompt, task_attempts.base_branch, task_attempts.task_branch
+		       task_attempts.prompt,
+		       EXISTS(SELECT 1 FROM worker_log_events
+		              WHERE task_id = tasks.id AND attempt_id = tasks.current_attempt_id AND processed = 0)
 		FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id
-		WHERE tasks.id = ?`, taskID).Scan(&state, &currentAttemptID, &logsExhausted, &prompt, &baseBranch, &taskBranch); errors.Is(err, sql.ErrNoRows) {
+		WHERE tasks.id = ?`, taskID).Scan(&state, &currentAttemptID, &logsExhausted, &prompt, &pendingWorkerEvents); errors.Is(err, sql.ErrNoRows) {
 		return RetryAttemptPlan{}, false, fmt.Errorf("%w: %s", ErrNotFound, taskID)
 	} else if err != nil {
 		return RetryAttemptPlan{}, false, fmt.Errorf("plan task retry: %w", err)
 	}
 	if err := (task.Machine{}).Retry(task.State(state), task.QUEUED); err != nil {
 		return RetryAttemptPlan{}, false, err
+	}
+	if pendingWorkerEvents == 1 {
+		return RetryAttemptPlan{}, false, fmt.Errorf("%w: current attempt %q has pending durable worker events", ErrConflict, currentAttemptID)
 	}
 	if logsExhausted != 1 {
 		return RetryAttemptPlan{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
@@ -817,8 +899,15 @@ func (s *Store) PlanRetryAttempt(ctx context.Context, taskID, idempotencyKey str
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM forge_events WHERE task_id = ? AND attempt_id = ? AND status = 'running'`, taskID, currentAttemptID).Scan(&runningForgeEvents); err != nil {
 		return RetryAttemptPlan{}, false, fmt.Errorf("plan running forge event retry: %w", err)
 	}
+	baseBranch, taskBranch := "", ""
 	if runningForgeEvents == 0 {
-		prompt, baseBranch, taskBranch = "", "", ""
+		prompt = ""
+	} else if err := s.db.QueryRowContext(ctx, `
+		SELECT base_branch, head_branch FROM pull_requests
+		WHERE attempt_id = ? AND state = 'open'`, currentAttemptID).Scan(&baseBranch, &taskBranch); errors.Is(err, sql.ErrNoRows) {
+		return RetryAttemptPlan{}, false, fmt.Errorf("%w: running forge event batch has no open pull request", ErrConflict)
+	} else if err != nil {
+		return RetryAttemptPlan{}, false, fmt.Errorf("plan forge retry pull request: %w", err)
 	}
 	var number int
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(number), 0) + 1 FROM task_attempts WHERE task_id = ?`, taskID).Scan(&number); err != nil {
@@ -894,19 +983,24 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 		}
 	}
 
-	var cancellationRequested, logsExhausted int
-	var state, currentAttemptID, prompt, baseBranch, taskBranch string
+	var cancellationRequested, logsExhausted, pendingWorkerEvents int
+	var state, currentAttemptID, prompt string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT tasks.state, tasks.cancellation_requested, tasks.current_attempt_id, task_attempts.logs_exhausted,
-		        task_attempts.prompt, task_attempts.base_branch, task_attempts.task_branch
+		        task_attempts.prompt,
+		        EXISTS(SELECT 1 FROM worker_log_events
+		               WHERE task_id = tasks.id AND attempt_id = tasks.current_attempt_id AND processed = 0)
 		 FROM tasks JOIN task_attempts ON task_attempts.id = tasks.current_attempt_id WHERE tasks.id = ?`, taskID,
-	).Scan(&state, &cancellationRequested, &currentAttemptID, &logsExhausted, &prompt, &baseBranch, &taskBranch); errors.Is(err, sql.ErrNoRows) {
+	).Scan(&state, &cancellationRequested, &currentAttemptID, &logsExhausted, &prompt, &pendingWorkerEvents); errors.Is(err, sql.ErrNoRows) {
 		return Attempt{}, false, fmt.Errorf("%w: %s", ErrNotFound, taskID)
 	} else if err != nil {
 		return Attempt{}, false, fmt.Errorf("read task for retry: %w", err)
 	}
 	if err := (task.Machine{}).Retry(task.State(state), task.QUEUED); err != nil {
 		return Attempt{}, false, err
+	}
+	if pendingWorkerEvents == 1 {
+		return Attempt{}, false, fmt.Errorf("%w: current attempt %q has pending durable worker events", ErrConflict, currentAttemptID)
 	}
 	if logsExhausted != 1 {
 		return Attempt{}, false, fmt.Errorf("%w: failed current attempt %q logs are not exhausted", ErrConflict, currentAttemptID)
@@ -919,7 +1013,14 @@ func (s *Store) retryTaskOnce(ctx context.Context, taskID, idempotencyKey string
 	}
 	retryPrompt, retryBaseBranch, retryTaskBranch := "", "", ""
 	if runningForgeEvents > 0 {
-		retryPrompt, retryBaseBranch, retryTaskBranch = prompt, baseBranch, taskBranch
+		if err := tx.QueryRowContext(ctx, `
+			SELECT base_branch, head_branch FROM pull_requests
+			WHERE attempt_id = ? AND state = 'open'`, currentAttemptID).Scan(&retryBaseBranch, &retryTaskBranch); errors.Is(err, sql.ErrNoRows) {
+			return Attempt{}, false, fmt.Errorf("%w: running forge event batch has no open pull request", ErrConflict)
+		} else if err != nil {
+			return Attempt{}, false, fmt.Errorf("read forge retry pull request: %w", err)
+		}
+		retryPrompt = prompt
 	}
 
 	var number int
@@ -1585,30 +1686,226 @@ func (s *Store) ListValidationRuns(ctx context.Context, attemptID string) (_ []V
 	return runs, nil
 }
 
-// RecordGitResult stores the branch identity emitted by one worker attempt.
-func (s *Store) RecordGitResult(ctx context.Context, result GitResult) error {
-	if strings.TrimSpace(result.AttemptID) == "" {
-		return errors.New("git result attempt ID is empty")
+// RecordPullRequestCandidate atomically records a freshly fetched published
+// branch and reported pull-request identity without marking either validated.
+// A later candidate may replace only the commit SHA.
+func (s *Store) RecordPullRequestCandidate(ctx context.Context, git GitResult, pullRequest PullRequest) error {
+	if strings.TrimSpace(git.AttemptID) == "" || git.State != "candidate" || strings.TrimSpace(git.Branch) == "" || !protocol.FullLowerGitObjectID(git.CommitSHA) || git.Error != "" {
+		return errors.New("candidate Git result is incomplete or invalid")
 	}
-	if strings.TrimSpace(result.State) == "" {
-		return errors.New("git result state is empty")
+	if pullRequest.AttemptID != git.AttemptID || pullRequest.State != "reported" || pullRequest.Number <= 0 || pullRequest.URL != "" || pullRequest.Title != "" ||
+		pullRequest.HeadBranch != git.Branch || strings.TrimSpace(pullRequest.BaseBranch) == "" || pullRequest.Error != "" {
+		return fmt.Errorf("%w: reported pull request is incomplete or does not match candidate Git result", ErrConflict)
 	}
-	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO git_results (attempt_id, state, branch, commit_sha, error)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(attempt_id) DO NOTHING`,
-		result.AttemptID, result.State, result.Branch, result.CommitSHA, result.Error)
-	if err != nil {
-		return fmt.Errorf("record git result for attempt %q: %w", result.AttemptID, err)
-	}
-	durable, err := s.GetGitResult(ctx, result.AttemptID)
+	return s.immediateTransaction(ctx, "pull request candidate", func(conn *sql.Conn) error {
+		return recordPullRequestCandidateTx(ctx, conn, git, pullRequest)
+	})
+}
+
+func recordPullRequestCandidateTx(ctx context.Context, tx *sql.Conn, git GitResult, pullRequest PullRequest) error {
+	taskID, baseBranch, taskBranch, err := readAttemptBranchIdentityTx(ctx, tx, git.AttemptID)
 	if err != nil {
 		return err
 	}
-	if durable != result {
-		return fmt.Errorf("%w: Git result for attempt %q is already durable", ErrConflict, result.AttemptID)
+	if baseBranch == "" || taskBranch == "" || git.Branch != taskBranch || pullRequest.HeadBranch != taskBranch || pullRequest.BaseBranch != baseBranch {
+		return fmt.Errorf("%w: candidate does not match immutable attempt branch identity", ErrConflict)
+	}
+	durableGit, hasGit, err := readGitResultTx(ctx, tx, git.AttemptID)
+	if err != nil {
+		return err
+	}
+	durablePR, hasPR, err := readPullRequestTx(ctx, tx, git.AttemptID)
+	if err != nil {
+		return err
+	}
+	if hasGit && durableGit.State == "pushed" {
+		if !hasPR || durableGit.Branch != git.Branch || durableGit.CommitSHA != git.CommitSHA || durableGit.Error != "" ||
+			durablePR.State != "open" || durablePR.Number != pullRequest.Number || durablePR.HeadBranch != pullRequest.HeadBranch || durablePR.BaseBranch != pullRequest.BaseBranch {
+			return fmt.Errorf("%w: candidate for attempt %q conflicts with durable verified data", ErrConflict, git.AttemptID)
+		}
+		return nil
+	}
+	if hasGit && (durableGit.State != "candidate" || durableGit.Branch != git.Branch || durableGit.Error != "") {
+		return fmt.Errorf("%w: candidate for attempt %q conflicts with durable Git data", ErrConflict, git.AttemptID)
+	}
+	priorNumber, err := priorPullRequestNumberTx(ctx, tx, taskID, git.AttemptID, taskBranch, baseBranch)
+	if err != nil {
+		return err
+	}
+	if err := recordCandidatePullRequestTx(ctx, tx, git.AttemptID, taskBranch, baseBranch, priorNumber, durablePR, hasPR, pullRequest); err != nil {
+		return err
+	}
+	return recordCandidateGitTx(ctx, tx, durableGit, hasGit, git)
+}
+
+func recordCandidatePullRequestTx(ctx context.Context, tx *sql.Conn, attemptID, taskBranch, baseBranch string, priorNumber int, durable PullRequest, hasDurable bool, reported PullRequest) error {
+	if priorNumber > 0 {
+		if !hasDurable || durable.State != "open" || durable.Number != priorNumber || durable.Number != reported.Number ||
+			durable.HeadBranch != taskBranch || durable.BaseBranch != baseBranch || durable.Error != "" {
+			return fmt.Errorf("%w: copied pull request for follow-up attempt %q does not match candidate identity", ErrConflict, attemptID)
+		}
+		return nil
+	}
+	if hasDurable {
+		if durable.State != "reported" || durable.Number != reported.Number || durable.URL != "" || durable.Title != "" ||
+			durable.HeadBranch != taskBranch || durable.BaseBranch != baseBranch || durable.Error != "" {
+			return fmt.Errorf("%w: reported pull request for attempt %q conflicts with durable data", ErrConflict, attemptID)
+		}
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO pull_requests (attempt_id, state, number, head_branch, base_branch) VALUES (?, 'reported', ?, ?, ?)`,
+		reported.AttemptID, reported.Number, reported.HeadBranch, reported.BaseBranch); err != nil {
+		return fmt.Errorf("insert reported pull request: %w", err)
 	}
 	return nil
+}
+
+func recordCandidateGitTx(ctx context.Context, tx *sql.Conn, durable GitResult, hasDurable bool, candidate GitResult) error {
+	if hasDurable {
+		if _, err := tx.ExecContext(ctx, `UPDATE git_results SET commit_sha = ? WHERE attempt_id = ? AND state = 'candidate' AND branch = ?`, candidate.CommitSHA, candidate.AttemptID, durable.Branch); err != nil {
+			return fmt.Errorf("update candidate Git result: %w", err)
+		}
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO git_results (attempt_id, state, branch, commit_sha) VALUES (?, 'candidate', ?, ?)`, candidate.AttemptID, candidate.Branch, candidate.CommitSHA); err != nil {
+		return fmt.Errorf("insert candidate Git result: %w", err)
+	}
+	return nil
+}
+
+// RecordVerifiedPullRequest atomically promotes only the exact latest
+// candidate to pushed Git and provider-verified open pull-request state.
+func (s *Store) RecordVerifiedPullRequest(ctx context.Context, git GitResult, pullRequest PullRequest) error {
+	if strings.TrimSpace(git.AttemptID) == "" || git.State != "pushed" || strings.TrimSpace(git.Branch) == "" || !protocol.FullLowerGitObjectID(git.CommitSHA) || git.Error != "" {
+		return errors.New("verified Git result is incomplete or invalid")
+	}
+	if pullRequest.AttemptID != git.AttemptID || pullRequest.State != "open" || pullRequest.Number <= 0 ||
+		strings.TrimSpace(pullRequest.URL) == "" || strings.TrimSpace(pullRequest.Title) == "" ||
+		pullRequest.HeadBranch != git.Branch || strings.TrimSpace(pullRequest.BaseBranch) == "" || pullRequest.Error != "" {
+		return fmt.Errorf("%w: verified pull request is incomplete or does not match Git result", ErrConflict)
+	}
+	if err := forge.ValidatePullRequestMetadata(pullRequest.URL, pullRequest.Title); err != nil {
+		return fmt.Errorf("%w: verified pull request metadata: %w", ErrConflict, err)
+	}
+	return s.immediateTransaction(ctx, "verified pull request", func(conn *sql.Conn) error {
+		return recordVerifiedPullRequestTx(ctx, conn, git, pullRequest)
+	})
+}
+
+func recordVerifiedPullRequestTx(ctx context.Context, conn *sql.Conn, git GitResult, pullRequest PullRequest) error {
+	_, baseBranch, taskBranch, err := readAttemptBranchIdentityTx(ctx, conn, git.AttemptID)
+	if err != nil {
+		return err
+	}
+	if git.Branch != taskBranch || pullRequest.HeadBranch != taskBranch || pullRequest.BaseBranch != baseBranch {
+		return fmt.Errorf("%w: verified result does not match immutable attempt branch identity", ErrConflict)
+	}
+	durableGit, hasGit, err := readGitResultTx(ctx, conn, git.AttemptID)
+	if err != nil {
+		return err
+	}
+	durablePR, hasPR, err := readPullRequestTx(ctx, conn, git.AttemptID)
+	if err != nil {
+		return err
+	}
+	if hasGit && durableGit.State == "pushed" {
+		if !hasPR || durableGit != git || durablePR != pullRequest {
+			return fmt.Errorf("%w: verified result for attempt %q conflicts with durable data", ErrConflict, git.AttemptID)
+		}
+		return nil
+	}
+	if !hasGit || !hasPR || durableGit.State != "candidate" || durableGit.Branch != git.Branch || durableGit.CommitSHA != git.CommitSHA || durableGit.Error != "" ||
+		(durablePR.State != "reported" && durablePR.State != "open") || durablePR.Number != pullRequest.Number || durablePR.HeadBranch != pullRequest.HeadBranch ||
+		durablePR.BaseBranch != pullRequest.BaseBranch || durablePR.Error != "" {
+		return fmt.Errorf("%w: verified receipt does not match the latest durable candidate", ErrConflict)
+	}
+	if _, err := conn.ExecContext(ctx, `UPDATE pull_requests SET state = 'open', number = ?, url = ?, title = ?, head_branch = ?, base_branch = ?, error = '' WHERE attempt_id = ?`,
+		pullRequest.Number, pullRequest.URL, pullRequest.Title, pullRequest.HeadBranch, pullRequest.BaseBranch, pullRequest.AttemptID); err != nil {
+		return fmt.Errorf("promote verified pull request: %w", err)
+	}
+	result, err := conn.ExecContext(ctx, `UPDATE git_results SET state = 'pushed', error = '' WHERE attempt_id = ? AND state = 'candidate' AND branch = ? AND commit_sha = ?`, git.AttemptID, git.Branch, git.CommitSHA)
+	if err != nil {
+		return fmt.Errorf("promote verified Git result: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		return fmt.Errorf("%w: latest candidate changed during verified promotion", ErrConflict)
+	}
+	return nil
+}
+
+func readAttemptBranchIdentityTx(ctx context.Context, tx *sql.Conn, attemptID string) (taskID, baseBranch, taskBranch string, resultErr error) {
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT task_id, base_branch, task_branch, manifest_json FROM task_attempts WHERE id = ?`, attemptID).
+		Scan(&taskID, &baseBranch, &taskBranch, &manifestJSON); errors.Is(err, sql.ErrNoRows) {
+		return "", "", "", fmt.Errorf("%w: attempt %s", ErrNotFound, attemptID)
+	} else if err != nil {
+		return "", "", "", fmt.Errorf("read pull request attempt: %w", err)
+	}
+	if baseBranch == "" || taskBranch == "" {
+		var manifest protocol.TaskManifest
+		if len(manifestJSON) == 0 || json.Unmarshal(manifestJSON, &manifest) != nil {
+			return "", "", "", fmt.Errorf("%w: attempt %q has no decodable immutable branch identity", ErrConflict, attemptID)
+		}
+		if baseBranch == "" {
+			baseBranch = manifest.BaseBranch
+		}
+		if taskBranch == "" {
+			taskBranch = manifest.TaskBranch
+		}
+	}
+	return taskID, baseBranch, taskBranch, nil
+}
+
+func priorPullRequestNumberTx(ctx context.Context, tx *sql.Conn, taskID, attemptID, taskBranch, baseBranch string) (int, error) {
+	var priorCount int
+	var priorMinimum, priorMaximum sql.NullInt64
+	err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*), MIN(COALESCE(p.number, 0)), MAX(COALESCE(p.number, 0)) FROM pull_requests p
+		JOIN task_attempts a ON a.id = p.attempt_id
+		WHERE a.task_id = ? AND p.attempt_id <> ? AND p.state = 'open' AND p.head_branch = ? AND p.base_branch = ?`,
+		taskID, attemptID, taskBranch, baseBranch).Scan(&priorCount, &priorMinimum, &priorMaximum)
+	if err != nil {
+		return 0, fmt.Errorf("read prior pull request identity: %w", err)
+	}
+	priorNumber := 0
+	if priorCount > 0 {
+		if !priorMinimum.Valid || !priorMaximum.Valid || priorMinimum.Int64 <= 0 || priorMinimum.Int64 != priorMaximum.Int64 {
+			return 0, fmt.Errorf("%w: prior open pull requests have invalid or conflicting identity", ErrConflict)
+		}
+		priorNumber = int(priorMinimum.Int64)
+	}
+
+	return priorNumber, nil
+}
+
+func readGitResultTx(ctx context.Context, tx *sql.Conn, attemptID string) (GitResult, bool, error) {
+	var result GitResult
+	err := tx.QueryRowContext(ctx, `SELECT attempt_id, state, branch, commit_sha, error FROM git_results WHERE attempt_id = ?`, attemptID).
+		Scan(&result.AttemptID, &result.State, &result.Branch, &result.CommitSHA, &result.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GitResult{}, false, nil
+	}
+	if err != nil {
+		return GitResult{}, false, fmt.Errorf("read durable verified Git result: %w", err)
+	}
+	return result, true, nil
+}
+
+func readPullRequestTx(ctx context.Context, tx *sql.Conn, attemptID string) (PullRequest, bool, error) {
+	var result PullRequest
+	var number sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT attempt_id, state, number, url, title, head_branch, base_branch, error FROM pull_requests WHERE attempt_id = ?`, attemptID).
+		Scan(&result.AttemptID, &result.State, &number, &result.URL, &result.Title, &result.HeadBranch, &result.BaseBranch, &result.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PullRequest{}, false, nil
+	}
+	if err != nil {
+		return PullRequest{}, false, fmt.Errorf("read durable verified pull request: %w", err)
+	}
+	if number.Valid {
+		result.Number = int(number.Int64)
+	}
+	return result, true, nil
 }
 
 func (s *Store) GetGitResult(ctx context.Context, attemptID string) (GitResult, error) {
@@ -1627,60 +1924,55 @@ func (s *Store) GetGitResult(ctx context.Context, attemptID string) (GitResult, 
 	return result, nil
 }
 
-// ReservePullRequest durably claims pull-request creation for an attempt. A
-// false return means another call has already claimed it.
-func (s *Store) ReservePullRequest(ctx context.Context, attemptID, title, headBranch, baseBranch string) (bool, error) {
-	if strings.TrimSpace(attemptID) == "" {
-		return false, errors.New("pull request attempt ID is empty")
-	}
-	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO pull_requests
-			(attempt_id, state, number, url, title, head_branch, base_branch, error)
-		VALUES (?, 'creating', NULL, '', ?, ?, ?, '')
-		ON CONFLICT(attempt_id) DO NOTHING`, attemptID, title, headBranch, baseBranch)
-	if err != nil {
-		return false, fmt.Errorf("reserve pull request for attempt %q: %w", attemptID, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("confirm pull request reservation for attempt %q: %w", attemptID, err)
-	}
-	return affected == 1, nil
+// LatestVerifiedPullRequestGitResult returns the newest durable pushed result
+// from the exact pull-request number and branch lineage.
+func (s *Store) LatestVerifiedPullRequestGitResult(ctx context.Context, taskID string, pullRequest PullRequest, excludeAttemptID string) (GitResult, error) {
+	return s.latestPullRequestGitResult(ctx, taskID, pullRequest, excludeAttemptID, false)
 }
 
-// CompletePullRequest stores the provider result. It only completes a previously reserved row.
-func (s *Store) CompletePullRequest(ctx context.Context, attemptID string, number int, url string) error {
-	if number <= 0 || strings.TrimSpace(url) == "" {
-		return errors.New("pull request number and URL are required")
-	}
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE pull_requests SET state = 'open', number = ?, url = ?, error = ''
-		WHERE attempt_id = ? AND state = 'creating'`, number, url, attemptID)
-	if err != nil {
-		return fmt.Errorf("complete pull request for attempt %q: %w", attemptID, err)
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("confirm pull request completion for attempt %q: %w", attemptID, err)
-	}
-	if affected != 1 {
-		return fmt.Errorf("%w: pull request for attempt %q is not creating", ErrConflict, attemptID)
-	}
-	return nil
+// LatestPullRequestGitResult returns the newest published candidate or pushed
+// result from the exact pull-request lineage.
+func (s *Store) LatestPullRequestGitResult(ctx context.Context, taskID string, pullRequest PullRequest, excludeAttemptID string) (GitResult, error) {
+	return s.latestPullRequestGitResult(ctx, taskID, pullRequest, excludeAttemptID, true)
 }
 
-func (s *Store) FailPullRequest(ctx context.Context, attemptID string, cause error) error {
-	message := ""
-	if cause != nil {
-		message = cause.Error()
+func (s *Store) latestPullRequestGitResult(ctx context.Context, taskID string, pullRequest PullRequest, excludeAttemptID string, includeCandidate bool) (GitResult, error) {
+	if strings.TrimSpace(taskID) == "" || pullRequest.Number <= 0 || strings.TrimSpace(pullRequest.HeadBranch) == "" || strings.TrimSpace(pullRequest.BaseBranch) == "" {
+		return GitResult{}, errors.New("complete task and pull request lineage is required")
 	}
-	_, err := s.db.ExecContext(ctx, `
-		UPDATE pull_requests SET state = 'failed', error = ?
-		WHERE attempt_id = ? AND state = 'creating'`, message, attemptID)
+	var result GitResult
+	err := s.db.QueryRowContext(ctx, `
+		SELECT g.attempt_id, g.state, g.branch, g.commit_sha, g.error
+		FROM task_attempts a
+		JOIN pull_requests p ON p.attempt_id = a.id
+		JOIN git_results g ON g.attempt_id = a.id
+		WHERE a.task_id = ? AND a.id <> ?
+		  AND p.state IN ('reported', 'open') AND (? OR p.state = 'open')
+		  AND p.number = ? AND p.head_branch = ? AND p.base_branch = ? AND p.error = ''
+		  AND g.state IN ('candidate', 'pushed') AND (? OR g.state = 'pushed')
+		  AND g.branch = p.head_branch AND g.error = ''
+		ORDER BY a.number DESC LIMIT 1`,
+		taskID, excludeAttemptID, includeCandidate, pullRequest.Number, pullRequest.HeadBranch, pullRequest.BaseBranch, includeCandidate,
+	).Scan(&result.AttemptID, &result.State, &result.Branch, &result.CommitSHA, &result.Error)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !includeCandidate {
+			return GitResult{}, fmt.Errorf("%w: task %q has no durable pushed Git result for pull request %d", ErrNotFound, taskID, pullRequest.Number)
+		}
+		return GitResult{}, fmt.Errorf("%w: task %q has no durable published Git result for pull request %d", ErrNotFound, taskID, pullRequest.Number)
+	}
 	if err != nil {
-		return fmt.Errorf("fail pull request for attempt %q: %w", attemptID, err)
+		if !includeCandidate {
+			return GitResult{}, fmt.Errorf("get latest verified pull request Git result: %w", err)
+		}
+		return GitResult{}, fmt.Errorf("get latest pull request Git result: %w", err)
 	}
-	return nil
+	if !protocol.FullLowerGitObjectID(result.CommitSHA) {
+		if !includeCandidate {
+			return GitResult{}, fmt.Errorf("%w: durable pushed Git result for pull request %d has invalid commit SHA", ErrConflict, pullRequest.Number)
+		}
+		return GitResult{}, fmt.Errorf("%w: durable published Git result for pull request %d has invalid commit SHA", ErrConflict, pullRequest.Number)
+	}
+	return result, nil
 }
 
 func (s *Store) GetPullRequest(ctx context.Context, attemptID string) (PullRequest, error) {

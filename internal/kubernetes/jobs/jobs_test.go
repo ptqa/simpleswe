@@ -68,9 +68,15 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 		},
 	}
 	manifest := TaskManifest{
-		TaskID:     "task-123",
-		Repository: "https://bitbucket.example/team/repo",
-		Prompt:     "Fix the failing test",
+		TaskID:                     "task-123",
+		Repository:                 "https://bitbucket.example/team/repo",
+		Prompt:                     "Fix the failing test",
+		ForgeProvider:              "bitbucket",
+		ForgeOwner:                 "team",
+		ForgeRepository:            "repo",
+		RequestedPullRequestTitle:  "Fix the failing test",
+		ExistingPullRequestNumber:  42,
+		ExistingPullRequestHeadSHA: "0123456789abcdef0123456789abcdef01234567",
 	}
 	attempt := Attempt{ID: "attempt-123", Number: 3}
 

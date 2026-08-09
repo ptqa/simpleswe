@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
+	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
@@ -412,7 +412,7 @@ func TestReconcileRecoversLabelledJobLifecycleExplicitly(t *testing.T) {
 	}
 }
 
-func TestCompletedJobWaitsForLogsThenFailsWithoutDurableBranchAndPullRequest(t *testing.T) {
+func TestCompletedJobWaitsForLogsThenFailsWithoutReportedPullRequest(t *testing.T) {
 	fixture := newFixture(t)
 	created := createTask(t, fixture, "must produce a branch", "complete-without-branch")
 	jobName := jobs.Name(created.ID, 1)
@@ -447,8 +447,8 @@ func TestCompletedJobWaitsForLogsThenFailsWithoutDurableBranchAndPullRequest(t *
 		t.Fatalf("completed Job without branch state = %q; want FAILED", got)
 	}
 	events := listEvents(t, fixture, created.ID)
-	if !strings.Contains(strings.ToLower(events[len(events)-1].Reason), "indeterminate") || !strings.Contains(events[len(events)-1].Reason, "branch_pushed") {
-		t.Fatalf("completion failure reason = %q; want explicit indeterminate missing branch event", events[len(events)-1].Reason)
+	if !strings.Contains(events[len(events)-1].Reason, "OpenCode did not report a pull request") {
+		t.Fatalf("completion failure reason = %q; want planned missing-report message", events[len(events)-1].Reason)
 	}
 }
 
@@ -506,9 +506,30 @@ func TestWorkerFailureEventRecordsExplicitFailure(t *testing.T) {
 	assertFailureDetails(t, events[len(events)-1], "worker", jobName, "worker-pod-a1", 9)
 }
 
-func TestBranchPushedCreatesPullRequestAtMostOnce(t *testing.T) {
+func TestWorkerFailureEventPersistsTrustedReportReason(t *testing.T) {
+	for i, message := range []string{"OpenCode did not report a pull request", "OpenCode reported failure: could not reproduce"} {
+		t.Run(message, func(t *testing.T) {
+			fixture := newFixture(t)
+			created := createRunningTask(t, fixture, "fix it", fmt.Sprintf("trusted-worker-failure-%d", i))
+			attempt, err := fixture.store.CurrentAttempt(fixture.ctx, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := protocol.Event{Type: protocol.EventWorkerFailed, TaskID: created.ID, Message: message, ExitCode: 1}
+			if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobs.Name(created.ID, attempt.Number), "worker-pod-a1", event); err != nil {
+				t.Fatalf("HandleWorkerEvent: %v", err)
+			}
+			events := listEvents(t, fixture, created.ID)
+			if reason := events[len(events)-1].Reason; !strings.Contains(reason, message) {
+				t.Fatalf("durable failure reason = %q, want report message %q", reason, message)
+			}
+		})
+	}
+}
+
+func TestPullRequestReadyVerifiesReportedPullRequestAtMostOnce(t *testing.T) {
 	fixture := newFixture(t)
-	created := createRunningTask(t, fixture, "open a pull request", "branch-pushed")
+	created := createRunningTask(t, fixture, "open a pull request", "pull-request-ready")
 	jobName := jobs.Name(created.ID, 1)
 	podName := "worker-pod-a1"
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "agent_started", TaskID: created.ID})
@@ -516,24 +537,23 @@ func TestBranchPushedCreatesPullRequestAtMostOnce(t *testing.T) {
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_result", TaskID: created.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_succeeded", TaskID: created.ID})
 	before := listEvents(t, fixture, created.ID)
-	event := protocol.Event{
-		Type: "branch_pushed", TaskID: created.ID, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA,
-	}
+	branch := "simpleswe/" + created.ID + "-a1"
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA}
+	event := protocol.Event{Type: protocol.EventPullRequestReady, TaskID: created.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA}
 	handleEvent(t, fixture, jobName, podName, event)
 
 	if got := getTask(t, fixture, created.ID).State; got != task.PR_OPEN {
-		t.Fatalf("branch_pushed state = %q; want %q", got, task.PR_OPEN)
+		t.Fatalf("pull_request_ready state = %q; want %q", got, task.PR_OPEN)
 	}
 	after := listEvents(t, fixture, created.ID)
 	wantPath := []task.State{task.VALIDATING, task.COMMITTING, task.PUSHING, task.CREATING_PR, task.PR_OPEN}
 	assertEventSlicePath(t, after[len(before):], wantPath)
-	if len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("Bitbucket PR calls = %d; want 1", len(fixture.pullRequests.calls))
+	if fixture.pullRequests.getCalls != 1 || fixture.pullRequests.getNumbers[0] != 42 {
+		t.Fatalf("provider get calls = %d numbers=%v; want 1 [42]", fixture.pullRequests.getCalls, fixture.pullRequests.getNumbers)
 	}
-	call := fixture.pullRequests.calls[0]
-	if call.workspace != "acme" || call.repository != "widget" ||
-		call.input.SourceBranch != event.Branch || call.input.DestinationBranch != "main" {
-		t.Fatalf("Bitbucket PR request = %#v; want acme/widget from %q to main", call, event.Branch)
+	durable, err := fixture.store.GetPullRequest(fixture.ctx, created.CurrentAttemptID)
+	if err != nil || durable.Number != 42 || durable.URL != pullRequestURL || durable.Title != "Provider title" || durable.HeadBranch != branch || durable.BaseBranch != "main" {
+		t.Fatalf("durable provider pull request = %#v, %v", durable, err)
 	}
 	runs, err := fixture.store.ListValidationRuns(fixture.ctx, created.CurrentAttemptID)
 	if err != nil || len(runs) != 1 || runs[0].State != "succeeded" {
@@ -547,10 +567,10 @@ func TestBranchPushedCreatesPullRequestAtMostOnce(t *testing.T) {
 		t.Fatalf("restart controller: %v", err)
 	}
 	if err := restarted.HandleWorkerEvent(fixture.ctx, jobName, podName, event); err != nil {
-		t.Fatalf("replay branch_pushed: %v", err)
+		t.Fatalf("replay pull_request_ready: %v", err)
 	}
-	if len(fixture.pullRequests.calls) != 1 {
-		t.Fatalf("replayed branch event duplicated PR: %d calls", len(fixture.pullRequests.calls))
+	if fixture.pullRequests.getCalls != 1 {
+		t.Fatalf("replayed ready event repeated provider inspection: get=%d", fixture.pullRequests.getCalls)
 	}
 	job, err := fixture.kube.BatchV1().Jobs(workerNamespace).Get(fixture.ctx, jobName, metav1.GetOptions{})
 	if err != nil {
@@ -566,49 +586,6 @@ func TestBranchPushedCreatesPullRequestAtMostOnce(t *testing.T) {
 	}
 	if got := getTask(t, fixture, created.ID).State; got != task.PR_OPEN {
 		t.Fatalf("completed Job with durable PR fabricated final state %q; want PR_OPEN", got)
-	}
-}
-
-func TestReconcileResumesPullRequestSagaFromEveryDurableStep(t *testing.T) {
-	for _, resumeState := range []task.State{task.COMMITTING, task.PUSHING, task.CREATING_PR} {
-		t.Run(string(resumeState), func(t *testing.T) {
-			fixture := newFixture(t)
-			created := createRunningTask(t, fixture, "resume pull request", "resume-"+string(resumeState))
-			jobName := jobs.Name(created.ID, 1)
-			handleEvent(t, fixture, jobName, "worker-pod-a1", protocol.Event{Type: "agent_started", TaskID: created.ID})
-			handleEvent(t, fixture, jobName, "worker-pod-a1", protocol.Event{Type: "validation_started", TaskID: created.ID, Command: []string{"go", "test", "./..."}})
-			attempt, err := fixture.store.CurrentAttempt(fixture.ctx, created.ID)
-			if err != nil {
-				t.Fatalf("current attempt: %v", err)
-			}
-			branch := "simpleswe/" + created.ID + "-a1"
-			if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: attempt.ID, State: "pushed", Branch: branch, CommitSHA: "abc123"}); err != nil {
-				t.Fatalf("record Git result: %v", err)
-			}
-			if err := fixture.store.Transition(fixture.ctx, created.ID, task.VALIDATING, task.COMMITTING, store.TransitionParams{Reason: "crash after commit", Trigger: "controller", Validation: &store.ValidationTransition{State: "succeeded"}}); err != nil {
-				t.Fatalf("transition to committing: %v", err)
-			}
-			if resumeState == task.PUSHING || resumeState == task.CREATING_PR {
-				transition(t, fixture, created.ID, task.COMMITTING, task.PUSHING, "crash after push", "controller")
-			}
-			if resumeState == task.CREATING_PR {
-				transition(t, fixture, created.ID, task.PUSHING, task.CREATING_PR, "crash before PR", "controller")
-			}
-			reserved, err := fixture.store.ReservePullRequest(fixture.ctx, attempt.ID, created.Prompt, branch, "main")
-			if err != nil || !reserved {
-				t.Fatalf("reserve PR = %t, %v", reserved, err)
-			}
-			fixture.pullRequests.found = &bitbucket.PullRequest{ID: 42, HTMLURL: pullRequestURL}
-			if err := fixture.controller.Reconcile(fixture.ctx); err != nil {
-				t.Fatalf("Reconcile(): %v", err)
-			}
-			if got := getTask(t, fixture, created.ID).State; got != task.PR_OPEN {
-				t.Fatalf("resumed state = %q; want PR_OPEN", got)
-			}
-			if fixture.pullRequests.findCalls != 1 || len(fixture.pullRequests.calls) != 0 {
-				t.Fatalf("PR reconciliation find/create calls = %d/%d; want 1/0", fixture.pullRequests.findCalls, len(fixture.pullRequests.calls))
-			}
-		})
 	}
 }
 

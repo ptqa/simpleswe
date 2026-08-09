@@ -2,7 +2,7 @@ package controller
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,19 +27,19 @@ const (
 	repositoryURL   = "https://bitbucket.example/acme/widget.git"
 	workerNamespace = "simpleswe-workers"
 	workerImage     = "registry.example/simpleswe/widget-worker:v7"
-	pullRequestURL  = "https://bitbucket.example/acme/widget/pull-requests/42"
+	pullRequestURL  = "https://bitbucket.org/acme/widget/pull-requests/42"
 )
 
 // Controller contract under test:
 //
-//	New(*store.Store, kubernetes.Interface, config.Config, PullRequestCreator) (*Controller, error)
+//	New(*store.Store, kubernetes.Interface, config.Config, PullRequestInspector) (*Controller, error)
 //	(*Controller).CreateTask(context.Context, store.CreateTaskParams) (store.Task, error)
 //	(*Controller).Cancel(context.Context, string) error
 //	(*Controller).Retry(context.Context, string) (store.Attempt, error)
 //	(*Controller).Reconcile(context.Context) error
 //	(*Controller).HandleWorkerEvent(context.Context, jobName, podName string, protocol.Event) error
 //
-// PullRequestCreator stays narrow at its external boundary.
+// PullRequestInspector stays narrow at its external boundary.
 type controllerContract interface {
 	CreateTask(context.Context, store.CreateTaskParams) (store.Task, error)
 	Cancel(context.Context, string) error
@@ -106,88 +106,46 @@ func newFixture(t *testing.T) *fixture {
 	}
 }
 
-type pullRequestCall struct {
-	target     forge.Target
-	workspace  string
-	repository string
-	input      forge.CreatePullRequestRequest
-}
-
 type fakePullRequestCreator struct {
-	mu          sync.Mutex
-	calls       []pullRequestCall
-	found       *forge.PullRequest
-	findCalls   int
-	findTargets []forge.Target
-	failFind    int
-	findErr     error
-	getResult   *forge.PullRequestState
-	getErr      error
-	getCalls    int
-	getTargets  []forge.Target
-	getNumbers  []int
-	blocked     chan struct{}
-	release     chan struct{}
-}
-
-func (f *fakePullRequestCreator) CreatePullRequest(_ context.Context, target forge.Target, input forge.CreatePullRequestRequest) (forge.PullRequest, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, pullRequestCall{target: target, workspace: target.Owner, repository: target.Repository, input: input})
-	return forge.PullRequest{ID: 42, HTMLURL: pullRequestURL}, nil
-}
-
-func (f *fakePullRequestCreator) FindPullRequest(ctx context.Context, target forge.Target, _, _, _ string) (forge.PullRequest, bool, error) {
-	f.mu.Lock()
-	f.findCalls++
-	f.findTargets = append(f.findTargets, target)
-	if f.failFind > 0 {
-		f.failFind--
-		err := f.findErr
-		f.mu.Unlock()
-		return forge.PullRequest{}, false, err
-	}
-	blocked, release := f.blocked, f.release
-	found := f.found
-	f.mu.Unlock()
-	if blocked != nil {
-		select {
-		case blocked <- struct{}{}:
-		default:
-		}
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return forge.PullRequest{}, false, fmt.Errorf("wait for fake pull request release: %w", ctx.Err())
-		}
-	}
-	if found == nil {
-		return forge.PullRequest{}, false, nil
-	}
-	return *found, true, nil
+	mu         sync.Mutex
+	getResult  *forge.PullRequestState
+	getErr     error
+	getCalls   int
+	getTargets []forge.Target
+	getNumbers []int
+	blocked    chan struct{}
+	release    chan struct{}
 }
 
 func (f *fakePullRequestCreator) GetPullRequest(_ context.Context, target forge.Target, number int) (forge.PullRequestState, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.getCalls++
 	f.getTargets = append(f.getTargets, target)
 	f.getNumbers = append(f.getNumbers, number)
 	if f.getErr != nil {
-		return forge.PullRequestState{}, f.getErr
+		err := f.getErr
+		f.mu.Unlock()
+		return forge.PullRequestState{}, err
 	}
 	if f.getResult != nil {
-		return *f.getResult, nil
+		result := *f.getResult
+		blocked, release := f.blocked, f.release
+		f.mu.Unlock()
+		if blocked != nil {
+			select {
+			case blocked <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		return result, nil
 	}
-	result := forge.PullRequestState{Number: number, State: "open", SourceOwner: target.Owner, SourceRepository: target.Repository, HeadSHA: fullCommitSHA}
-	if len(f.calls) > 0 {
-		result.SourceBranch = f.calls[len(f.calls)-1].input.SourceBranch
-		result.DestinationBranch = f.calls[len(f.calls)-1].input.DestinationBranch
-	}
+	result := forge.PullRequestState{Number: number, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: target.Owner, SourceRepository: target.Repository, HeadSHA: fullCommitSHA}
+	f.mu.Unlock()
 	return result, nil
 }
 
-var _ PullRequestCreator = (*fakePullRequestCreator)(nil)
+var _ PullRequestInspector = (*fakePullRequestCreator)(nil)
 
 func createTask(t *testing.T, fixture *fixture, prompt, idempotencyKey string) store.Task {
 	t.Helper()
@@ -271,8 +229,47 @@ func transition(t *testing.T, fixture *fixture, taskID string, from, to task.Sta
 
 func handleEvent(t *testing.T, fixture *fixture, jobName, podName string, event protocol.Event) {
 	t.Helper()
+	if event.Type == protocol.EventPullRequestReady {
+		attempt, err := fixture.store.CurrentAttempt(fixture.ctx, event.TaskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.store.GetGitResult(fixture.ctx, attempt.ID); errors.Is(err, store.ErrNotFound) {
+			published := event
+			published.Type = protocol.EventPullRequestPublished
+			if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, published); err != nil {
+				t.Fatalf("HandleWorkerEvent(%q) error = %v", published.Type, err)
+			}
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if event.Type == protocol.EventPullRequestReady && fixture.pullRequests.getResult == nil {
+		fixture.pullRequests.getResult = &forge.PullRequestState{
+			Number: event.PullRequestNumber, State: "open", HTMLURL: pullRequestURL, Title: "Provider title",
+			SourceOwner: "acme", SourceRepository: "widget", SourceBranch: event.Branch, DestinationBranch: "main", HeadSHA: event.CommitSHA,
+		}
+	}
 	if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, event); err != nil {
 		t.Fatalf("HandleWorkerEvent(%q) error = %v", event.Type, err)
+	}
+}
+
+func queueDurableWorkerEvent(t *testing.T, fixture *fixture, id, podUID, jobName, podName string, event protocol.Event) {
+	t.Helper()
+	attempt, err := fixture.store.CurrentAttempt(fixture.ctx, event.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := protocol.EncodeEvent(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.AppendPodLog(fixture.ctx, store.AppendPodLogParams{
+		TaskID: event.TaskID, AttemptID: attempt.ID, PodUID: podUID, JobName: jobName, PodName: podName,
+		Content: []byte(content), WorkerEventID: id, WorkerEvent: content,
+	}, 1<<20, 64<<10); err != nil {
+		t.Fatal(err)
 	}
 }
 

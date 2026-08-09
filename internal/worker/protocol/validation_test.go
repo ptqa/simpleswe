@@ -8,19 +8,86 @@ import (
 
 func TestValidateManifestAcceptsFullShape(t *testing.T) {
 	manifest := TaskManifest{
-		TaskID:             "task-1",
-		Repository:         "acme/widget",
-		CloneURL:           "ssh://git@bitbucket.org/acme/widget.git",
-		BaseBranch:         "main",
-		TaskBranch:         "simpleswe/task-1",
-		Prompt:             "add focused tests",
-		OpenCodeCommand:    []string{"opencode", "run"},
-		ValidationCommands: [][]string{{"go", "test", "./..."}},
-		MaxFixAttempts:     maxFixAttempts,
+		TaskID:                     "task-1",
+		Repository:                 "acme/widget",
+		CloneURL:                   "ssh://git@bitbucket.org/acme/widget.git",
+		BaseBranch:                 "main",
+		TaskBranch:                 "simpleswe/task-1",
+		Prompt:                     "add focused tests",
+		OpenCodeCommand:            []string{"opencode", "run"},
+		ValidationCommands:         [][]string{{"go", "test", "./..."}},
+		MaxFixAttempts:             maxFixAttempts,
+		ForgeProvider:              "github",
+		ForgeOwner:                 "acme",
+		ForgeRepository:            "widget",
+		RequestedPullRequestTitle:  "Fix widget",
+		ExistingPullRequestNumber:  42,
+		ExistingPullRequestHeadSHA: "0123456789abcdef0123456789abcdef01234567",
 	}
 
 	if err := ValidateManifest(manifest); err != nil {
 		t.Fatalf("full manifest rejected: %v", err)
+	}
+}
+
+func TestManifestForgeContextIsStrictAndContainsNoEvidencePayloads(t *testing.T) {
+	valid := TaskManifest{
+		TaskID: "task-1", CloneURL: "https://github.com/acme/widget.git", BaseBranch: "main",
+		TaskBranch: "simpleswe/task-1", Prompt: "fix it", OpenCodeCommand: []string{"opencode"},
+		ValidationCommand: []string{"go", "test", "./..."}, ForgeProvider: "github", ForgeOwner: "acme",
+		ForgeRepository: "widget", RequestedPullRequestTitle: "Fix widget", ExistingPullRequestNumber: 42,
+		ExistingPullRequestHeadSHA: "0123456789abcdef0123456789abcdef01234567",
+	}
+	if err := ValidateManifest(valid); err != nil {
+		t.Fatalf("valid forge context rejected: %v", err)
+	}
+	for name, edit := range map[string]func(*TaskManifest){
+		"unsupported provider":  func(m *TaskManifest) { m.ForgeProvider = "gitlab" },
+		"missing owner":         func(m *TaskManifest) { m.ForgeOwner = "" },
+		"missing repository":    func(m *TaskManifest) { m.ForgeRepository = "" },
+		"invalid existing PR":   func(m *TaskManifest) { m.ExistingPullRequestNumber = -1 },
+		"missing existing head": func(m *TaskManifest) { m.ExistingPullRequestHeadSHA = "" },
+		"short existing head":   func(m *TaskManifest) { m.ExistingPullRequestHeadSHA = "0123456" },
+		"uppercase existing head": func(m *TaskManifest) {
+			m.ExistingPullRequestHeadSHA = strings.ToUpper(m.ExistingPullRequestHeadSHA)
+		},
+		"head without existing PR": func(m *TaskManifest) { m.ExistingPullRequestNumber = 0 },
+		"blank requested title":    func(m *TaskManifest) { m.RequestedPullRequestTitle = " \t" },
+		"long requested title":     func(m *TaskManifest) { m.RequestedPullRequestTitle = strings.Repeat("x", 257) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifest := valid
+			edit(&manifest)
+			if err := ValidateManifest(manifest); err == nil {
+				t.Fatal("invalid forge context accepted")
+			}
+		})
+	}
+
+	payload, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"screenshot", "screenshots", "summary", "attachment", "attachments", "upload", "uploads", "pull_request_url"} {
+		if _, exists := fields[forbidden]; exists {
+			t.Errorf("manifest contains forbidden field %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestValidateManifestAcceptsSHA256ExistingHead(t *testing.T) {
+	manifest := TaskManifest{
+		TaskID: "task-1", Repository: "acme/widget", BaseBranch: "main", TaskBranch: "simpleswe/task-1",
+		Prompt: "fix it", OpenCodeCommand: []string{"opencode"}, ValidationCommand: []string{"go", "test"},
+		ForgeProvider: "github", ForgeOwner: "acme", ForgeRepository: "widget", ExistingPullRequestNumber: 42,
+		ExistingPullRequestHeadSHA: strings.Repeat("a", 64),
+	}
+	if err := ValidateManifest(manifest); err != nil {
+		t.Fatalf("SHA-256 existing head rejected: %v", err)
 	}
 }
 
@@ -50,6 +117,9 @@ func TestValidateManifestValidationCommandsErrors(t *testing.T) {
 		Repository:         "acme/widget",
 		Prompt:             "prompt",
 		ValidationCommands: [][]string{{"go", "test"}},
+		ForgeProvider:      "bitbucket",
+		ForgeOwner:         "acme",
+		ForgeRepository:    "widget",
 	}
 	for name, edit := range map[string]func(*TaskManifest){
 		"empty command":     func(m *TaskManifest) { m.ValidationCommands = [][]string{{}} },

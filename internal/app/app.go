@@ -19,7 +19,7 @@ const (
 
 	rootUsage       = "usage: simpleswe <controller|worker|tui|task>"
 	controllerUsage = "usage: simpleswe controller --config PATH --database PATH"
-	workerUsage     = "usage: simpleswe worker [--manifest PATH]"
+	workerUsage     = "usage: simpleswe worker [--manifest PATH] | simpleswe worker report (--pull-request NUMBER | --failure REASON)"
 	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
 	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
 	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
@@ -38,6 +38,7 @@ type Dependencies struct {
 	RunController func(context.Context, string, string, io.Writer, io.Writer) error
 	NewWorkspace  func() (string, func() error, error)
 	RunWorker     func(context.Context, string, string, io.Writer, io.Writer) error
+	ReportWorker  func([]string) error
 	RunTUI        func(context.Context, string, string, string, io.Reader, io.Writer, io.Writer) error
 	PortForward   func(context.Context, string, string) (string, func() error, error)
 
@@ -98,6 +99,12 @@ func runController(ctx context.Context, args []string, stdout, stderr io.Writer,
 }
 
 func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
+	if len(args) > 0 && args[0] == "report" {
+		if deps.ReportWorker == nil {
+			return errors.New("worker report runtime is not configured")
+		}
+		return deps.ReportWorker(args[1:])
+	}
 	manifestPath, ok := parseWorkerArgs(args)
 	if !ok {
 		return errors.New(workerUsage)

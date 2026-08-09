@@ -12,9 +12,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/simpleswe/simpleswe/internal/redaction"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
+	"golang.org/x/sys/unix"
 )
 
 // Runner executes one task manifest in a fresh repository workspace.
@@ -29,12 +31,12 @@ type Runner struct {
 const (
 	validationFixPromptLimit = 32 << 10
 	streamChunkBytes         = 8 << 10
-	baseWorkflowInstructions = "You may commit changes locally and must fix any pre-commit hook failures. Do not push commits or branches, merge, create pull requests, or alter pull request metadata; the outer SimpleSWE orchestrator handles those steps."
+	baseWorkflowInstructions = "You own all repository and forge actions for this task. Read the immutable task manifest from $SIMPLESWE_TASK_MANIFEST_PATH for the exact provider, repository, base branch, task branch, requested pull-request title, and any existing pull-request number. Edit the repository, commit all intended changes, commit and push the task branch, and create or update the pull request through the configured forge tooling. Write the pull-request title, body, and useful evidence yourself. For a follow-up, update only the existing pull request and its same branch. After the provider operation is complete, report the pull-request number with `simpleswe worker report --pull-request NUMBER`; report an intentional failure with `simpleswe worker report --failure REASON`."
 )
 
 // Run clones the task repository, invokes OpenCode, validates its changes,
-// and pushes one non-forced task branch.
-func (r Runner) Run(ctx context.Context) error {
+// and verifies OpenCode's published task branch and reported pull request.
+func (r Runner) Run(ctx context.Context) (runErr error) {
 	if ctx == nil {
 		return errors.New("context is nil")
 	}
@@ -47,6 +49,16 @@ func (r Runner) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	manifestPath, err := filepath.Abs(r.ManifestPath)
+	if err != nil {
+		return fmt.Errorf("resolve manifest path: %w", err)
+	}
+	r.ManifestPath = manifestPath
+	restoreIsolation, err := isolateRunnerProcess()
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, restoreIsolation()) }()
 
 	manifest, err := readManifest(r.ManifestPath)
 	if err != nil {
@@ -58,6 +70,11 @@ func (r Runner) Run(ctx context.Context) error {
 	if err := requireFreshWorkspace(r.WorkspaceDir); err != nil {
 		return err
 	}
+	resultDir, err := os.MkdirTemp(filepath.Dir(r.WorkspaceDir), ".simpleswe-worker-result-")
+	if err != nil {
+		return fmt.Errorf("create private worker result directory: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(resultDir) }()
 	r.Secrets = loadSecrets(r.Secrets, strings.Split(os.Getenv(protocol.SecretEnvNamesVariable), ","))
 
 	output := r.Output
@@ -66,65 +83,75 @@ func (r Runner) Run(ctx context.Context) error {
 	}
 	output = &synchronizedWriter{writer: output}
 	run := func(argv []string) (CommandResult, error) {
-		return runStreamingCommand(ctx, r.WorkspaceDir, argv, output, r.Secrets, r.OutputTailBytes)
+		return runContainedStreamingCommandWithEnvironment(ctx, r.WorkspaceDir, argv, output, r.Secrets, r.OutputTailBytes, nil)
 	}
 	runOutsideWorkspace := func(argv []string) (CommandResult, error) {
-		return runStreamingCommand(ctx, "", argv, output, r.Secrets, r.OutputTailBytes)
+		return runContainedStreamingCommandWithEnvironment(ctx, "", argv, output, r.Secrets, r.OutputTailBytes, nil)
 	}
-	runWithEnvironment := func(argv []string, environment map[string]string) (CommandResult, error) {
-		return runStreamingCommandWithEnvironment(ctx, r.WorkspaceDir, argv, output, r.Secrets, r.OutputTailBytes, environment)
+	cloneURL, startCommit, err := prepareRunnerWorkspace(ctx, r.WorkspaceDir, manifest, run, runOutsideWorkspace)
+	if err != nil {
+		return err
 	}
+	candidate, err := r.runAgentValidation(ctx, output, manifest, resultDir, cloneURL, startCommit, run)
+	if err != nil {
+		return err
+	}
+	return r.emitReadyCandidate(ctx, output, manifest, cloneURL, startCommit, candidate, run)
+}
 
+type runnerCommand func([]string) (CommandResult, error)
+
+func prepareRunnerWorkspace(ctx context.Context, workspace string, manifest protocol.TaskManifest, run, runOutsideWorkspace runnerCommand) (string, string, error) {
 	cloneURL := manifest.CloneURL
 	if cloneURL == "" {
 		cloneURL = manifest.Repository
 	}
-	if _, err := runOutsideWorkspace([]string{"git", "clone", "--no-checkout", "--origin", "origin", "--", cloneURL, r.WorkspaceDir}); err != nil {
-		return commandFailure(ctx, "clone repository", err)
+	if _, err := runOutsideWorkspace([]string{"git", "clone", "--no-checkout", "--origin", "origin", "--", cloneURL, workspace}); err != nil {
+		return "", "", commandFailure(ctx, "clone repository", err)
 	}
-	baseRef := "refs/remotes/origin/" + manifest.BaseBranch
-	if _, err := run([]string{"git", "fetch", "--no-tags", "origin", "+refs/heads/" + manifest.BaseBranch + ":" + baseRef}); err != nil {
-		return commandFailure(ctx, "fetch base branch", err)
+	baseRef := "refs/simpleswe/base"
+	if _, err := run([]string{"git", "fetch", "--no-tags", "--", cloneURL, "+refs/heads/" + manifest.BaseBranch + ":" + baseRef}); err != nil {
+		return "", "", commandFailure(ctx, "fetch base branch", err)
 	}
-	baseCommit, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", baseRef + "^{commit}"})
+	startCommit, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", baseRef + "^{commit}"})
 	if err != nil {
-		return fmt.Errorf("resolve base branch: %w", err)
+		return "", "", fmt.Errorf("resolve base branch: %w", err)
 	}
-	if _, err := run([]string{"git", "checkout", "-b", manifest.TaskBranch, baseCommit}); err != nil {
-		return commandFailure(ctx, "check out task branch", err)
+	if manifest.ExistingPullRequestNumber > 0 {
+		followUpRef := "refs/simpleswe/follow-up"
+		if _, err := run([]string{"git", "fetch", "--no-tags", "--", cloneURL, "+refs/heads/" + manifest.TaskBranch + ":" + followUpRef}); err != nil {
+			return "", "", commandFailure(ctx, "fetch existing remote task branch", err)
+		}
+		startCommit, err = commandText(ctx, run, []string{"git", "rev-parse", "--verify", followUpRef + "^{commit}"})
+		if err != nil {
+			return "", "", fmt.Errorf("resolve existing remote task branch: %w", err)
+		}
+		if startCommit != manifest.ExistingPullRequestHeadSHA {
+			return "", "", fmt.Errorf("existing remote task branch %q is %s, want immutable existing pull request head %s", manifest.TaskBranch, startCommit, manifest.ExistingPullRequestHeadSHA)
+		}
 	}
+	if _, err := run([]string{"git", "checkout", "-b", manifest.TaskBranch, startCommit}); err != nil {
+		return "", "", commandFailure(ctx, "check out task branch", err)
+	}
+	return cloneURL, startCommit, nil
+}
 
+func (r Runner) runAgentValidation(ctx context.Context, output io.Writer, manifest protocol.TaskManifest, resultDir, cloneURL, startCommit string, run runnerCommand) (protocol.Event, error) {
 	initialCommand := append(append([]string(nil), manifest.OpenCodeCommand...), agentPrompt(manifest.Prompt))
 	if err := emitEvent(output, r.Secrets, protocol.Event{
-		Type:      protocol.EventAgentStarted,
-		TaskID:    manifest.TaskID,
-		Message:   "initial",
-		Timestamp: time.Now().UTC(),
-		Command:   initialCommand,
+		Type: protocol.EventAgentStarted, TaskID: manifest.TaskID, Message: "initial",
+		Timestamp: time.Now().UTC(), Command: initialCommand,
 	}); err != nil {
-		return err
+		return protocol.Event{}, err
 	}
-	_, err = run(initialCommand)
+	reportedPullRequest, err := r.invokeOpenCode(ctx, output, manifest, resultDir, initialCommand, manifest.ExistingPullRequestNumber)
 	if err != nil {
-		return commandFailure(ctx, "run OpenCode", err)
+		return protocol.Event{}, err
 	}
-	changed, err := repositoryChanged(ctx, run)
+	candidate, err := r.publishCandidate(ctx, output, manifest, cloneURL, startCommit, reportedPullRequest, run)
 	if err != nil {
-		return err
+		return protocol.Event{}, err
 	}
-	if !changed {
-		head, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", "HEAD^{commit}"})
-		if err != nil {
-			return fmt.Errorf("resolve task branch after OpenCode: %w", err)
-		}
-		if head == baseCommit {
-			return fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
-		}
-	}
-	if _, err := run([]string{"git", "merge-base", "--is-ancestor", baseCommit, "HEAD"}); err != nil {
-		return commandFailure(ctx, "verify OpenCode commit ancestry", err)
-	}
-
 	commands := manifest.ValidationCommands
 	if len(commands) == 0 {
 		commands = [][]string{manifest.ValidationCommand}
@@ -133,7 +160,7 @@ func (r Runner) Run(ctx context.Context) error {
 	for attempt := 0; attempt <= manifest.MaxFixAttempts; attempt++ {
 		failure, err := r.runValidationRound(ctx, output, manifest, commands, attempt+1, run)
 		if err != nil {
-			return err
+			return protocol.Event{}, err
 		}
 		if failure == nil {
 			lastFailure = nil
@@ -141,7 +168,7 @@ func (r Runner) Run(ctx context.Context) error {
 				Type: protocol.EventValidationSucceeded, TaskID: manifest.TaskID,
 				Message: fmt.Sprintf("attempt %d", attempt+1), Timestamp: time.Now().UTC(),
 			}); err != nil {
-				return err
+				return protocol.Event{}, err
 			}
 			break
 		}
@@ -149,82 +176,154 @@ func (r Runner) Run(ctx context.Context) error {
 		if attempt == manifest.MaxFixAttempts {
 			break
 		}
-
-		fixPrompt := validationFixPrompt(failure.summary)
-		fixCommand := append(append([]string(nil), manifest.OpenCodeCommand...), agentPrompt(fixPrompt))
+		fixCommand := append(append([]string(nil), manifest.OpenCodeCommand...), agentPrompt(validationFixPrompt(failure.summary, reportedPullRequest)))
 		if err := emitEvent(output, r.Secrets, protocol.Event{
-			Type:      protocol.EventAgentStarted,
-			TaskID:    manifest.TaskID,
-			Message:   "validation_fix",
-			Timestamp: time.Now().UTC(),
-			Command:   fixCommand,
+			Type: protocol.EventAgentStarted, TaskID: manifest.TaskID, Message: "validation_fix",
+			Timestamp: time.Now().UTC(), Command: fixCommand,
 		}); err != nil {
-			return err
+			return protocol.Event{}, err
 		}
-		_, err = run(fixCommand)
+		reportedPullRequest, err = r.invokeOpenCode(ctx, output, manifest, resultDir, fixCommand, reportedPullRequest)
 		if err != nil {
-			return commandFailure(ctx, "run OpenCode validation fix", err)
+			return protocol.Event{}, err
+		}
+		candidate, err = r.publishCandidate(ctx, output, manifest, cloneURL, startCommit, reportedPullRequest, run)
+		if err != nil {
+			return protocol.Event{}, err
 		}
 	}
-	if lastFailure != nil {
-		if err := emitEvent(output, r.Secrets, protocol.Event{
-			Type: protocol.EventValidationFailed, TaskID: manifest.TaskID,
-			Message: lastFailure.summary, Timestamp: time.Now().UTC(),
-			Command: lastFailure.command, ExitCode: lastFailure.exitCode,
-		}); err != nil {
-			return err
-		}
-		return fmt.Errorf("validation failed after %d attempts: %s", manifest.MaxFixAttempts+1, lastFailure.summary)
+	if lastFailure == nil {
+		return candidate, nil
 	}
+	if err := emitEvent(output, r.Secrets, protocol.Event{
+		Type: protocol.EventValidationFailed, TaskID: manifest.TaskID,
+		Message: lastFailure.summary, Timestamp: time.Now().UTC(),
+		Command: lastFailure.command, ExitCode: lastFailure.exitCode,
+	}); err != nil {
+		return protocol.Event{}, err
+	}
+	return protocol.Event{}, fmt.Errorf("validation failed after %d attempts: %s", manifest.MaxFixAttempts+1, lastFailure.summary)
+}
 
+func (r Runner) invokeOpenCode(ctx context.Context, output io.Writer, manifest protocol.TaskManifest, resultDir string, command []string, expectedPullRequest int) (int, error) {
+	resultFile, err := os.CreateTemp(resultDir, "result-*.json")
+	if err != nil {
+		return 0, fmt.Errorf("reserve private OpenCode result path: %w", err)
+	}
+	resultPath := resultFile.Name()
+	if err := errors.Join(resultFile.Close(), os.Remove(resultPath)); err != nil {
+		return 0, fmt.Errorf("prepare fresh OpenCode result path: %w", err)
+	}
+	result, runErr := runContainedStreamingCommandWithEnvironment(ctx, r.WorkspaceDir, command, output, r.Secrets, r.OutputTailBytes, map[string]string{
+		WorkerResultPathVariable: resultPath, "SIMPLESWE_TASK_MANIFEST_PATH": r.ManifestPath,
+	})
+	if err := ctx.Err(); err != nil {
+		return 0, fmt.Errorf("run OpenCode canceled: %w", err)
+	}
+	reported, reportErr := readWorkerResult(resultPath)
+	invocationErr := workerInvocationError(ctx, reported, reportErr, runErr, result, expectedPullRequest)
+	if invocationErr == nil {
+		return reported.PullRequestNumber, nil
+	}
+	message := boundedWorkerFailureMessage(invocationErr.Error(), r.Secrets)
+	emitErr := emitEvent(output, nil, protocol.Event{
+		Type: protocol.EventWorkerFailed, TaskID: manifest.TaskID, Message: message,
+		Timestamp: time.Now().UTC(), ExitCode: result.ExitCode,
+	})
+	return 0, errors.Join(errors.New(message), emitErr)
+}
+
+func workerInvocationError(ctx context.Context, reported workerResult, reportErr, runErr error, result CommandResult, expectedPullRequest int) error {
+	switch {
+	case errors.Is(reportErr, os.ErrNotExist):
+		return errors.New("OpenCode did not report a pull request")
+	case reportErr != nil:
+		return reportErr
+	case reported.Outcome == workerOutcomeFailed:
+		return fmt.Errorf("OpenCode reported failure: %s", reported.Reason)
+	case expectedPullRequest > 0 && reported.PullRequestNumber != expectedPullRequest:
+		return fmt.Errorf("OpenCode reported pull request %d, want pull request %d", reported.PullRequestNumber, expectedPullRequest)
+	case runErr != nil:
+		return commandFailure(ctx, "run OpenCode", fmt.Errorf("%w (exit code %d)", runErr, result.ExitCode))
+	default:
+		return nil
+	}
+}
+
+func (r Runner) publishCandidate(ctx context.Context, output io.Writer, manifest protocol.TaskManifest, cloneURL, startCommit string, reportedPullRequest int, run runnerCommand) (protocol.Event, error) {
+	candidate, err := verifyPublishedCandidate(ctx, manifest, cloneURL, startCommit, reportedPullRequest, "", run)
+	if err != nil {
+		return protocol.Event{}, err
+	}
+	if err := emitEvent(output, r.Secrets, candidate); err != nil {
+		return protocol.Event{}, err
+	}
+	return candidate, nil
+}
+
+func (r Runner) emitReadyCandidate(ctx context.Context, output io.Writer, manifest protocol.TaskManifest, cloneURL, startCommit string, candidate protocol.Event, run runnerCommand) error {
+	verified, err := verifyPublishedCandidate(ctx, manifest, cloneURL, startCommit, candidate.PullRequestNumber, candidate.CommitSHA, run)
+	if err != nil {
+		return err
+	}
+	verified.Type = protocol.EventPullRequestReady
+	verified.Timestamp = time.Now().UTC()
+	if err := protocol.ValidateEvent(verified, manifest.TaskBranch); err != nil {
+		return fmt.Errorf("validate pull_request_ready event: %w", err)
+	}
+	return emitEvent(output, r.Secrets, verified)
+}
+
+func verifyPublishedCandidate(ctx context.Context, manifest protocol.TaskManifest, cloneURL, startCommit string, reportedPullRequest int, expectedCommit string, run runnerCommand) (protocol.Event, error) {
+	dirty, err := repositoryChanged(ctx, run)
+	if err != nil {
+		return protocol.Event{}, err
+	}
+	if dirty {
+		return protocol.Event{}, errors.New("worktree must be clean after successful OpenCode report and validation")
+	}
 	head, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", "HEAD^{commit}"})
 	if err != nil {
-		return fmt.Errorf("resolve task branch: %w", err)
+		return protocol.Event{}, fmt.Errorf("resolve task branch: %w", err)
 	}
-	if _, err := run([]string{"git", "merge-base", "--is-ancestor", baseCommit, "HEAD"}); err != nil {
-		return commandFailure(ctx, "verify task branch ancestry", err)
+	if _, err := run([]string{"git", "merge-base", "--is-ancestor", startCommit, "HEAD"}); err != nil {
+		return protocol.Event{}, commandFailure(ctx, "verify attempt start is ancestor of task branch", err)
 	}
-	if _, err := run([]string{"git", "add", "--all", "--", "."}); err != nil {
-		return commandFailure(ctx, "stage repository changes", err)
+	if head == startCommit {
+		return protocol.Event{}, fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
 	}
-	staged, err := hasStagedChanges(ctx, run)
+	if expectedCommit != "" && head != expectedCommit {
+		return protocol.Event{}, fmt.Errorf("validation changed local HEAD from published candidate %s to %s", expectedCommit, head)
+	}
+	branch, err := commandText(ctx, run, []string{"git", "symbolic-ref", "--short", "HEAD"})
 	if err != nil {
-		return err
+		return protocol.Event{}, fmt.Errorf("resolve checked-out task branch: %w", err)
 	}
-	if !staged && head == baseCommit {
-		return fmt.Errorf("%w: OpenCode did not modify the repository", ErrNoChanges)
-	}
-	if staged {
-		commitMessage := "chore: complete SimpleSWE task " + manifest.TaskID
-		commitEnvironment := map[string]string{
-			"GIT_AUTHOR_NAME": "simpleswe", "GIT_AUTHOR_EMAIL": "simpleswe@localhost",
-			"GIT_COMMITTER_NAME": "simpleswe", "GIT_COMMITTER_EMAIL": "simpleswe@localhost",
-		}
-		if _, err := runWithEnvironment([]string{"git", "-c", "user.name=simpleswe", "-c", "user.email=simpleswe@localhost", "commit", "-m", commitMessage}, commitEnvironment); err != nil {
-			return commandFailure(ctx, "commit task changes", err)
-		}
-	}
-	commit, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", "HEAD^{commit}"})
-	if err != nil {
-		return fmt.Errorf("resolve task commit: %w", err)
-	}
-	if _, err := run([]string{"git", "merge-base", "--is-ancestor", baseCommit, commit}); err != nil {
-		return commandFailure(ctx, "verify committed branch ancestry", err)
+	if branch != manifest.TaskBranch {
+		return protocol.Event{}, fmt.Errorf("checked-out branch %q does not match task branch %q", branch, manifest.TaskBranch)
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return protocol.Event{}, fmt.Errorf("verify published task branch canceled: %w", err)
 	}
-	if _, err := run([]string{"git", "push", "origin", "HEAD:refs/heads/" + manifest.TaskBranch}); err != nil {
-		return commandFailure(ctx, "push task branch", err)
+	verifiedTaskRef := "refs/simpleswe/verified-task"
+	if _, err := run([]string{"git", "fetch", "--no-tags", "--", cloneURL, "+refs/heads/" + manifest.TaskBranch + ":" + verifiedTaskRef}); err != nil {
+		return protocol.Event{}, commandFailure(ctx, "fetch remote task branch", err)
 	}
-	branchEvent := protocol.Event{
-		Type: protocol.EventBranchPushed, TaskID: manifest.TaskID, Timestamp: time.Now().UTC(),
-		Branch: manifest.TaskBranch, CommitSHA: commit,
+	remoteHead, err := commandText(ctx, run, []string{"git", "rev-parse", "--verify", verifiedTaskRef + "^{commit}"})
+	if err != nil {
+		return protocol.Event{}, fmt.Errorf("resolve remote task branch: %w", err)
 	}
-	if err := protocol.ValidateEvent(branchEvent, manifest.TaskBranch); err != nil {
-		return fmt.Errorf("validate branch_pushed event: %w", err)
+	if remoteHead != head {
+		return protocol.Event{}, fmt.Errorf("remote task branch %q is %s, want local HEAD %s", manifest.TaskBranch, remoteHead, head)
 	}
-	return emitEvent(output, r.Secrets, branchEvent)
+	candidate := protocol.Event{
+		Type: protocol.EventPullRequestPublished, TaskID: manifest.TaskID, Timestamp: time.Now().UTC(),
+		PullRequestNumber: reportedPullRequest, Branch: manifest.TaskBranch, CommitSHA: head,
+	}
+	if err := protocol.ValidateEvent(candidate, manifest.TaskBranch); err != nil {
+		return protocol.Event{}, fmt.Errorf("validate pull_request_published event: %w", err)
+	}
+	return candidate, nil
 }
 
 type validationFailure struct {
@@ -308,11 +407,99 @@ func loadSecrets(values, environmentNames []string) []string {
 	return redaction.ExpandSecrets(loaded)
 }
 
-func validationFixPrompt(failure string) string {
-	const header = "Validation failed. Fix the repository so all validation commands pass.\n\n"
+func validationFixPrompt(failure string, pullRequestNumber int) string {
+	header := fmt.Sprintf("Validation failed. Fix the repository so all validation commands pass. Commit and push the repair, update the same pull request %d, then report pull request %d.\n\n", pullRequestNumber, pullRequestNumber)
 	tail := newTailBuffer(validationFixPromptLimit - len(header))
 	_, _ = tail.Write([]byte(failure))
 	return header + tail.String()
+}
+
+func boundedWorkerFailureMessage(message string, secrets []string) string {
+	message = strings.ToValidUTF8(redaction.Redact(message, secrets), "\uFFFD")
+	if len(message) <= protocol.MaxWorkerEventMessageLen {
+		return message
+	}
+	keep := protocol.MaxWorkerEventMessageLen - len(OutputTruncatedMarker)
+	start := len(message) - keep
+	for start < len(message) && !utf8.RuneStart(message[start]) {
+		start++
+	}
+	return OutputTruncatedMarker + message[start:]
+}
+
+func readWorkerResult(path string) (_ workerResult, resultErr error) {
+	defer func() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove OpenCode worker result: %w", err))
+		}
+	}()
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return workerResult{}, fmt.Errorf("read OpenCode worker result: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer func() { resultErr = errors.Join(resultErr, file.Close()) }()
+	var before unix.Stat_t
+	if err := unix.Fstat(fd, &before); err != nil {
+		return workerResult{}, fmt.Errorf("inspect OpenCode worker result: %w", err)
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return workerResult{}, errors.New("OpenCode worker result is not a regular file")
+	}
+	if int64(before.Uid) != int64(os.Geteuid()) {
+		return workerResult{}, errors.New("OpenCode worker result has an unexpected owner")
+	}
+	if before.Nlink != 1 {
+		return workerResult{}, errors.New("OpenCode worker result is not a fresh file")
+	}
+	if before.Size < 0 || before.Size > int64(maxWorkerResultEncodedBytes) {
+		return workerResult{}, errors.New("OpenCode worker result is too large")
+	}
+	if err := requireWorkerResultPath(path, before); err != nil {
+		return workerResult{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, int64(maxWorkerResultEncodedBytes+1)))
+	if err != nil {
+		return workerResult{}, fmt.Errorf("read OpenCode worker result: %w", err)
+	}
+	if len(data) > maxWorkerResultEncodedBytes {
+		return workerResult{}, errors.New("OpenCode worker result is too large")
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		return workerResult{}, fmt.Errorf("reinspect OpenCode worker result: %w", err)
+	}
+	if before.Dev != after.Dev || before.Ino != after.Ino || before.Size != after.Size || int64(len(data)) != after.Size {
+		return workerResult{}, errors.New("OpenCode worker result changed while being read")
+	}
+	if err := requireWorkerResultPath(path, after); err != nil {
+		return workerResult{}, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var result workerResult
+	if err := decoder.Decode(&result); err != nil {
+		return workerResult{}, fmt.Errorf("decode OpenCode worker result: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return workerResult{}, errors.New("decode OpenCode worker result: multiple JSON values")
+	}
+	if err := validateWorkerResult(result); err != nil {
+		return workerResult{}, fmt.Errorf("validate OpenCode worker result: %w", err)
+	}
+	return result, nil
+}
+
+func requireWorkerResultPath(path string, opened unix.Stat_t) error {
+	var current unix.Stat_t
+	if err := unix.Fstatat(unix.AT_FDCWD, path, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("inspect OpenCode worker result path: %w", err)
+	}
+	if current.Mode&unix.S_IFMT != unix.S_IFREG || current.Dev != opened.Dev || current.Ino != opened.Ino {
+		return errors.New("OpenCode worker result is not the file at the expected path")
+	}
+	return nil
 }
 
 func readManifest(path string) (protocol.TaskManifest, error) {
@@ -384,20 +571,6 @@ func repositoryChanged(ctx context.Context, run func([]string) (CommandResult, e
 	return result.Stdout != "", nil
 }
 
-func hasStagedChanges(ctx context.Context, run func([]string) (CommandResult, error)) (bool, error) {
-	result, err := run([]string{"git", "diff", "--cached", "--quiet", "--exit-code"})
-	if err == nil {
-		return false, nil
-	}
-	if ctx.Err() != nil {
-		return false, ctx.Err()
-	}
-	if result.ExitCode == 1 {
-		return true, nil
-	}
-	return false, fmt.Errorf("inspect staged changes: %w", err)
-}
-
 func commandText(ctx context.Context, run func([]string) (CommandResult, error), command []string) (string, error) {
 	result, err := run(command)
 	if err != nil {
@@ -413,14 +586,13 @@ func commandFailure(ctx context.Context, operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-func runStreamingCommand(ctx context.Context, dir string, command []string, output io.Writer, secrets []string, outputLimit int) (CommandResult, error) {
-	return runStreamingCommandWithEnvironment(ctx, dir, command, output, secrets, outputLimit, nil)
-}
-
-func runStreamingCommandWithEnvironment(ctx context.Context, dir string, command []string, output io.Writer, secrets []string, outputLimit int, environment map[string]string) (CommandResult, error) {
+func runContainedStreamingCommandWithEnvironment(ctx context.Context, dir string, command []string, output io.Writer, secrets []string, outputLimit int, environment map[string]string) (CommandResult, error) {
 	stdout := &readableStream{output: output, name: "stdout", secrets: secrets}
 	stderr := &readableStream{output: output, name: "stderr", secrets: secrets}
-	result, runErr := runCommandInDirWithOutputEnv(ctx, dir, command, stdout, stderr, outputLimit, environment)
+	result, runErr := runContainedCommandInDirWithOutputEnv(ctx, dir, command, stdout, stderr, outputLimit, environment)
+	if errors.Is(runErr, errCommandOutputDrain) {
+		return result, runErr
+	}
 	if err := errors.Join(stdout.flush(), stderr.flush()); err != nil {
 		return result, err
 	}

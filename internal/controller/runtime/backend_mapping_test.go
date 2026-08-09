@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/url"
@@ -161,7 +162,7 @@ func TestBackendModelsAndPayloadOmitSlackFields(t *testing.T) {
 }
 
 func TestBackendMapsDurableResultsEventsAndKubernetesResources(t *testing.T) {
-	db, taskRecord, attempt, _ := backendStore(t)
+	db, taskRecord, attempt, path := backendStore(t)
 	ctx := context.Background()
 	from := task.QUEUED
 	for _, to := range []task.State{task.CREATING_JOB, task.JOB_PENDING, task.RUNNING, task.AGENT_RUNNING, task.VALIDATING} {
@@ -177,8 +178,16 @@ func TestBackendMapsDurableResultsEventsAndKubernetesResources(t *testing.T) {
 	if err := db.RecordValidationResult(ctx, taskRecord.ID, attempt.ID, "go test ./...", "package failed", 1); err != nil {
 		t.Fatalf("record validation: %v", err)
 	}
-	if err := db.RecordGitResult(ctx, store.GitResult{AttemptID: attempt.ID, State: "failed", Branch: "simpleswe/fix", CommitSHA: strings.Repeat("a", 40), Error: "push rejected"}); err != nil {
-		t.Fatalf("record Git result: %v", err)
+	fixtureDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open fixture database: %v", err)
+	}
+	if _, err := fixtureDB.ExecContext(ctx, `INSERT INTO git_results (attempt_id, state, branch, commit_sha, error) VALUES (?, 'failed', 'simpleswe/fix', ?, 'push rejected')`, attempt.ID, strings.Repeat("a", 40)); err != nil {
+		_ = fixtureDB.Close()
+		t.Fatalf("insert failed Git fixture: %v", err)
+	}
+	if err := fixtureDB.Close(); err != nil {
+		t.Fatalf("close fixture database: %v", err)
 	}
 	started := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	completed := started.Add(time.Minute)
@@ -228,5 +237,34 @@ func TestBackendMapsDurableResultsEventsAndKubernetesResources(t *testing.T) {
 	})
 	if event["resource_identity"].(map[string]any)["kind"] != "Pod" || event["error"].(map[string]any)["code"] != "worker_failed" {
 		t.Fatalf("event model = %#v", event)
+	}
+}
+
+func TestBackendMapsCandidateAsInProgress(t *testing.T) {
+	db, taskRecord, attempt, path := backendStore(t)
+	fixtureDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fixtureDB.Close()
+	branch, sha := "simpleswe/candidate", strings.Repeat("a", 40)
+	if _, err := fixtureDB.ExecContext(t.Context(), `INSERT INTO git_results (attempt_id, state, branch, commit_sha) VALUES (?, 'candidate', ?, ?)`, attempt.ID, branch, sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixtureDB.ExecContext(t.Context(), `UPDATE pull_requests SET state = 'reported', number = 42, url = '', title = '', head_branch = ?, base_branch = 'main' WHERE attempt_id = ?`, branch, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := NewBackend(db, newFakeController(db)).GetTask(t.Context(), taskRecord.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var model map[string]any
+	if err := json.Unmarshal(payload, &model); err != nil {
+		t.Fatal(err)
+	}
+	git := model["git_result"].(map[string]any)
+	pullRequest := model["pull_request"].(map[string]any)
+	if git["state"] != "running" || pullRequest["state"] != "creating" || pullRequest["number"] != float64(42) {
+		t.Fatalf("candidate API mapping = %#v / %#v", git, pullRequest)
 	}
 }

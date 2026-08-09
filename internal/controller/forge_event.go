@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
+	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
 
 type forgeMatch uint8
@@ -57,12 +57,19 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 				processed[sibling.ID] = true
 			}
 			if err := c.recoverRunningForgeEvent(ctx, event); err != nil {
-				for _, sibling := range associated {
-					if sibling.Status != store.ForgeEventRunning || sibling.NextAttemptAt != nil && sibling.NextAttemptAt.After(time.Now().UTC()) {
-						continue
-					}
-					if persistErr := c.persistForgeEventFailure(ctx, sibling, "recover", err); persistErr != nil {
+				if forge.IsPermanent(err) {
+					if persistErr := c.persistForgeEventFailure(ctx, event, "recover", err); persistErr != nil {
 						persistenceErrors = append(persistenceErrors, persistErr)
+					}
+					continue
+				}
+				if persistErr := c.persistForgeEventBatchFailure(ctx, runningForgeEvents(associated), "recover", err); persistErr != nil {
+					persistenceErrors = append(persistenceErrors, persistErr)
+				}
+			} else {
+				for _, sibling := range associated {
+					if deferErr := c.store.DeferForgeEvent(ctx, sibling.ID, store.ForgeEventRunning); deferErr != nil {
+						persistenceErrors = append(persistenceErrors, deferErr)
 					}
 				}
 			}
@@ -89,6 +96,9 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 			continue
 		}
 		if match == forgeSettling {
+			if err := c.store.DeferForgeEvent(ctx, event.ID, store.ForgeEventPending); err != nil {
+				persistenceErrors = append(persistenceErrors, err)
+			}
 			continue
 		}
 		if match == forgeDefinitelyUnowned {
@@ -106,19 +116,47 @@ func (c *Controller) ProcessForgeEvents(ctx context.Context) error {
 			if errors.Is(err, store.ErrForgeEventNotDue) {
 				continue
 			}
-			for _, selected := range batch {
-				if persistErr := c.persistForgeEventFailure(ctx, selected, "start", err); persistErr != nil {
-					persistenceErrors = append(persistenceErrors, persistErr)
-				}
+			if persistErr := c.persistForgeEventBatchFailure(ctx, batch, "start", err); persistErr != nil {
+				persistenceErrors = append(persistenceErrors, persistErr)
 			}
 		}
 	}
 	return errors.Join(persistenceErrors...)
 }
 
+func (c *Controller) persistForgeEventBatchFailure(ctx context.Context, events []store.ForgeEvent, operation string, cause error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("persist forge event batch failure: %w", ctx.Err())
+	}
+	var persistenceError forgeEventPersistenceError
+	if errors.As(cause, &persistenceError) {
+		return cause
+	}
+	eventIDs := make([]string, len(events))
+	for i := range events {
+		eventIDs[i] = events[i].ID
+	}
+	permanent := forge.IsPermanent(cause)
+	var err error
+	if permanent {
+		err = c.store.FailForgeEventBatch(ctx, eventIDs, cause)
+	} else {
+		err = c.store.RecordForgeEventBatchErrorAfter(ctx, eventIDs, cause, forge.RetryDelay(cause))
+	}
+	if err != nil {
+		return forgeEventPersistenceError{fmt.Errorf("persist forge event batch %s failure: %w", operation, errors.Join(cause, err))}
+	}
+	message := "forge event batch processing deferred"
+	if permanent {
+		message = "forge event batch processing permanently failed"
+	}
+	c.logger.ErrorContext(ctx, message, "forge_events", eventIDs, "operation", operation, "permanent", permanent, "error", cause)
+	return nil
+}
+
 func (c *Controller) persistForgeEventFailure(ctx context.Context, event store.ForgeEvent, operation string, cause error) error {
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return fmt.Errorf("persist forge event failure: %w", ctx.Err())
 	}
 	var persistenceError forgeEventPersistenceError
 	if errors.As(cause, &persistenceError) {
@@ -127,10 +165,7 @@ func (c *Controller) persistForgeEventFailure(ctx context.Context, event store.F
 	permanent := forge.IsPermanent(cause)
 	var err error
 	if permanent {
-		if _, err := c.store.RequestForgeEventCancellation(ctx, event.ID); err != nil {
-			return forgeEventPersistenceError{fmt.Errorf("persist forge event %q %s cancellation: %w", event.ID, operation, errors.Join(cause, err))}
-		}
-		err = c.store.MarkForgeEventFailed(ctx, event.ID, cause)
+		err = c.store.FailForgeEvent(ctx, event.ID, cause)
 	} else {
 		err = c.store.RecordForgeEventErrorAfter(ctx, event.ID, cause, forge.RetryDelay(cause))
 	}
@@ -193,7 +228,7 @@ func (c *Controller) startForgeEvent(ctx context.Context, events []store.ForgeEv
 			}
 			return fmt.Errorf("get durable pull request: %w", err)
 		}
-		if !validDurablePullRequestURL(pullRequest.URL) {
+		if err := forge.ValidatePullRequestMetadata(pullRequest.URL, "durable pull request"); err != nil {
 			unlock()
 			return fmt.Errorf("validate durable pull request URL: %w", forge.MarkPermanent(fmt.Errorf("%w: current durable pull request URL is invalid", store.ErrConflict)))
 		}
@@ -212,7 +247,7 @@ func (c *Controller) startForgeEvent(ctx context.Context, events []store.ForgeEv
 		return err
 	}
 	if len(plan.Attempt.ResourceSnapshot) == 0 {
-		plan.Attempt, _, _, err = c.buildAttemptSnapshot(current, plan.Attempt, repository)
+		plan.Attempt, _, _, err = c.buildAttemptSnapshot(ctx, current, plan.Attempt, repository)
 		if err != nil {
 			unlock()
 			return err
@@ -233,17 +268,10 @@ func (c *Controller) startForgeEvent(ctx context.Context, events []store.ForgeEv
 	return err
 }
 
-func verifyLivePullRequest(live forge.PullRequestState, durable store.PullRequest, target forge.Target, headSHA string) error {
-	if err := verifyLivePullRequestIdentity(live, durable, target); err != nil {
-		return err
-	}
-	if !providerCommitMatchesDurable(live.HeadSHA, headSHA) {
-		return forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q does not match durable pushed SHA %q", store.ErrConflict, live.HeadSHA, headSHA))
-	}
-	return nil
-}
-
 func verifyLivePullRequestIdentity(live forge.PullRequestState, durable store.PullRequest, target forge.Target) error {
+	if err := forge.ValidatePullRequestMetadata(live.HTMLURL, live.Title); err != nil {
+		return fmt.Errorf("invalid provider pull request metadata: %w", forge.MarkPermanent(fmt.Errorf("%w: %w", store.ErrConflict, err)))
+	}
 	if live.State != "open" {
 		return forge.MarkPermanent(fmt.Errorf("%w: pull request %d is %q at provider", store.ErrConflict, durable.Number, live.State))
 	}
@@ -251,41 +279,10 @@ func verifyLivePullRequestIdentity(live forge.PullRequestState, durable store.Pu
 		!strings.EqualFold(live.SourceOwner, target.Owner) || !strings.EqualFold(live.SourceRepository, target.Repository) {
 		return forge.MarkPermanent(fmt.Errorf("%w: provider pull request identity or refs no longer match durable ownership", store.ErrConflict))
 	}
+	if err := validateProviderPullRequestURL(live.HTMLURL, target, durable.Number); err != nil {
+		return fmt.Errorf("provider pull request URL: %w", forge.MarkPermanent(fmt.Errorf("%w: %w", store.ErrConflict, err)))
+	}
 	return nil
-}
-
-func (c *Controller) latestPushedPullRequestGitResult(ctx context.Context, taskID string, durable store.PullRequest, excludeAttemptID string) (store.GitResult, error) {
-	attempts, err := c.store.ListAttempts(ctx, taskID)
-	if err != nil {
-		return store.GitResult{}, err
-	}
-	for i := len(attempts) - 1; i >= 0; i-- {
-		attempt := attempts[i]
-		if attempt.ID == excludeAttemptID {
-			continue
-		}
-		candidatePR, err := c.store.GetPullRequest(ctx, attempt.ID)
-		if errors.Is(err, store.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return store.GitResult{}, err
-		}
-		if candidatePR.State != "open" || candidatePR.Number != durable.Number || candidatePR.HeadBranch != durable.HeadBranch || candidatePR.BaseBranch != durable.BaseBranch {
-			continue
-		}
-		git, err := c.store.GetGitResult(ctx, attempt.ID)
-		if errors.Is(err, store.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return store.GitResult{}, err
-		}
-		if git.State == "pushed" && git.Branch == durable.HeadBranch && strings.TrimSpace(git.CommitSHA) != "" {
-			return git, nil
-		}
-	}
-	return store.GitResult{}, fmt.Errorf("%w: task %q has no durable pushed Git result for pull request %d", store.ErrNotFound, taskID, durable.Number)
 }
 
 func (c *Controller) verifyAttemptProviderOwnership(ctx context.Context, record store.Task, attempt store.Attempt, excludeAttemptID string) error {
@@ -300,12 +297,25 @@ func (c *Controller) verifyAttemptProviderOwnership(ctx context.Context, record 
 	if err != nil {
 		return err
 	}
-	durableHead, err := c.latestPushedPullRequestGitResult(ctx, record.ID, pullRequest, excludeAttemptID)
+	durableHead, err := c.store.LatestPullRequestGitResult(ctx, record.ID, pullRequest, excludeAttemptID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return forge.MarkPermanent(err)
 		}
 		return err
+	}
+	var priorHead store.GitResult
+	currentGit, currentGitErr := c.store.GetGitResult(ctx, attempt.ID)
+	if currentGitErr == nil && currentGit.State == "candidate" && currentGit.Branch == pullRequest.HeadBranch && protocol.FullLowerGitObjectID(currentGit.CommitSHA) {
+		durableHead = currentGit
+	} else if currentGitErr != nil && !errors.Is(currentGitErr, store.ErrNotFound) {
+		return fmt.Errorf("get current Git result: %w", currentGitErr)
+	}
+	if durableHead.State == "candidate" {
+		priorHead, err = c.store.LatestVerifiedPullRequestGitResult(ctx, record.ID, pullRequest, durableHead.AttemptID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("latest pushed pull request Git result: %w", err)
+		}
 	}
 	providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
 	live, err := c.pullRequests.GetPullRequest(providerCtx, target, pullRequest.Number)
@@ -313,7 +323,25 @@ func (c *Controller) verifyAttemptProviderOwnership(ctx context.Context, record 
 	if err != nil {
 		return fmt.Errorf("inspect current pull request: %w", err)
 	}
-	return verifyLivePullRequest(live, pullRequest, target, durableHead.CommitSHA)
+	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
+		return err
+	}
+	if !validLiveProviderCommit(live.HeadSHA) {
+		return fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID", store.ErrConflict, live.HeadSHA)))
+	}
+	if liveProviderCommitExactlyMatchesDurable(live.HeadSHA, durableHead.CommitSHA) {
+		return nil
+	}
+	if priorHead.CommitSHA != "" && liveProviderCommitExactlyMatchesDurable(live.HeadSHA, priorHead.CommitSHA) {
+		return fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for candidate SHA %q", priorHead.CommitSHA, durableHead.CommitSHA)
+	}
+	if durableHead.State == "candidate" && candidateReplacementMaySettle(record, attempt) {
+		return fmt.Errorf("provider pull request head SHA %q may be a replacement for active candidate SHA %q; waiting for durable worker event", live.HeadSHA, durableHead.CommitSHA)
+	}
+	if priorHead.CommitSHA != "" {
+		return fmt.Errorf("candidate lineage drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither candidate SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, durableHead.CommitSHA, priorHead.CommitSHA)))
+	}
+	return fmt.Errorf("durable lineage drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q does not match durable SHA %q", store.ErrConflict, live.HeadSHA, durableHead.CommitSHA)))
 }
 
 func (c *Controller) recoverRunningForgeEvent(ctx context.Context, event store.ForgeEvent) error {
@@ -380,7 +408,7 @@ func (c *Controller) recoverRunningForgeEvent(ctx context.Context, event store.F
 	}
 	git, gitErr := c.store.GetGitResult(ctx, attempt.ID)
 	if gitErr == nil && git.State == "pushed" && git.Branch != "" && git.CommitSHA != "" {
-		err = c.completeForgeEventLocked(ctx, record, attempt)
+		err = c.completeForgeEventLocked(ctx, record, attempt, false)
 		unlock()
 		return err
 	}
@@ -448,6 +476,9 @@ func (c *Controller) matchForgeEvent(ctx context.Context, event store.ForgeEvent
 }
 
 func (c *Controller) forgeEventMatchesTask(ctx context.Context, event store.ForgeEvent, record store.Task) (forgeMatch, error) {
+	if record.CancellationRequested || record.State == task.FAILED || record.State == task.CANCELLED {
+		return forgeDefinitelyUnowned, nil
+	}
 	attempt, err := c.store.CurrentAttempt(ctx, record.ID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -459,6 +490,13 @@ func (c *Controller) forgeEventMatchesTask(ctx context.Context, event store.Forg
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return forgeDefinitelyUnowned, err
 	}
+	git, gitErr := c.store.GetGitResult(ctx, attempt.ID)
+	if gitErr != nil && !errors.Is(gitErr, store.ErrNotFound) {
+		return forgeDefinitelyUnowned, fmt.Errorf("get forge ownership Git result: %w", gitErr)
+	}
+	if gitErr == nil && git.State == "candidate" {
+		return c.forgeEventMaySettle(ctx, event, record, attempt, pullRequest)
+	}
 	if err == nil && pullRequest.State == "open" && pullRequest.Number > 0 && pullRequest.HeadBranch != "" {
 		if event.Kind != "quality_gate_failed" {
 			if event.PullRequestNumber == pullRequest.Number {
@@ -468,8 +506,8 @@ func (c *Controller) forgeEventMatchesTask(ctx context.Context, event store.Forg
 		}
 		return c.qualityEventMatchesOpenPullRequest(ctx, event, record, attempt, pullRequest)
 	}
-	if (err == nil && pullRequest.State == "creating") || forgeOwnershipMaySettle(record.State) {
-		return c.forgeEventMaySettle(ctx, event, attempt, pullRequest)
+	if (err == nil && (pullRequest.State == "creating" || pullRequest.State == "reported")) || forgeOwnershipMaySettle(record.State) {
+		return c.forgeEventMaySettle(ctx, event, record, attempt, pullRequest)
 	}
 	return forgeDefinitelyUnowned, nil
 }
@@ -506,7 +544,7 @@ func (c *Controller) qualityEventMatchesOpenPullRequest(ctx context.Context, eve
 			continue
 		}
 		currentHasPushed = candidate.ID == current.ID
-		if providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
+		if webhookCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
 			return forgeOwned, nil
 		}
 		break
@@ -517,21 +555,39 @@ func (c *Controller) qualityEventMatchesOpenPullRequest(ctx context.Context, eve
 	return forgeDefinitelyUnowned, nil
 }
 
-func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeEvent, attempt store.Attempt, pullRequest store.PullRequest) (forgeMatch, error) {
-	branch := pullRequest.HeadBranch
-	if branch == "" {
-		manifest, err := attemptManifest(attempt)
-		if err != nil {
-			return forgeDefinitelyUnowned, nil
-		}
-		branch = manifest.TaskBranch
+func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeEvent, record store.Task, attempt store.Attempt, pullRequest store.PullRequest) (forgeMatch, error) {
+	manifest, err := attemptManifest(attempt)
+	if err != nil {
+		manifest = protocol.TaskManifest{}
+	}
+	if manifest.TaskBranch == "" {
+		return forgeDefinitelyUnowned, nil
+	}
+	if !strings.EqualFold(event.Provider, manifest.ForgeProvider) || !strings.EqualFold(event.Owner, manifest.ForgeOwner) || !strings.EqualFold(event.Repository, manifest.ForgeRepository) {
+		return forgeDefinitelyUnowned, nil
+	}
+	branch := manifest.TaskBranch
+	if pullRequest.HeadBranch != "" && pullRequest.HeadBranch != branch || pullRequest.BaseBranch != "" && pullRequest.BaseBranch != manifest.BaseBranch {
+		return forgeDefinitelyUnowned, nil
 	}
 	if event.Branch != "" && branch != "" && event.Branch != branch {
 		return forgeDefinitelyUnowned, nil
 	}
+	if pullRequest.Number > 0 && event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number {
+		return forgeDefinitelyUnowned, nil
+	}
+	if pullRequest.Number == 0 && manifest.ExistingPullRequestNumber > 0 && event.PullRequestNumber > 0 && event.PullRequestNumber != manifest.ExistingPullRequestNumber {
+		return forgeDefinitelyUnowned, nil
+	}
 	git, err := c.store.GetGitResult(ctx, attempt.ID)
-	if err == nil && git.State == "pushed" {
-		if branch != "" && git.Branch != branch || event.Branch != "" && git.Branch != event.Branch || event.CommitSHA != "" && !providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
+	if err == nil && (git.State == "candidate" || git.State == "pushed") {
+		if git.Branch != branch || event.Branch != "" && git.Branch != event.Branch {
+			return forgeDefinitelyUnowned, nil
+		}
+		if event.CommitSHA != "" && !webhookCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
+			if git.State == "candidate" && candidateReplacementMaySettle(record, attempt) {
+				return forgeSettling, nil
+			}
 			return forgeDefinitelyUnowned, nil
 		}
 	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -540,100 +596,131 @@ func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeE
 	return forgeSettling, nil
 }
 
+func candidateReplacementMaySettle(record store.Task, attempt store.Attempt) bool {
+	return record.CurrentAttemptID == attempt.ID && !attempt.LogsExhausted &&
+		(record.State == task.RUNNING || record.State == task.AGENT_RUNNING || record.State == task.VALIDATING)
+}
+
 func forgeOwnershipMaySettle(state task.State) bool {
 	switch state {
-	case task.VALIDATING, task.COMMITTING, task.PUSHING, task.CREATING_PR:
+	case task.RUNNING, task.AGENT_RUNNING, task.VALIDATING, task.COMMITTING, task.PUSHING, task.CREATING_PR:
 		return true
 	default:
 		return false
 	}
 }
 
-func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.Task, attempt store.Attempt) error {
+func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.Task, attempt store.Attempt, includeDeferred bool) error {
 	events, err := c.store.ListForgeEventsByAttempt(ctx, attempt.ID)
 	if err != nil {
-		return err
+		return fmt.Errorf("list forge events for completion: %w", err)
 	}
-	now := time.Now().UTC()
-	due := make([]store.ForgeEvent, 0, len(events))
-	for _, event := range events {
-		if event.Status == store.ForgeEventRunning && (event.NextAttemptAt == nil || !event.NextAttemptAt.After(now)) {
-			due = append(due, event)
-		}
-	}
+	running := runningForgeEvents(events)
+	due := dueRunningForgeEvents(events, includeDeferred, time.Now().UTC())
 	if len(due) == 0 {
 		return nil
 	}
-	persistAll := func(cause error) error {
-		const operation = "completion ownership"
-		var persistenceErrors []error
-		for _, event := range due {
-			if persistErr := c.persistForgeEventFailure(ctx, event, operation, cause); persistErr != nil {
-				persistenceErrors = append(persistenceErrors, persistErr)
-			}
-		}
-		return errors.Join(persistenceErrors...)
+	pullRequest, target, ready, err := c.forgeCompletionEvidence(ctx, record, attempt)
+	if err != nil {
+		return c.persistForgeCompletionFailure(ctx, running, err)
 	}
-	git, err := c.store.GetGitResult(ctx, attempt.ID)
-	if errors.Is(err, store.ErrNotFound) {
+	if !ready {
 		return nil
 	}
+	return c.handleCompletedForgeEvents(ctx, due, record, attempt, pullRequest, target)
+}
+
+func runningForgeEvents(events []store.ForgeEvent) []store.ForgeEvent {
+	running := make([]store.ForgeEvent, 0, len(events))
+	for _, event := range events {
+		if event.Status == store.ForgeEventRunning {
+			running = append(running, event)
+		}
+	}
+	return running
+}
+
+func dueRunningForgeEvents(events []store.ForgeEvent, includeDeferred bool, now time.Time) []store.ForgeEvent {
+	due := make([]store.ForgeEvent, 0, len(events))
+	for _, event := range events {
+		if event.Status == store.ForgeEventRunning && (includeDeferred || event.NextAttemptAt == nil || !event.NextAttemptAt.After(now)) {
+			due = append(due, event)
+		}
+	}
+	return due
+}
+
+func (c *Controller) forgeCompletionEvidence(ctx context.Context, record store.Task, attempt store.Attempt) (store.PullRequest, forge.Target, bool, error) {
+	git, err := c.store.GetGitResult(ctx, attempt.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.PullRequest{}, forge.Target{}, false, nil
+	}
 	if err != nil {
-		return err
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("get completion Git result: %w", err)
 	}
 	pullRequest, err := c.store.GetPullRequest(ctx, attempt.ID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return persistAll(forge.MarkPermanent(fmt.Errorf("running forge event durable pull request: %w", err)))
+			err = forge.MarkPermanent(fmt.Errorf("running forge event durable pull request: %w", err))
 		}
-		return err
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("get completion pull request: %w", err)
 	}
 	if git.State != "pushed" || git.Branch == "" || git.CommitSHA == "" {
-		return nil
+		return store.PullRequest{}, forge.Target{}, false, nil
 	}
 	if pullRequest.State != "open" || pullRequest.Number <= 0 || pullRequest.HeadBranch != git.Branch {
-		return persistAll(forge.MarkPermanent(fmt.Errorf("%w: forge event durable pull request does not match pushed Git result", store.ErrConflict)))
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("invalid completion evidence: %w", forge.MarkPermanent(fmt.Errorf("%w: forge event durable pull request does not match pushed Git result", store.ErrConflict)))
 	}
 	target, err := c.attemptForgeTarget(record, attempt)
 	if err != nil {
-		return persistAll(err)
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("get prior completion Git result: %w", err)
 	}
-	priorGit, err := c.latestPushedPullRequestGitResult(ctx, record.ID, pullRequest, attempt.ID)
+	priorGit, err := c.store.LatestVerifiedPullRequestGitResult(ctx, record.ID, pullRequest, attempt.ID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			err = forge.MarkPermanent(err)
 		}
-		return persistAll(err)
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("get prior completion Git result: %w", err)
 	}
 	providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
 	live, err := c.pullRequests.GetPullRequest(providerCtx, target, pullRequest.Number)
 	cancel()
 	if err != nil {
-		return persistAll(fmt.Errorf("inspect completed pull request: %w", err))
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("inspect completed pull request: %w", err)
 	}
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
-		return persistAll(err)
+		return store.PullRequest{}, forge.Target{}, false, err
 	}
-	if !providerCommitMatchesDurable(live.HeadSHA, git.CommitSHA) {
-		if providerCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
-			return persistAll(fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA))
+	if !validLiveProviderCommit(live.HeadSHA) {
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID", store.ErrConflict, live.HeadSHA)))
+	}
+	if !liveProviderCommitExactlyMatchesDurable(live.HeadSHA, git.CommitSHA) {
+		if liveProviderCommitExactlyMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
+			return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA)
 		}
-		return persistAll(forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("completion head drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
 	}
-	var persistenceErrors []error
-	for _, event := range due {
+	return pullRequest, target, true, nil
+}
+
+func (c *Controller) persistForgeCompletionFailure(ctx context.Context, events []store.ForgeEvent, cause error) error {
+	if forge.IsPermanent(cause) && len(events) > 0 {
+		return c.persistForgeEventFailure(ctx, events[0], "completion ownership", cause)
+	}
+	return c.persistForgeEventBatchFailure(ctx, events, "completion ownership", cause)
+}
+
+func (c *Controller) handleCompletedForgeEvents(ctx context.Context, events []store.ForgeEvent, record store.Task, attempt store.Attempt, pullRequest store.PullRequest, target forge.Target) error {
+	for _, event := range events {
 		if event.TaskID != record.ID {
-			if err := c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q is not running for task %q", store.ErrConflict, event.ID, record.ID))); err != nil {
-				persistenceErrors = append(persistenceErrors, err)
-			}
-			continue
+			return c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q is not running for task %q", store.ErrConflict, event.ID, record.ID)))
 		}
 		if event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number || !sameForgeCoordinates(event, target) {
-			if err := c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q does not match durable pull request ownership", store.ErrConflict, event.ID))); err != nil {
-				persistenceErrors = append(persistenceErrors, err)
-			}
-			continue
+			return c.persistForgeEventFailure(ctx, event, "completion ownership", forge.MarkPermanent(fmt.Errorf("%w: forge event %q does not match durable pull request ownership", store.ErrConflict, event.ID)))
 		}
+	}
+	var persistenceErrors []error
+	for _, event := range events {
 		if err := c.store.MarkForgeEventHandled(ctx, event.ID); err != nil {
 			persistenceErrors = append(persistenceErrors, forgeEventPersistenceError{err})
 			continue
@@ -643,7 +730,17 @@ func (c *Controller) completeForgeEventLocked(ctx context.Context, record store.
 	return errors.Join(persistenceErrors...)
 }
 
-func providerCommitMatchesDurable(providerSHA, durableSHA string) bool {
+func liveProviderCommitExactlyMatchesDurable(providerSHA, durableSHA string) bool {
+	return validLiveProviderCommit(providerSHA) &&
+		protocol.FullLowerGitObjectID(strings.ToLower(durableSHA)) &&
+		strings.EqualFold(providerSHA, durableSHA)
+}
+
+func validLiveProviderCommit(providerSHA string) bool {
+	return protocol.FullLowerGitObjectID(strings.ToLower(providerSHA))
+}
+
+func webhookCommitMatchesDurable(providerSHA, durableSHA string) bool {
 	if strings.EqualFold(providerSHA, durableSHA) {
 		return true
 	}
@@ -661,15 +758,6 @@ func providerCommitMatchesDurable(providerSHA, durableSHA string) bool {
 func sameForgeCoordinates(event store.ForgeEvent, target forge.Target) bool {
 	return strings.EqualFold(event.Provider, string(target.Provider)) &&
 		strings.EqualFold(event.Owner, target.Owner) && strings.EqualFold(event.Repository, target.Repository)
-}
-
-func validDurablePullRequestURL(value string) bool {
-	if len(value) > 4<<10 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
-		return false
-	}
-	parsed, err := url.Parse(value)
-	return err == nil && parsed.IsAbs() && parsed.Hostname() != "" && parsed.User == nil &&
-		(strings.EqualFold(parsed.Scheme, "http") || strings.EqualFold(parsed.Scheme, "https"))
 }
 
 const forgeFollowUpPromptMaxBytes = 95 << 10

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/simpleswe/simpleswe/internal/redaction"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -111,7 +112,7 @@ func TestLoadSecretsIncludesNamedEnvironmentValuesAndMultilineParts(t *testing.T
 
 func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
 	failure := strings.Repeat("old-output-", validationFixPromptLimit)
-	prompt := validationFixPrompt(failure)
+	prompt := validationFixPrompt(failure, 42)
 	if len(prompt) > validationFixPromptLimit {
 		t.Fatalf("fix prompt length = %d; want at most %d", len(prompt), validationFixPromptLimit)
 	}
@@ -123,14 +124,75 @@ func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
 	}
 }
 
-func TestAgentPromptAppendsOnlyBaseConstraints(t *testing.T) {
+func TestWorkerFailureMessageIsBoundedAndRedacted(t *testing.T) {
+	const secret = "super-secret"
+	message := "OpenCode reported failure: " + strings.Repeat("x", protocol.MaxWorkerEventMessageLen) + secret
+	got := boundedWorkerFailureMessage(message, []string{secret})
+	if len(got) > protocol.MaxWorkerEventMessageLen || strings.Contains(got, secret) {
+		t.Fatalf("bounded failure length/secret = %d/%t", len(got), strings.Contains(got, secret))
+	}
+}
+
+func TestWorkerFailureMessagePreservesASCIIBounds(t *testing.T) {
+	exact := strings.Repeat("x", protocol.MaxWorkerEventMessageLen)
+	if got := boundedWorkerFailureMessage(exact, nil); got != exact {
+		t.Fatalf("exact ASCII message changed: got length %d", len(got))
+	}
+
+	over := exact + "y"
+	want := OutputTruncatedMarker + strings.Repeat("x", protocol.MaxWorkerEventMessageLen-len(OutputTruncatedMarker)-1) + "y"
+	if got := boundedWorkerFailureMessage(over, nil); got != want {
+		t.Fatalf("over-bound ASCII message changed: got length %d, want %d", len(got), len(want))
+	}
+}
+
+func TestWorkerFailureMessageRoundTripsMaximumUTF8Reason(t *testing.T) {
+	reason := strings.Repeat("😀", protocol.MaxWorkerEventMessageLen/utf8.RuneLen('😀'))
+	event := roundTripWorkerFailureEvent(t, "OpenCode reported failure: "+reason)
+	if !utf8.ValidString(event.Message) || len(event.Message) > protocol.MaxWorkerEventMessageLen {
+		t.Fatalf("worker_failed message is not valid and bounded: valid=%t length=%d", utf8.ValidString(event.Message), len(event.Message))
+	}
+}
+
+func TestWorkerFailureMessageNormalizesInvalidUTF8BeforeBounding(t *testing.T) {
+	event := roundTripWorkerFailureEvent(t, strings.Repeat("x", protocol.MaxWorkerEventMessageLen-1)+"\xff")
+	if !utf8.ValidString(event.Message) || len(event.Message) > protocol.MaxWorkerEventMessageLen {
+		t.Fatalf("invalid UTF-8 worker_failed message is not valid and bounded: valid=%t length=%d", utf8.ValidString(event.Message), len(event.Message))
+	}
+	if !strings.HasSuffix(event.Message, "\uFFFD") {
+		t.Fatalf("invalid UTF-8 was not normalized deterministically: suffix %q", event.Message[len(event.Message)-min(len(event.Message), 16):])
+	}
+}
+
+func roundTripWorkerFailureEvent(t *testing.T, message string) protocol.Event {
+	t.Helper()
+	var output bytes.Buffer
+	if err := emitEvent(&output, nil, protocol.Event{Type: protocol.EventWorkerFailed, Message: boundedWorkerFailureMessage(message, nil)}); err != nil {
+		t.Fatalf("emit worker_failed: %v", err)
+	}
+	parsed, err := protocol.ParseLine(strings.TrimSpace(output.String()))
+	if err != nil || parsed.Event == nil {
+		t.Fatalf("parse worker_failed: event=%#v error=%v", parsed.Event, err)
+	}
+	if err := protocol.ValidateEvent(*parsed.Event, ""); err != nil {
+		t.Fatalf("validate worker_failed: %v", err)
+	}
+	return *parsed.Event
+}
+
+func TestAgentPromptGrantsOpenCodeRepositoryAndForgeOwnership(t *testing.T) {
 	taskPrompt := "ordinary task containing pull_request_url=https://forge.example/pr/1 and reply_marker=ordinary-data"
 	prompt := agentPrompt(taskPrompt)
 	if want := taskPrompt + "\n\nWorkflow constraints:\n" + baseWorkflowInstructions; prompt != want {
 		t.Fatalf("agent prompt = %q, want only task and generic constraints %q", prompt, want)
 	}
-	if !strings.Contains(prompt, "Do not push commits or branches, merge, create pull requests, or alter pull request metadata") {
-		t.Fatalf("ordinary task prompt does not contain base constraints: %q", prompt)
+	for _, want := range []string{"commit", "push", "create or update", "pull request", "simpleswe worker report"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("ordinary task prompt does not contain ownership instruction %q: %q", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "Do not push commits or branches") {
+		t.Fatalf("ordinary task prompt retains obsolete repository prohibition: %q", prompt)
 	}
 }
 
@@ -232,7 +294,7 @@ func TestReadableStreamDoesNotRetainLongSecretAtChunkStart(t *testing.T) {
 	}
 }
 
-func TestReadableStreamAndStreamingCommandPropagateOutputErrors(t *testing.T) {
+func TestReadableStreamPropagatesOutputErrors(t *testing.T) {
 	wantErr := errors.New("output unavailable")
 	stream := &readableStream{output: failingWriter{err: wantErr}, name: "stdout"}
 	if _, err := stream.Write([]byte("line\n")); !errors.Is(err, wantErr) {
@@ -243,11 +305,6 @@ func TestReadableStreamAndStreamingCommandPropagateOutputErrors(t *testing.T) {
 	}
 	if err := stream.flush(); !errors.Is(err, wantErr) {
 		t.Fatalf("stream flush error: got %v, want %v", err, wantErr)
-	}
-
-	_, err := runStreamingCommand(context.Background(), "", []string{"sh", "-c", "printf line"}, failingWriter{err: wantErr}, nil, 128)
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("streaming command output error: got %v, want %v", err, wantErr)
 	}
 }
 
@@ -266,6 +323,9 @@ func TestRunValidationLoopIsBoundedAndRetainsFailures(t *testing.T) {
 		Prompt:            "fix it",
 		ValidationCommand: []string{"fake-validation"},
 		MaxFixAttempts:    2,
+		ForgeProvider:     "bitbucket",
+		ForgeOwner:        "acme",
+		ForgeRepository:   "widget",
 	}
 	wantRuns := []CommandResult{
 		{ExitCode: 7, Stdout: "first stdout", Stderr: "first stderr"},
@@ -329,6 +389,9 @@ func TestRunValidationLoopHandlesInputRunnerErrorsAndCancellation(t *testing.T) 
 		Repository:         "repo",
 		Prompt:             "fix it",
 		ValidationCommands: [][]string{{"first"}, {"second"}},
+		ForgeProvider:      "bitbucket",
+		ForgeOwner:         "acme",
+		ForgeRepository:    "widget",
 	}
 
 	if _, err := RunValidationLoop(context.Background(), protocol.TaskManifest{}, func(context.Context, []string) (CommandResult, error) {
@@ -404,17 +467,28 @@ func TestRunCommandCancellationReachesChild(t *testing.T) {
 	t.Fatalf("child process %d is still running after cancellation", pid)
 }
 
-func TestRequireChangesReturnsExactNoChangesError(t *testing.T) {
-	err := RequireChanges(false)
-	if err == nil || err.Error() != "no changes detected" {
-		t.Fatalf("no-changes error: got %v, want %q", err, "no changes detected")
+func TestRunCommandCleansBackgroundProcessGroupAfterLeaderSuccess(t *testing.T) {
+	tmp := t.TempDir()
+	pidFile := filepath.Join(tmp, "background.pid")
+	script := filepath.Join(tmp, "exit-with-background-child")
+	scriptBody := "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > \"$1\"\nexit 0\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatalf("write background command: %v", err)
 	}
-	if !errors.Is(err, ErrNoChanges) {
-		t.Fatalf("no-changes error is not ErrNoChanges: %v", err)
+
+	result, err := RunCommand(context.Background(), []string{script, pidFile})
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("successful command result = %#v, %v", result, err)
 	}
-	if err := RequireChanges(true); err != nil {
-		t.Fatalf("changed workspace rejected: %v", err)
+	pid := waitForPID(t, pidFile)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatalf("background process %d survived successful command leader", pid)
 }
 
 func waitForPID(t *testing.T, path string) int {

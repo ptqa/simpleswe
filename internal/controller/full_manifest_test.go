@@ -30,7 +30,7 @@ func TestCreateTaskMapsRepositoryConfigurationIntoFullManifestAndJob(t *testing.
 	if err != nil {
 		t.Fatalf("recreate controller: %v", err)
 	}
-	created, err := control.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "fix", IdempotencyKey: "request-1"})
+	created, err := control.CreateTask(fixture.ctx, store.CreateTaskParams{Repository: repositoryURL, Prompt: "fix", PRTitle: "Requested title", IdempotencyKey: "request-1"})
 	if err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
@@ -48,6 +48,9 @@ func TestCreateTaskMapsRepositoryConfigurationIntoFullManifestAndJob(t *testing.
 	}
 	if !reflect.DeepEqual(manifest.OpenCodeCommand, []string{"opencode", "run"}) || !reflect.DeepEqual(manifest.ValidationCommands, [][]string{{"go", "test", "./..."}}) || manifest.MaxFixAttempts != 2 {
 		t.Fatalf("manifest execution = %#v", manifest)
+	}
+	if manifest.ForgeProvider != "bitbucket" || manifest.ForgeOwner != "acme" || manifest.ForgeRepository != "widget" || manifest.RequestedPullRequestTitle != "Requested title" || manifest.ExistingPullRequestNumber != 0 || manifest.ExistingPullRequestHeadSHA != "" {
+		t.Fatalf("manifest forge context = %#v", manifest)
 	}
 
 	jobs, err := fixture.kube.BatchV1().Jobs(workerNamespace).List(fixture.ctx, metav1.ListOptions{})

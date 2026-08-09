@@ -108,6 +108,8 @@ config:
     review_debounce: 30m
     max_fix_attempts: 3
   worker:
+    # Repository worker images must include forge tooling and credentials:
+    # gh with GH_TOKEN for GitHub, or a configured Bitbucket MCP.
     image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
     command: opencode
     branch_prefix: simpleswe/

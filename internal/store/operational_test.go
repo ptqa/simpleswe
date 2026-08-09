@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -55,8 +56,23 @@ func TestPodLogCRUDCheckpointAndChunkReads(t *testing.T) {
 		t.Fatalf("missing Pod cursor = %#v, %v", missingCursor, err)
 	}
 	events, err := db.ListPendingWorkerEvents(ctx, "pod-1")
-	if err != nil || len(events) != 1 || events[0].ID != "worker-event-1" || events[0].Content != params.WorkerEvent {
+	if err != nil || len(events) != 1 || events[0].ID != "worker-event-1" || events[0].PodUID != "pod-1" || events[0].TaskID != created.ID || events[0].AttemptID != attempt || events[0].JobName != "job-1" || events[0].PodName != "pod-1" || events[0].Content != params.WorkerEvent {
 		t.Fatalf("pending worker events = %#v, %v", events, err)
+	}
+	gotEvent, err := db.GetWorkerLogEvent(ctx, events[0].ID)
+	if err != nil || gotEvent != events[0] {
+		t.Fatalf("worker event lookup = %#v, %v", gotEvent, err)
+	}
+	if _, err := db.GetWorkerLogEvent(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing worker event = %v, want ErrNotFound", err)
+	}
+	podUIDs, err := db.ListPendingWorkerEventPodUIDs(ctx)
+	if err != nil || len(podUIDs) != 1 || podUIDs[0] != "pod-1" {
+		t.Fatalf("pending worker event Pods = %#v, %v", podUIDs, err)
+	}
+	pending, err := db.HasPendingWorkerEvents(ctx, created.ID, attempt)
+	if err != nil || !pending {
+		t.Fatalf("attempt pending worker event = %t, %v", pending, err)
 	}
 	if err := db.MarkWorkerEventProcessed(ctx, events[0].ID); err != nil {
 		t.Fatalf("mark worker event processed: %v", err)
@@ -65,13 +81,108 @@ func TestPodLogCRUDCheckpointAndChunkReads(t *testing.T) {
 	if err != nil || len(events) != 0 {
 		t.Fatalf("pending events after processing = %#v, %v", events, err)
 	}
-	if err := db.MarkPodLogsExhausted(ctx, "pod-1"); err != nil {
+	pending, err = db.HasPendingWorkerEvents(ctx, created.ID, attempt)
+	if err != nil || pending {
+		t.Fatalf("processed attempt pending worker event = %t, %v", pending, err)
+	}
+	if err := db.MarkPodLogsExhausted(ctx, "pod-1", other.ID, other.CurrentAttemptID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mark Pod cursor for another attempt = %v, want ErrConflict", err)
+	}
+	cursor, err = db.GetPodLogCursor(ctx, "pod-1")
+	if err != nil || cursor.Exhausted {
+		t.Fatalf("cursor exhausted by another attempt = %#v, %v", cursor, err)
+	}
+	if err := db.MarkPodLogsExhausted(ctx, "pod-1", created.ID, attempt); err != nil {
 		t.Fatalf("mark Pod logs exhausted: %v", err)
 	}
 	cursor, err = db.GetPodLogCursor(ctx, "pod-1")
 	if err != nil || !cursor.Exhausted {
 		t.Fatalf("exhausted Pod cursor = %#v, %v", cursor, err)
 	}
+	if err := db.MarkPodLogsExhausted(ctx, "empty-pod", created.ID, attempt); err != nil {
+		t.Fatalf("mark empty Pod logs exhausted: %v", err)
+	}
+	emptyCursor, err := db.GetPodLogCursor(ctx, "empty-pod")
+	if err != nil || !emptyCursor.Exhausted {
+		t.Fatalf("empty exhausted Pod cursor = %#v, %v", emptyCursor, err)
+	}
+}
+
+func TestAppendPodLogOrdersAtomicallyWithLogsExhaustion(t *testing.T) {
+	for _, appendFirst := range []bool{true, false} {
+		name := "logs exhausted first"
+		if appendFirst {
+			name = "event append first"
+		}
+		t.Run(name, func(t *testing.T) { testAppendPodLogBarrierOrder(t, appendFirst) })
+	}
+}
+
+func testAppendPodLogBarrierOrder(t *testing.T, appendFirst bool) {
+	t.Helper()
+	ctx := context.Background()
+	db := openTestStore(t)
+	created, err := db.CreateTask(ctx, CreateTaskParams{Repository: "repo", Prompt: "atomic log barrier"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := AppendPodLogParams{
+		TaskID: created.ID, AttemptID: created.CurrentAttemptID, PodUID: "barrier-pod", JobName: "job", PodName: "pod",
+		Content: []byte("worker event"), WorkerEventID: "barrier-event", WorkerEvent: "worker event",
+	}
+	appendGate, exhaustedGate := make(chan struct{}), make(chan struct{})
+	appendResult, exhaustedResult := make(chan error, 1), make(chan error, 1)
+	var started sync.WaitGroup
+	started.Add(2)
+	go func() {
+		started.Done()
+		<-appendGate
+		_, err := db.AppendPodLog(ctx, params, 256, 64)
+		appendResult <- err
+	}()
+	go func() {
+		started.Done()
+		<-exhaustedGate
+		exhaustedResult <- db.MarkLogsExhausted(ctx, created.ID, created.CurrentAttemptID)
+	}()
+	started.Wait()
+	if appendFirst {
+		close(appendGate)
+		if err := <-appendResult; err != nil {
+			t.Fatalf("append before barrier: %v", err)
+		}
+		close(exhaustedGate)
+	} else {
+		close(exhaustedGate)
+		if err := <-exhaustedResult; err != nil {
+			t.Fatalf("close log barrier: %v", err)
+		}
+		close(appendGate)
+	}
+	appendErr, exhaustedErr := error(nil), error(nil)
+	if appendFirst {
+		exhaustedErr = <-exhaustedResult
+	} else {
+		appendErr = <-appendResult
+	}
+	if exhaustedErr != nil {
+		t.Fatalf("mark logs exhausted: %v", exhaustedErr)
+	}
+	pending, err := db.HasPendingWorkerEvents(ctx, created.ID, created.CurrentAttemptID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if appendFirst {
+		if !pending {
+			t.Fatal("event committed before the barrier is not pending")
+		}
+	} else if !errors.Is(appendErr, ErrConflict) || pending {
+		t.Fatalf("append after barrier error/pending = %v/%t, want ErrConflict/false", appendErr, pending)
+	}
+	if _, err := db.AppendPodLog(ctx, params, 256, 64); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate append after barrier = %v, want ErrConflict", err)
+	}
+
 }
 
 func TestPodLogCursorTailAndChunkReads(t *testing.T) {

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -276,12 +277,16 @@ func backendStore(t *testing.T) (*store.Store, store.Task, store.Attempt, string
 	if err != nil {
 		t.Fatalf("current attempt: %v", err)
 	}
-	reserved, err := db.ReservePullRequest(ctx, attempt.ID, "Fix the flaky test", "simpleswe/fix", "main")
-	if err != nil || !reserved {
-		t.Fatalf("reserve pull request = %v, %v", reserved, err)
+	fixtureDB, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open fixture database: %v", err)
 	}
-	if err := db.CompletePullRequest(ctx, attempt.ID, 42, "https://bitbucket.example/acme/widget/pull-requests/42"); err != nil {
-		t.Fatalf("complete pull request: %v", err)
+	if _, err := fixtureDB.ExecContext(ctx, `INSERT INTO pull_requests (attempt_id, state, number, url, title, head_branch, base_branch, error) VALUES (?, 'open', 42, 'https://bitbucket.example/acme/widget/pull-requests/42', 'Fix the flaky test', 'simpleswe/fix', 'main', '')`, attempt.ID); err != nil {
+		_ = fixtureDB.Close()
+		t.Fatalf("insert historical pull request fixture: %v", err)
+	}
+	if err := fixtureDB.Close(); err != nil {
+		t.Fatalf("close fixture database: %v", err)
 	}
 	return db, created, attempt, path
 }

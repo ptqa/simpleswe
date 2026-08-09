@@ -86,7 +86,11 @@ func (c *Controller) reconcileTask(ctx context.Context, record store.Task) error
 		}
 		record.State = task.CREATING_JOB
 	}
-	if workerResourceState(record.State) {
+	pendingWorkerEvents, err := c.store.HasPendingWorkerEvents(ctx, record.ID, attempt.ID)
+	if err != nil {
+		return fmt.Errorf("check pending worker events before reconciliation: %w", err)
+	}
+	if workerResourceState(record.State) && !pendingWorkerEvents {
 		recovered, err := c.ensureAttemptResources(ctx, record, attempt, repository)
 		if err != nil {
 			failedState := record.State
@@ -101,6 +105,13 @@ func (c *Controller) reconcileTask(ctx context.Context, record store.Task) error
 			reason := failureMessage("kubernetes", jobs.Name(record.ID, attempt.Number), "", nil, -1, err)
 			if permanentKubernetesError(err) {
 				_ = c.store.MarkLogsExhausted(ctx, record.ID, attempt.ID)
+				pendingWorkerEvents, pendingErr := c.store.HasPendingWorkerEvents(ctx, record.ID, attempt.ID)
+				if pendingErr != nil {
+					return errors.Join(err, pendingErr)
+				}
+				if pendingWorkerEvents {
+					return err
+				}
 				if transitionErr := c.transition(ctx, record.ID, record.State, task.FAILED, reason, "kubernetes"); transitionErr != nil {
 					return errors.Join(err, transitionErr)
 				}
@@ -128,22 +139,45 @@ func (c *Controller) reconcileTask(ctx context.Context, record store.Task) error
 		}
 	}
 	if stateAtOrAfter(record.State, task.VALIDATING) && !stateAtOrAfter(record.State, task.PR_OPEN) {
-		if _, err := c.store.GetGitResult(ctx, attempt.ID); err == nil {
-			if err := c.resumePullRequestLocked(ctx, record, attempt, "recovery durable branch"); err != nil {
+		git, gitErr := c.store.GetGitResult(ctx, attempt.ID)
+		pullRequest, pullRequestErr := c.store.GetPullRequest(ctx, attempt.ID)
+		if gitErr == nil && pullRequestErr == nil && git.State == "pushed" && pullRequest.State == "open" {
+			if err := c.resumePullRequestLocked(ctx, record, attempt, "recovery provider-verified pull request"); err != nil {
 				return err
 			}
 			record, err = c.store.GetTask(ctx, record.ID)
 			if err != nil {
 				return err
 			}
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return err
+		} else {
+			if gitErr != nil && !errors.Is(gitErr, store.ErrNotFound) {
+				return fmt.Errorf("get recovery Git result: %w", gitErr)
+			}
+			if pullRequestErr != nil && !errors.Is(pullRequestErr, store.ErrNotFound) {
+				return fmt.Errorf("get recovery pull request: %w", pullRequestErr)
+			}
 		}
 	}
 	jobName := jobs.Name(record.ID, attempt.Number)
 	job, err := c.kubernetes.BatchV1().Jobs(c.config.Controller.Namespace).Get(ctx, jobName, metav1.GetOptions{})
-	if apierrors.IsNotFound(err) && !workerResourceState(record.State) {
-		return nil
+	if apierrors.IsNotFound(err) {
+		jobGetErr := err
+		pendingWorkerEvents, err = c.store.HasPendingWorkerEvents(ctx, record.ID, attempt.ID)
+		if err != nil {
+			return fmt.Errorf("check pending worker events for missing Job: %w", err)
+		}
+		if pendingWorkerEvents {
+			return nil
+		}
+		if workerResourceState(record.State) {
+			retryErr := fmt.Errorf("get worker Job %s after resource reconciliation: %w", jobName, jobGetErr)
+			reason := failureMessage("kubernetes", jobName, "", nil, -1, retryErr)
+			if observationErr := c.store.RecordObservation(ctx, record.ID, "transient resource reconciliation; retry pending "+reason, "kubernetes"); observationErr != nil {
+				return errors.Join(retryErr, observationErr)
+			}
+			return retryErr
+		}
+		return c.markLogsExhaustedWithoutJob(ctx, record, attempt)
 	}
 	if err != nil {
 		return fmt.Errorf("get worker Job %s: %w", jobName, err)
@@ -152,6 +186,27 @@ func (c *Controller) reconcileTask(ctx context.Context, record store.Task) error
 		return err
 	}
 	return c.reconcileJob(ctx, record, attempt, job)
+}
+
+func (c *Controller) markLogsExhaustedWithoutJob(ctx context.Context, record store.Task, attempt store.Attempt) error {
+	if attempt.LogsExhausted {
+		return nil
+	}
+	selector := fmt.Sprintf("simpleswe.dev/task-id=%s,simpleswe.dev/attempt-id=%s", record.ID, attempt.ID)
+	pods, err := c.kubernetes.CoreV1().Pods(c.config.Controller.Namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return fmt.Errorf("list Pods for missing worker Job: %w", err)
+	}
+	jobName := jobs.Name(record.ID, attempt.Number)
+	for i := range pods.Items {
+		if podOwnedByJob(&pods.Items[i], jobName, "") {
+			return nil
+		}
+	}
+	if err := c.store.MarkLogsExhausted(ctx, record.ID, attempt.ID); err != nil {
+		return fmt.Errorf("mark missing Job logs exhausted: %w", err)
+	}
+	return nil
 }
 
 func (c *Controller) reconcileJob(ctx context.Context, taskRecord store.Task, attempt store.Attempt, job *batchv1.Job) error {
@@ -201,6 +256,13 @@ func (c *Controller) markLogsExhaustedWithoutPod(ctx context.Context, record sto
 }
 
 func (c *Controller) finishFailedJob(ctx context.Context, record store.Task, attempt store.Attempt, job *batchv1.Job) error {
+	pending, err := c.store.HasPendingWorkerEvents(ctx, record.ID, attempt.ID)
+	if err != nil {
+		return fmt.Errorf("check pending worker events for failed Job: %w", err)
+	}
+	if pending {
+		return nil
+	}
 	pod, exitCode, command := c.failedPod(ctx, job)
 	reason := "recovery failed " + failureMessage("kubernetes", job.Name, pod, command, exitCode, nil)
 	if record.State != task.VALIDATING {
@@ -226,12 +288,14 @@ func (c *Controller) finishCompletedJob(ctx context.Context, record store.Task, 
 	if prErr != nil && !errors.Is(prErr, store.ErrNotFound) {
 		return prErr
 	}
-	if gitErr == nil && git.State == "pushed" && git.Branch != "" && git.CommitSHA != "" {
-		// A durable push makes PR creation resumable. Provider and store failures
-		// are retried by reconciliation rather than converted to log-EOF failure.
+	pending, err := c.store.HasPendingWorkerEvents(ctx, record.ID, attempt.ID)
+	if err != nil {
+		return fmt.Errorf("check pending worker events for completed Job: %w", err)
+	}
+	if pending {
 		return nil
 	}
-	reason := "indeterminate successful Job after logs exhausted: missing durable branch_pushed Git result and open pull request job=" + jobName
+	reason := "OpenCode did not report a pull request job=" + jobName
 	return c.transition(ctx, record.ID, record.State, task.FAILED, reason, "kubernetes")
 }
 

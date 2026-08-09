@@ -2,79 +2,16 @@ package run
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/forge"
-	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
 )
-
-func TestBitbucketRouterRoutesFindAndCreateToRepositoryClient(t *testing.T) {
-	type testRepository struct {
-		workspace, repository, username, password string
-		id                                        int
-	}
-	tests := []testRepository{
-		{workspace: "acme", repository: "widget", username: "widget-user", password: "widget-password", id: 11},
-		{workspace: "labs", repository: "gadget", username: "gadget-user", password: "gadget-password", id: 22},
-	}
-	router := make(forgeRouter, len(tests))
-	targets := make([]forge.Target, 0, len(tests))
-	var requests atomic.Int32
-	for _, test := range tests {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			requests.Add(1)
-			if username, password, ok := r.BasicAuth(); !ok || username != test.username || password != test.password {
-				t.Errorf("%s/%s BasicAuth = %q/%q/%t", test.workspace, test.repository, username, password, ok)
-			}
-			wantPath := "/2.0/repositories/" + test.workspace + "/" + test.repository + "/pullrequests"
-			if !strings.EqualFold(r.URL.Path, wantPath) {
-				t.Errorf("path = %q, want %q", r.URL.Path, wantPath)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if r.Method == http.MethodGet {
-				fmt.Fprintf(w, `{"values":[{"id":%d,"state":"OPEN","description":"Created by simpleswe task task-1","source":{"branch":{"name":"feature/task-1"},"repository":{"full_name":%q}},"destination":{"branch":{"name":"main"}},"links":{"html":{"href":"https://bitbucket.example/pr/%d"}}}]}`, test.id, test.workspace+"/"+test.repository, test.id)
-				return
-			}
-			fmt.Fprintf(w, `{"id":%d,"links":{"html":{"href":"https://bitbucket.example/pr/%d"}}}`, test.id, test.id)
-		}))
-		t.Cleanup(server.Close)
-		client, err := bitbucket.NewClient(server.URL, test.username, test.password)
-		if err != nil {
-			t.Fatalf("NewClient: %v", err)
-		}
-		target := forge.Target{
-			Provider: forge.ProviderBitbucket, BaseURL: server.URL,
-			Owner: test.workspace, Repository: test.repository, CredentialsSecret: test.repository + "-bitbucket",
-		}
-		router[forgeRoute(target)] = client
-		targets = append(targets, target)
-	}
-
-	for i, test := range tests {
-		target := targets[i]
-		target.Owner, target.Repository = strings.ToUpper(target.Owner), strings.ToUpper(target.Repository)
-		found, ok, err := router.FindPullRequest(context.Background(), target, "feature/task-1", "main", "task-1")
-		if err != nil || !ok || found.ID != test.id {
-			t.Fatalf("FindPullRequest(%s/%s) = %#v, %t, %v", test.workspace, test.repository, found, ok, err)
-		}
-		created, err := router.CreatePullRequest(context.Background(), target, forge.CreatePullRequestRequest{})
-		if err != nil || created.ID != test.id {
-			t.Fatalf("CreatePullRequest(%s/%s) = %#v, %v", test.workspace, test.repository, created, err)
-		}
-	}
-	if requests.Load() != 4 {
-		t.Fatalf("requests = %d, want 4", requests.Load())
-	}
-}
 
 func TestNewBitbucketRouterReadsOnlyRepositoryCredentialMounts(t *testing.T) {
 	credentials := map[string][2]string{
@@ -95,15 +32,18 @@ func TestNewBitbucketRouterReadsOnlyRepositoryCredentialMounts(t *testing.T) {
 		}
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		workspace := r.URL.Path[len("/2.0/repositories/"):]
 		username, password, _ := r.BasicAuth()
-		if workspace == "acme/widget/pullrequests" && (username != "widget-user" || password != "widget-password") {
+		if r.URL.Path == "/2.0/repositories/acme/widget/pullrequests/42" && (username != "widget-user" || password != "widget-password") {
 			t.Errorf("widget credentials = %q/%q", username, password)
 		}
-		if workspace == "labs/gadget/pullrequests" && (username != "gadget-user" || password != "gadget-password") {
+		if r.URL.Path == "/2.0/repositories/labs/gadget/pullrequests/42" && (username != "gadget-user" || password != "gadget-password") {
 			t.Errorf("gadget credentials = %q/%q", username, password)
 		}
-		io.WriteString(w, `{"id":1,"links":{"html":{"href":"https://bitbucket.example/pr/1"}}}`)
+		owner, repository := "acme", "widget"
+		if r.URL.Path == "/2.0/repositories/labs/gadget/pullrequests/42" {
+			owner, repository = "labs", "gadget"
+		}
+		_, _ = io.WriteString(w, `{"id":42,"state":"OPEN","title":"PR","links":{"html":{"href":"https://bitbucket.example/`+owner+`/`+repository+`/pull-requests/42"}},"source":{"branch":{"name":"feature/task"},"commit":{"hash":"0123456789abcdef0123456789abcdef01234567"},"repository":{"full_name":"`+owner+`/`+repository+`"}},"destination":{"branch":{"name":"main"}}}`)
 	}))
 	defer server.Close()
 
@@ -116,12 +56,8 @@ func TestNewBitbucketRouterReadsOnlyRepositoryCredentialMounts(t *testing.T) {
 		t.Fatalf("newForgeRouter: %v", err)
 	}
 	for _, repository := range cfg.Repositories {
-		target := forge.Target{
-			Provider: forge.ProviderBitbucket, BaseURL: cfg.Bitbucket.BaseURL,
-			Owner: repository.Bitbucket.Workspace, Repository: repository.Bitbucket.Repository,
-			CredentialsSecret: repository.Bitbucket.CredentialsSecret,
-		}
-		if _, err := router.CreatePullRequest(context.Background(), target, forge.CreatePullRequestRequest{}); err != nil {
+		target := forge.Target{Provider: forge.ProviderBitbucket, BaseURL: cfg.Bitbucket.BaseURL, Owner: repository.Bitbucket.Workspace, Repository: repository.Bitbucket.Repository, CredentialsSecret: repository.Bitbucket.CredentialsSecret}
+		if _, err := router.GetPullRequest(context.Background(), target, 42); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,9 +71,7 @@ func TestNewBitbucketRouterDoesNotFallbackToGlobalCredentials(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "app-password"), []byte("global-password"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.Config{Bitbucket: config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"}, Repositories: config.RepositoryConfigs{
-		{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "missing-secret"}},
-	}}
+	cfg := config.Config{Bitbucket: config.BitbucketConfig{BaseURL: "https://api.bitbucket.org"}, Repositories: config.RepositoryConfigs{{Bitbucket: config.RepositoryBitbucketConfig{Workspace: "acme", Repository: "widget", CredentialsSecret: "missing-secret"}}}}
 	if _, err := newForgeRouter(cfg, root, t.TempDir()); err == nil {
 		t.Fatal("newForgeRouter used global credential files")
 	}

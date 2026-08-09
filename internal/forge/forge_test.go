@@ -97,6 +97,25 @@ func TestMarkedPermanentErrorClassification(t *testing.T) {
 	}
 }
 
+func TestValidatePullRequestMetadataRequiresSafeHTTPSURL(t *testing.T) {
+	if err := ValidatePullRequestMetadata("https://github.com/acme/widget/pull/42", "Fix it"); err != nil {
+		t.Fatalf("valid metadata: %v", err)
+	}
+	if err := ValidatePullRequestMetadata("http://127.0.0.1:8080/acme/widget/pull/42", "Fix it"); err != nil {
+		t.Fatalf("loopback metadata: %v", err)
+	}
+	for _, value := range []string{
+		"http://github.com/acme/widget/pull/42",
+		"https://user@github.com/acme/widget/pull/42",
+		"https://github.com/acme/widget/pull/42?token=x",
+		"https://github.com/acme/widget/pull/42#details",
+	} {
+		if err := ValidatePullRequestMetadata(value, "Fix it"); err == nil {
+			t.Errorf("ValidatePullRequestMetadata(%q) accepted unsafe URL", value)
+		}
+	}
+}
+
 func TestValidateNormalizedTextAllowsRenderableWhitespaceOnly(t *testing.T) {
 	if err := ValidateNormalizedText("body", "first\nsecond\r\n\tindented", true); err != nil {
 		t.Fatalf("ValidateNormalizedText(multiline) error = %v", err)

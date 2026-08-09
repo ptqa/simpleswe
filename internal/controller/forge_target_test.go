@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"encoding/json"
 	"testing"
 
@@ -18,6 +17,7 @@ func TestReconcileUsesAttemptSnapshottedForgeTargetAfterConfigChanges(t *testing
 	created := createRunningTask(t, fixture, "keep original pull request route", "immutable-forge-route")
 	jobName, podName := jobs.Name(created.ID, 1), "worker-pod-a1"
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "agent_started", TaskID: created.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: created.ID, PullRequestNumber: 42, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_started", TaskID: created.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_result", TaskID: created.ID})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: "validation_succeeded", TaskID: created.ID})
@@ -41,10 +41,6 @@ func TestReconcileUsesAttemptSnapshottedForgeTargetAfterConfigChanges(t *testing
 		t.Fatalf("resource snapshot target = %#v; want %#v", resources.ForgeTarget, wantTarget)
 	}
 	branch := manifest.TaskBranch
-	if err := fixture.store.RecordGitResult(fixture.ctx, store.GitResult{AttemptID: attempt.ID, State: "pushed", Branch: branch, CommitSHA: fullCommitSHA}); err != nil {
-		t.Fatalf("record Git result: %v", err)
-	}
-
 	changed := fixture.config
 	changed.Repositories[0].Bitbucket = config.RepositoryBitbucketConfig{}
 	changed.Repositories[0].GitHub = config.RepositoryGitHubConfig{Owner: "new-owner", Repository: "new-repository", CredentialsSecret: "new-github"}
@@ -53,15 +49,13 @@ func TestReconcileUsesAttemptSnapshottedForgeTargetAfterConfigChanges(t *testing
 	if err != nil {
 		t.Fatalf("restart controller: %v", err)
 	}
-	if err := restarted.Reconcile(fixture.ctx); err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	fixture.pullRequests.getResult = &forge.PullRequestState{Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch, DestinationBranch: "main", HeadSHA: fullCommitSHA}
+	if err := restarted.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: created.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA}); err != nil {
+		t.Fatalf("HandleWorkerEvent: %v", err)
 	}
 	want := wantTarget
-	if len(fixture.pullRequests.findTargets) != 1 || fixture.pullRequests.findTargets[0] != want {
-		t.Fatalf("find targets = %#v; want %#v", fixture.pullRequests.findTargets, want)
-	}
-	if len(fixture.pullRequests.calls) != 1 || fixture.pullRequests.calls[0].target != want {
-		t.Fatalf("create calls = %#v; want target %#v", fixture.pullRequests.calls, want)
+	if len(fixture.pullRequests.getTargets) != 1 || fixture.pullRequests.getTargets[0] != want {
+		t.Fatalf("get targets = %#v; want %#v", fixture.pullRequests.getTargets, want)
 	}
 	if got := getTask(t, fixture, created.ID).State; got != task.PR_OPEN {
 		t.Fatalf("reconciled state = %q; want %q", got, task.PR_OPEN)
@@ -92,36 +86,5 @@ func TestAttemptForgeTargetFallsBackOnlyWhenSnapshotFieldIsAbsent(t *testing.T) 
 				t.Fatal("invalid snapshotted target was accepted")
 			}
 		})
-	}
-}
-
-func TestWorkerTaskJSONStrictlyDecodesWithPreForgeTargetSchema(t *testing.T) {
-	fixture := newFixture(t)
-	created := createTask(t, fixture, "remain compatible with old workers", "old-worker-schema")
-	attempt, err := fixture.store.CurrentAttempt(fixture.ctx, created.ID)
-	if err != nil {
-		t.Fatalf("current attempt: %v", err)
-	}
-	var resources attemptResourceSnapshot
-	if err := json.Unmarshal(attempt.ResourceSnapshot, &resources); err != nil {
-		t.Fatalf("decode resource snapshot: %v", err)
-	}
-	type oldTaskManifest struct {
-		TaskID             string     `json:"task_id"`
-		Repository         string     `json:"repository,omitempty"`
-		CloneURL           string     `json:"clone_url,omitempty"`
-		BaseBranch         string     `json:"base_branch,omitempty"`
-		TaskBranch         string     `json:"task_branch,omitempty"`
-		Prompt             string     `json:"prompt"`
-		OpenCodeCommand    []string   `json:"opencode_command,omitempty"`
-		ValidationCommand  []string   `json:"validation_command,omitempty"`
-		ValidationCommands [][]string `json:"validation_commands,omitempty"`
-		MaxFixAttempts     int        `json:"max_fix_attempts"`
-	}
-	decoder := json.NewDecoder(bytes.NewReader(resources.Secret.Data["task.json"]))
-	decoder.DisallowUnknownFields()
-	var manifest oldTaskManifest
-	if err := decoder.Decode(&manifest); err != nil {
-		t.Fatalf("strictly decode task.json with old worker schema: %v", err)
 	}
 }

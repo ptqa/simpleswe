@@ -20,6 +20,8 @@ repositories:
     default_branch: main
     worker:
       image: ghcr.io/simpleswe/simpleswe-worker:0.1.0
+      # The image must include a configured Bitbucket MCP so OpenCode can
+      # push, create/update the PR, and report its number to simpleswe.
     git:
       ssh_secret: widget-git-ssh
     bitbucket:

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 type Provider string
@@ -85,28 +86,35 @@ func validSecretName(name string) bool {
 	return true
 }
 
-type CreatePullRequestRequest struct {
-	Title             string
-	Description       string
-	SourceBranch      string
-	DestinationBranch string
-}
-
-type PullRequest struct {
-	ID      int
-	HTMLURL string
-}
-
 // PullRequestState is the provider-reported identity and lifecycle state used
 // to verify an owned pull request before starting follow-up work.
 type PullRequestState struct {
 	Number            int
 	State             string
+	HTMLURL           string
+	Title             string
 	SourceOwner       string
 	SourceRepository  string
 	SourceBranch      string
 	DestinationBranch string
 	HeadSHA           string
+}
+
+// ValidatePullRequestMetadata checks provider-returned display fields before
+// they become durable API data.
+func ValidatePullRequestMetadata(htmlURL, title string) error {
+	if len(htmlURL) == 0 || len(htmlURL) > 4<<10 || strings.IndexFunc(htmlURL, unicode.IsControl) >= 0 {
+		return errors.New("pull request URL is missing, too long, or contains control characters")
+	}
+	parsed, err := url.Parse(htmlURL)
+	if err != nil || parsed.String() != htmlURL || !parsed.IsAbs() || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopbackHost(parsed.Hostname()))) {
+		return errors.New("pull request URL must use HTTPS without credentials, query, or fragment (HTTP is allowed only for loopback test servers)")
+	}
+	if strings.TrimSpace(title) == "" || !utf8.ValidString(title) || utf8.RuneCountInString(title) > 256 || strings.IndexFunc(title, unicode.IsControl) >= 0 {
+		return errors.New("pull request title is blank, too long, or contains control characters")
+	}
+	return nil
 }
 
 // Event is the normalized subset of a provider webhook that can affect a

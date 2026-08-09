@@ -446,11 +446,8 @@ func TestBitbucketConfigurationAndMountedSecretErrors(t *testing.T) {
 	if _, err := router.client(target); err == nil || !forge.IsPermanent(err) {
 		t.Fatal("router.client(missing) error = nil")
 	}
-	if _, err := router.CreatePullRequest(context.Background(), target, forge.CreatePullRequestRequest{}); err == nil || !forge.IsPermanent(err) {
-		t.Fatal("CreatePullRequest(missing route) error = nil")
-	}
-	if _, _, err := router.FindPullRequest(context.Background(), target, "branch", "main", "task"); err == nil || !forge.IsPermanent(err) {
-		t.Fatal("FindPullRequest(missing route) error = nil")
+	if _, err := router.GetPullRequest(context.Background(), target, 42); err == nil || !forge.IsPermanent(err) {
+		t.Fatal("GetPullRequest(missing route) error = nil")
 	}
 
 	invalid := config.Config{Repositories: config.RepositoryConfigs{{}}}

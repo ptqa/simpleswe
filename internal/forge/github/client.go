@@ -1,7 +1,6 @@
 package github
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,119 +69,8 @@ func NewClient(baseURL, token string) (*Client, error) {
 	return &Client{baseURL: parsed, token: token, httpClient: http.DefaultClient}, nil
 }
 
-func (c *Client) CreatePullRequest(ctx context.Context, owner, repository string, input forge.CreatePullRequestRequest) (_ forge.PullRequest, resultErr error) {
-	endpoint, err := c.endpoint(owner, repository)
-	if err != nil {
-		return forge.PullRequest{}, forge.MarkPermanent(err)
-	}
-	body, err := json.Marshal(struct {
-		Title string `json:"title"`
-		Body  string `json:"body"`
-		Head  string `json:"head"`
-		Base  string `json:"base"`
-	}{input.Title, input.Description, input.SourceBranch, input.DestinationBranch})
-	if err != nil {
-		return forge.PullRequest{}, fmt.Errorf("encode GitHub request: %w", err)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return forge.PullRequest{}, fmt.Errorf("create GitHub request: %w", err)
-	}
-	c.setHeaders(request)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.do(request)
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return forge.PullRequest{}, fmt.Errorf("GitHub request context: %w", contextErr)
-		}
-		return forge.PullRequest{}, fmt.Errorf("GitHub request failed: %w", err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, response.Body.Close()) }()
-	responseBody, err := readBounded(response.Body)
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return forge.PullRequest{}, fmt.Errorf("GitHub response context: %w", contextErr)
-		}
-		return forge.PullRequest{}, fmt.Errorf("read GitHub response: %w", err)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return forge.PullRequest{}, c.httpError(response, responseBody)
-	}
-	var decoded pullRequestResponse
-	if err := json.Unmarshal(responseBody, &decoded); err != nil {
-		return forge.PullRequest{}, forge.MarkPermanent(fmt.Errorf("decode GitHub response: %w", err))
-	}
-	pullRequest, err := validatePullRequest(decoded, "decode GitHub response")
-	return pullRequest, forge.MarkPermanent(err)
-}
-
-func (c *Client) FindPullRequest(ctx context.Context, owner, repository, sourceBranch, destinationBranch, taskMarker string) (_ forge.PullRequest, _ bool, resultErr error) {
-	endpoint, err := c.endpoint(owner, repository)
-	if err != nil {
-		return forge.PullRequest{}, false, forge.MarkPermanent(err)
-	}
-	target, err := url.Parse(endpoint)
-	if err != nil {
-		return forge.PullRequest{}, false, fmt.Errorf("parse GitHub endpoint: %w", err)
-	}
-	query := target.Query()
-	query.Set("state", "open")
-	query.Set("head", owner+":"+sourceBranch)
-	query.Set("base", destinationBranch)
-	target.RawQuery = query.Encode()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		return forge.PullRequest{}, false, fmt.Errorf("create GitHub lookup request: %w", err)
-	}
-	c.setHeaders(request)
-	response, err := c.do(request)
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return forge.PullRequest{}, false, fmt.Errorf("GitHub lookup context: %w", contextErr)
-		}
-		return forge.PullRequest{}, false, fmt.Errorf("GitHub lookup failed: %w", err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, response.Body.Close()) }()
-	body, err := readBounded(response.Body)
-	if err != nil {
-		if contextErr := ctx.Err(); contextErr != nil {
-			return forge.PullRequest{}, false, fmt.Errorf("GitHub lookup response context: %w", contextErr)
-		}
-		return forge.PullRequest{}, false, fmt.Errorf("read GitHub lookup response: %w", err)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return forge.PullRequest{}, false, c.httpError(response, body)
-	}
-	var decoded []pullRequestResponse
-	if err := json.Unmarshal(body, &decoded); err != nil {
-		return forge.PullRequest{}, false, forge.MarkPermanent(fmt.Errorf("decode GitHub lookup response: %w", err))
-	}
-	marker := "simpleswe task " + taskMarker
-	for _, candidate := range decoded {
-		if candidate.Head.Ref != sourceBranch || candidate.Base.Ref != destinationBranch || !strings.Contains(candidate.Body, marker) {
-			continue
-		}
-		state := strings.ToLower(candidate.State)
-		if candidate.Merged {
-			state = "merged"
-		}
-		if state != "open" {
-			continue
-		}
-		if candidate.Head.Repository.Owner.Login == "" || candidate.Head.Repository.Name == "" {
-			return forge.PullRequest{}, false, forge.MarkPermanent(errors.New("decode GitHub lookup response: missing source repository identity"))
-		}
-		if !strings.EqualFold(candidate.Head.Repository.Owner.Login, owner) || !strings.EqualFold(candidate.Head.Repository.Name, repository) {
-			continue
-		}
-		pullRequest, err := validatePullRequest(candidate, "decode GitHub lookup response")
-		return pullRequest, err == nil, forge.MarkPermanent(err)
-	}
-	return forge.PullRequest{}, false, nil
-}
-
 // GetPullRequest reads current provider truth from the configured repository
-// endpoint. Response URLs are intentionally ignored.
+// endpoint.
 func (c *Client) GetPullRequest(ctx context.Context, owner, repository string, number int) (_ forge.PullRequestState, resultErr error) {
 	endpoint, err := c.pullRequestEndpoint(owner, repository, number)
 	if err != nil {
@@ -291,20 +179,6 @@ func (c *Client) httpError(response *http.Response, body []byte) *HTTPError {
 	}
 }
 
-func validatePullRequest(decoded pullRequestResponse, prefix string) (forge.PullRequest, error) {
-	if decoded.Number <= 0 {
-		return forge.PullRequest{}, errors.New(prefix + ": missing pull request id")
-	}
-	if decoded.HTMLURL == "" {
-		return forge.PullRequest{}, errors.New(prefix + ": missing pull request URL")
-	}
-	link, err := url.Parse(decoded.HTMLURL)
-	if err != nil || link.Host == "" || link.User != nil || (link.Scheme != "http" && link.Scheme != "https") {
-		return forge.PullRequest{}, errors.New(prefix + ": invalid pull request URL")
-	}
-	return forge.PullRequest{ID: decoded.Number, HTMLURL: decoded.HTMLURL}, nil
-}
-
 func validatePullRequestState(decoded pullRequestResponse) (forge.PullRequestState, error) {
 	state := strings.ToLower(decoded.State)
 	if decoded.Merged {
@@ -317,8 +191,11 @@ func validatePullRequestState(decoded pullRequestResponse) (forge.PullRequestSta
 	if err := forge.ValidateNormalizedIdentity("GitHub pull request head SHA", decoded.Head.SHA, true); err != nil {
 		return forge.PullRequestState{}, fmt.Errorf("decode GitHub pull request response: %w", err)
 	}
+	if err := forge.ValidatePullRequestMetadata(decoded.HTMLURL, decoded.Title); err != nil {
+		return forge.PullRequestState{}, fmt.Errorf("decode GitHub pull request response: %w", err)
+	}
 	return forge.PullRequestState{
-		Number: decoded.Number, State: state,
+		Number: decoded.Number, State: state, HTMLURL: decoded.HTMLURL, Title: decoded.Title,
 		SourceOwner: decoded.Head.Repository.Owner.Login, SourceRepository: decoded.Head.Repository.Name,
 		SourceBranch: decoded.Head.Ref, DestinationBranch: decoded.Base.Ref, HeadSHA: decoded.Head.SHA,
 	}, nil
@@ -353,7 +230,7 @@ func isLoopback(host string) bool {
 
 type pullRequestResponse struct {
 	Number  int    `json:"number"`
-	Body    string `json:"body"`
+	Title   string `json:"title"`
 	HTMLURL string `json:"html_url"`
 	State   string `json:"state"`
 	Merged  bool   `json:"merged"`

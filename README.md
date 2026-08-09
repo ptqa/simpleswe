@@ -1,6 +1,6 @@
 # simpleswe
 
-`simpleswe` is a Kubernetes-native supervisor for software-engineering tasks. Its CLI and k9s-style terminal UI create, observe, and control tasks that run as immutable Kubernetes Jobs. Each worker executes OpenCode in a repository-specific image, validates and pushes the changes, and creates a Bitbucket or GitHub pull request.
+`simpleswe` is a Kubernetes-native supervisor for software-engineering tasks. Its CLI and k9s-style terminal UI create, observe, and control tasks that run as immutable Kubernetes Jobs. OpenCode edits, commits, pushes, and creates or updates a Bitbucket or GitHub pull request; the worker validates the published result and the controller verifies it against provider truth.
 
 The CLI is also the automation boundary for external agents. Any agent that can run commands can create tasks and observe their results; agent choice, chat, conversation, and orchestration stay outside `simpleswe`.
 
@@ -9,13 +9,14 @@ Human operator / external agent
   -> simpleswe CLI or TUI
   -> simpleswe controller
   -> Kubernetes Job
-  -> OpenCode
-  -> repository validation
-  -> Git push
-  -> forge pull request
+  -> OpenCode edits, commits, pushes, and creates or updates the PR
+  -> OpenCode reports the PR number
+  -> worker validation and controller provider verification
 ```
 
 A Vaxis terminal UI provides a k9s-style operational view of tasks, attempts, Kubernetes resources, logs, validation results, and pull requests.
+
+Upgrade note: in-flight attempts from versions that emitted `branch_pushed` must be retried after upgrade. Existing verified/open pull-request lifecycle data remains readable.
 
 ## Status
 
@@ -26,8 +27,8 @@ The initial vertical slice supports:
 - controller restart reconciliation;
 - live and persisted Pod logs;
 - bounded OpenCode validation/fix loops;
-- deterministic task branches, commits, and non-force pushes;
-- Bitbucket Cloud and GitHub pull-request creation;
+- deterministic OpenCode-owned task branches, commits, pushes, and pull requests;
+- Bitbucket Cloud and GitHub provider verification;
 - cancellation and retry without rewriting attempt history;
 - task creation and operations through the internal HTTP API, CLI, and Vaxis TUI;
 - machine-safe task creation and observation for external agents;
@@ -42,7 +43,7 @@ The initial vertical slice supports:
 - a default or configured `ReadWriteOnce` StorageClass suitable for SQLite WAL locking;
 - Bitbucket or GitHub credentials for each configured repository;
 - a webhook signing secret for each configured forge provider;
-- a repository-specific worker image containing `simpleswe`, OpenCode, Git, GitHub CLI, SSH, language runtimes, and validation tools;
+- a repository-specific worker image containing `simpleswe`, OpenCode, Git, forge tooling and credentials, SSH, language runtimes, and validation tools;
 - Go 1.26.5 when building locally;
 - `kubectl` locally for automatic port-forwarding and TUI shell access.
 
@@ -68,7 +69,7 @@ docker build \
   -t ghcr.io/example/widget-worker:0.1.0 .
 ```
 
-Repository-specific worker images should extend this target and add only the runtimes and tools required by that repository.
+Repository-specific worker images should extend this target and add only the runtimes and tools required by that repository. They must also provide the forge access OpenCode uses to create or update the PR: install `gh` and expose `GH_TOKEN` for GitHub, or install and configure the Bitbucket MCP with suitable credentials. OpenCode reports the finished PR number with `simpleswe worker report --pull-request NUMBER`.
 
 ## Local Kubernetes with kind
 
@@ -110,14 +111,14 @@ kubectl -n simpleswe create secret generic bitbucket-widget \
   --from-literal=app-password='...'
 ```
 
-For GitHub, create a repository-scoped fine-grained token. `github.credentials_secret_name` identifies the controller Secret, whose `token` key is used to find and create pull requests. When no separate worker Secret is configured, HTTPS workers also mount this Secret to clone and push:
+For GitHub, create a repository-scoped fine-grained token. `github.credentials_secret_name` identifies the controller Secret used to inspect reported pull requests and process webhooks. When no separate worker Secret is configured, HTTPS workers also mount this Secret for Git access:
 
 ```sh
 kubectl -n simpleswe create secret generic github-widget \
   --from-literal=token='github_pat_...'
 ```
 
-GitHub review follow-ups use `gh`. Expose the worker token as `GH_TOKEN`, as shown in [`examples/values-kind.yaml`](examples/values-kind.yaml); the local example reuses the repository-scoped `github-simpleswe` Secret rather than duplicating the PAT.
+GitHub PR creation and review follow-ups use `gh`. Expose a worker token with PR write access as `GH_TOKEN`, as shown in [`examples/values-kind.yaml`](examples/values-kind.yaml); the local example reuses the repository-scoped `github-simpleswe` Secret rather than duplicating the PAT. The controller never creates or edits a fallback PR.
 
 For SSH Git access, create a worker Secret whose private key is named `ssh-privatekey`:
 
@@ -126,9 +127,9 @@ kubectl -n simpleswe create secret generic widget-git-ssh \
   --from-file=ssh-privatekey="$HOME/.ssh/widget_deploy_key"
 ```
 
-With GitHub SSH clone URLs, `git.ssh_secret` supplies worker clone/push credentials while `github.credentials_secret_name` still supplies the controller PR token. To separate GitHub HTTPS privileges, set `credentials.secret_name` to a worker-only Secret containing a `token` key. Only that Secret is mounted in the worker at `/run/secrets/repository`; the controller PR Secret does not enter the Job. Git scopes the token helper to the configured clone URL and will not return it for another host or repository.
+With GitHub SSH clone URLs, `git.ssh_secret` supplies worker clone/push credentials while `github.credentials_secret_name` supplies the controller inspection token. To separate GitHub HTTPS privileges, set `credentials.secret_name` to a worker-only Secret containing a `token` key. Only that Secret is mounted in the worker at `/run/secrets/repository`; the controller inspection Secret does not enter the Job. Git scopes the token helper to the configured clone URL and will not return it for another host or repository.
 
-Use repository-scoped credentials with only the permissions needed to clone, push task branches, read pull requests, and create pull requests. Secret values never belong in Helm values or controller configuration.
+Use repository-scoped credentials with only the permissions needed to clone, push task branches, and read or create/update pull requests. Bitbucket workers must expose these capabilities through their configured MCP. Secret values never belong in Helm values or controller configuration.
 
 ## Configuration
 

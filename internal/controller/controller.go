@@ -28,10 +28,9 @@ import (
 	"github.com/simpleswe/simpleswe/internal/task"
 )
 
-// PullRequestCreator is the forge surface owned by the pull-request saga.
-type PullRequestCreator interface {
-	CreatePullRequest(context.Context, forge.Target, forge.CreatePullRequestRequest) (forge.PullRequest, error)
-	FindPullRequest(context.Context, forge.Target, string, string, string) (forge.PullRequest, bool, error)
+// PullRequestInspector is the provider-truth surface used to verify a worker's
+// reported pull request.
+type PullRequestInspector interface {
 	GetPullRequest(context.Context, forge.Target, int) (forge.PullRequestState, error)
 }
 
@@ -39,7 +38,7 @@ type Controller struct {
 	store           *store.Store
 	kubernetes      kubernetes.Interface
 	config          config.Config
-	pullRequests    PullRequestCreator
+	pullRequests    PullRequestInspector
 	logger          *slog.Logger
 	locks           *keyedLocks
 	providerTimeout time.Duration
@@ -53,7 +52,7 @@ type attemptResourceSnapshot struct {
 
 var errResourceCreationBlocked = errors.New("resource creation blocked by current task outcome")
 
-func New(db *store.Store, client kubernetes.Interface, cfg config.Config, pullRequests PullRequestCreator) (*Controller, error) {
+func New(db *store.Store, client kubernetes.Interface, cfg config.Config, pullRequests PullRequestInspector) (*Controller, error) {
 	if db == nil {
 		return nil, errors.New("controller Store is nil")
 	}
@@ -61,7 +60,7 @@ func New(db *store.Store, client kubernetes.Interface, cfg config.Config, pullRe
 		return nil, errors.New("controller Kubernetes client is nil")
 	}
 	if pullRequests == nil {
-		return nil, errors.New("controller PullRequestCreator is nil")
+		return nil, errors.New("controller PullRequestInspector is nil")
 	}
 	if strings.TrimSpace(cfg.Controller.Namespace) == "" {
 		return nil, errors.New("controller namespace is empty")
@@ -237,7 +236,7 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 		unlock()
 		return store.Attempt{}, eventErr
 	}
-	plan.Attempt, _, _, err = c.buildAttemptSnapshot(current, plan.Attempt, repository)
+	plan.Attempt, _, _, err = c.buildAttemptSnapshot(ctx, current, plan.Attempt, repository)
 	if err != nil {
 		unlock()
 		return store.Attempt{}, err
@@ -253,7 +252,10 @@ func (c *Controller) RetryWithKey(ctx context.Context, taskID, idempotencyKey st
 	}
 	unlock()
 	if err := c.startAttempt(ctx, current, attempt, repository); err != nil {
-		return store.Attempt{}, err
+		var transient transientAttemptStartupError
+		if !errors.As(err, &transient) {
+			return store.Attempt{}, err
+		}
 	}
 	attempt, err = c.store.CurrentAttempt(ctx, taskID)
 	if err != nil {
@@ -345,10 +347,17 @@ func (c *Controller) startAttempt(ctx context.Context, taskRecord store.Task, at
 			_ = c.transition(ctx, taskRecord.ID, task.CREATING_JOB, task.FAILED, reason, "kubernetes")
 			return err
 		}
-		return c.store.RecordObservation(ctx, taskRecord.ID, "transient resource creation; retry pending "+reason, "kubernetes")
+		if observationErr := c.store.RecordObservation(ctx, taskRecord.ID, "transient resource creation; retry pending "+reason, "kubernetes"); observationErr != nil {
+			return fmt.Errorf("record transient resource creation: %w", observationErr)
+		}
+		return transientAttemptStartupError{err}
 	}
 	return c.completeAttemptResources(ctx, taskRecord.ID, attempt.ID, "retry worker Job created job="+jobs.Name(taskRecord.ID, attempt.Number))
 }
+
+type transientAttemptStartupError struct{ error }
+
+func (e transientAttemptStartupError) Unwrap() error { return e.error }
 
 func (c *Controller) completeAttemptResources(ctx context.Context, taskID, attemptID, reason string) error {
 	current, err := c.store.GetTask(ctx, taskID)
@@ -462,7 +471,7 @@ func (c *Controller) deleteJob(ctx context.Context, namespace, name string, uid 
 	return c.kubernetes.BatchV1().Jobs(namespace).Delete(ctx, name, options)
 }
 
-func (c *Controller) buildAttemptResources(taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (*batchv1.Job, *corev1.Secret, error) {
+func (c *Controller) buildAttemptResources(ctx context.Context, taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (*batchv1.Job, *corev1.Secret, error) {
 	jobConfig, err := c.jobConfig(repository)
 	if err != nil {
 		return nil, nil, err
@@ -478,16 +487,46 @@ func (c *Controller) buildAttemptResources(taskRecord store.Task, attempt store.
 	if attempt.TaskBranch != "" {
 		taskBranch = attempt.TaskBranch
 	}
+	target, err := forgeTarget(c.config, repository)
+	if err != nil {
+		return nil, nil, err
+	}
+	existingPullRequestNumber := 0
+	existingPullRequestHeadSHA := ""
+	if attempt.Number > 1 && attempt.TaskBranch != "" {
+		pullRequest, pullRequestErr := c.store.GetPullRequest(ctx, attempt.ID)
+		if errors.Is(pullRequestErr, store.ErrNotFound) && taskRecord.CurrentAttemptID != attempt.ID {
+			pullRequest, pullRequestErr = c.store.GetPullRequest(ctx, taskRecord.CurrentAttemptID)
+		}
+		if pullRequestErr != nil {
+			return nil, nil, fmt.Errorf("load existing pull request for follow-up manifest: %w", pullRequestErr)
+		}
+		if pullRequest.State != "open" || pullRequest.Number <= 0 || pullRequest.HeadBranch != taskBranch || pullRequest.BaseBranch != baseBranch {
+			return nil, nil, fmt.Errorf("%w: follow-up pull request does not match immutable branches", store.ErrConflict)
+		}
+		existingPullRequestNumber = pullRequest.Number
+		git, gitErr := c.store.LatestPullRequestGitResult(ctx, taskRecord.ID, pullRequest, attempt.ID)
+		if gitErr != nil {
+			return nil, nil, fmt.Errorf("load existing pull request head for follow-up manifest: %w", gitErr)
+		}
+		existingPullRequestHeadSHA = git.CommitSHA
+	}
 	job, secret, err := jobs.Build(jobConfig, jobs.TaskManifest{
-		TaskID:             taskRecord.ID,
-		Repository:         repository.Name,
-		CloneURL:           repository.CloneURL,
-		BaseBranch:         baseBranch,
-		TaskBranch:         taskBranch,
-		Prompt:             prompt,
-		OpenCodeCommand:    c.openCodeCommand(repository),
-		ValidationCommands: c.validationCommands(repository),
-		MaxFixAttempts:     c.maxFixAttempts(repository),
+		TaskID:                     taskRecord.ID,
+		Repository:                 repository.Name,
+		CloneURL:                   repository.CloneURL,
+		BaseBranch:                 baseBranch,
+		TaskBranch:                 taskBranch,
+		Prompt:                     prompt,
+		OpenCodeCommand:            c.openCodeCommand(repository),
+		ValidationCommands:         c.validationCommands(repository),
+		MaxFixAttempts:             c.maxFixAttempts(repository),
+		ForgeProvider:              string(target.Provider),
+		ForgeOwner:                 target.Owner,
+		ForgeRepository:            target.Repository,
+		RequestedPullRequestTitle:  taskRecord.PRTitle,
+		ExistingPullRequestNumber:  existingPullRequestNumber,
+		ExistingPullRequestHeadSHA: existingPullRequestHeadSHA,
 	}, jobs.Attempt{ID: attempt.ID, Number: attempt.Number})
 	if err != nil {
 		return nil, nil, err
@@ -517,7 +556,7 @@ func (c *Controller) prepareAttemptSnapshot(ctx context.Context, taskRecord stor
 	} else if err != nil {
 		return nil, nil, err
 	}
-	snapshotted, job, secret, err := c.buildAttemptSnapshot(taskRecord, attempt, repository)
+	snapshotted, job, secret, err := c.buildAttemptSnapshot(ctx, taskRecord, attempt, repository)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -536,8 +575,8 @@ func hasRunningForgeEvent(events []store.ForgeEvent) bool {
 	return false
 }
 
-func (c *Controller) buildAttemptSnapshot(taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (store.Attempt, *batchv1.Job, *corev1.Secret, error) {
-	job, secret, err := c.buildAttemptResources(taskRecord, attempt, repository)
+func (c *Controller) buildAttemptSnapshot(ctx context.Context, taskRecord store.Task, attempt store.Attempt, repository config.RepositoryConfig) (store.Attempt, *batchv1.Job, *corev1.Secret, error) {
+	job, secret, err := c.buildAttemptResources(ctx, taskRecord, attempt, repository)
 	if err != nil {
 		return store.Attempt{}, nil, nil, err
 	}
@@ -556,7 +595,7 @@ func (c *Controller) buildAttemptSnapshot(taskRecord store.Task, attempt store.A
 }
 
 func (c *Controller) validateAttemptConfig(params store.CreateTaskParams, repository config.RepositoryConfig) error {
-	_, _, err := c.buildAttemptResources(store.Task{ID: "swe-validation", Prompt: params.Prompt}, store.Attempt{ID: "swe-attempt-validation", Number: 1}, repository)
+	_, _, err := c.buildAttemptResources(context.Background(), store.Task{ID: "swe-validation", Prompt: params.Prompt, PRTitle: params.PRTitle}, store.Attempt{ID: "swe-attempt-validation", Number: 1}, repository)
 	if err != nil {
 		return fmt.Errorf("validate worker manifest before task acceptance: %w", err)
 	}

@@ -36,8 +36,9 @@ type AppendPodLogResult struct {
 	AppendedBytes int
 }
 
-type PendingWorkerEvent struct {
-	ID, JobName, PodName, Content string
+type WorkerLogEvent struct {
+	ID, PodUID, TaskID, AttemptID string
+	JobName, PodName, Content     string
 }
 
 type LogChunk struct {
@@ -75,7 +76,7 @@ func (s *Store) AppendPodLog(ctx context.Context, p AppendPodLogParams, maxBytes
 		return AppendPodLogResult{}, fmt.Errorf("begin Pod log append: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := ensureAttemptTx(ctx, tx, p.TaskID, p.AttemptID); err != nil {
+	if err := requireAppendableAttemptTx(ctx, tx, p.TaskID, p.AttemptID); err != nil {
 		return AppendPodLogResult{}, err
 	}
 	now := stamp(time.Now().UTC())
@@ -162,6 +163,34 @@ func (s *Store) AppendPodLog(ctx context.Context, p AppendPodLogParams, maxBytes
 		return AppendPodLogResult{}, fmt.Errorf("commit Pod log append: %w", err)
 	}
 	return result, nil
+}
+
+func requireAppendableAttemptTx(ctx context.Context, tx *sql.Tx, taskID, attemptID string) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE task_attempts SET logs_exhausted = 0
+		WHERE id = ? AND task_id = ? AND logs_exhausted = 0
+		  AND EXISTS (
+			SELECT 1 FROM tasks
+			WHERE id = ? AND current_attempt_id = ?
+		  )`, attemptID, taskID, taskID, attemptID)
+	if err != nil {
+		return fmt.Errorf("verify appendable attempt: %w", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm appendable attempt: %w", err)
+	}
+	if affected == 1 {
+		return nil
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM task_attempts WHERE task_id = ? AND id = ?)`, taskID, attemptID).Scan(&found); err != nil {
+		return fmt.Errorf("inspect non-appendable attempt: %w", err)
+	}
+	if found == 0 {
+		return fmt.Errorf("%w: attempt %s", ErrNotFound, attemptID)
+	}
+	return fmt.Errorf("%w: attempt %q is stale or its logs are exhausted", ErrConflict, attemptID)
 }
 
 func ensureAttemptTx(ctx context.Context, tx *sql.Tx, taskID, attemptID string) error {
@@ -266,16 +295,50 @@ func (s *Store) GetPodLogCursor(ctx context.Context, podUID string) (PodLogCurso
 	return result, nil
 }
 
-func (s *Store) ListPendingWorkerEvents(ctx context.Context, podUID string) (_ []PendingWorkerEvent, resultErr error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, job_name, pod_name, content FROM worker_log_events WHERE pod_uid = ? AND processed = 0 ORDER BY rowid`, podUID)
+func (s *Store) GetWorkerLogEvent(ctx context.Context, id string) (WorkerLogEvent, error) {
+	var event WorkerLogEvent
+	err := s.db.QueryRowContext(ctx, `SELECT id, pod_uid, task_id, attempt_id, job_name, pod_name, content FROM worker_log_events WHERE id = ?`, id).Scan(
+		&event.ID, &event.PodUID, &event.TaskID, &event.AttemptID, &event.JobName, &event.PodName, &event.Content,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WorkerLogEvent{}, fmt.Errorf("%w: worker log event %s", ErrNotFound, id)
+	}
+	if err != nil {
+		return WorkerLogEvent{}, fmt.Errorf("get worker log event: %w", err)
+	}
+	return event, nil
+}
+
+func (s *Store) ListPendingWorkerEventPodUIDs(ctx context.Context) (_ []string, resultErr error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT pod_uid FROM worker_log_events WHERE processed = 0 GROUP BY pod_uid ORDER BY MIN(rowid)`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending worker event Pods: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
+	var result []string
+	for rows.Next() {
+		var podUID string
+		if err := rows.Scan(&podUID); err != nil {
+			return nil, fmt.Errorf("scan pending worker event Pod: %w", err)
+		}
+		result = append(result, podUID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending worker event Pods: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) ListPendingWorkerEvents(ctx context.Context, podUID string) (_ []WorkerLogEvent, resultErr error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, pod_uid, task_id, attempt_id, job_name, pod_name, content FROM worker_log_events WHERE pod_uid = ? AND processed = 0 ORDER BY rowid`, podUID)
 	if err != nil {
 		return nil, fmt.Errorf("list pending worker events: %w", err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
-	var result []PendingWorkerEvent
+	var result []WorkerLogEvent
 	for rows.Next() {
-		var event PendingWorkerEvent
-		if err := rows.Scan(&event.ID, &event.JobName, &event.PodName, &event.Content); err != nil {
+		var event WorkerLogEvent
+		if err := rows.Scan(&event.ID, &event.PodUID, &event.TaskID, &event.AttemptID, &event.JobName, &event.PodName, &event.Content); err != nil {
 			return nil, err
 		}
 		result = append(result, event)
@@ -283,14 +346,41 @@ func (s *Store) ListPendingWorkerEvents(ctx context.Context, podUID string) (_ [
 	return result, rows.Err()
 }
 
+func (s *Store) HasPendingWorkerEvents(ctx context.Context, taskID, attemptID string) (bool, error) {
+	var pending int
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM worker_log_events WHERE task_id = ? AND attempt_id = ? AND processed = 0)`, taskID, attemptID).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("check pending worker events: %w", err)
+	}
+	return pending == 1, nil
+}
+
 func (s *Store) MarkWorkerEventProcessed(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE worker_log_events SET processed = 1 WHERE id = ?`, id)
 	return err
 }
 
-func (s *Store) MarkPodLogsExhausted(ctx context.Context, podUID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE pod_log_state SET exhausted = 1, updated_at = ? WHERE pod_uid = ?`, stamp(time.Now().UTC()), podUID)
-	return err
+func (s *Store) MarkPodLogsExhausted(ctx context.Context, podUID, taskID, attemptID string) error {
+	if podUID == "" || taskID == "" || attemptID == "" {
+		return errors.New("complete Pod log identity is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO pod_log_state (pod_uid, task_id, attempt_id, exhausted, updated_at)
+		VALUES (?, ?, ?, 1, ?)
+		ON CONFLICT(pod_uid) DO UPDATE SET exhausted = 1, updated_at = excluded.updated_at
+		WHERE pod_log_state.task_id = excluded.task_id AND pod_log_state.attempt_id = excluded.attempt_id`,
+		podUID, taskID, attemptID, stamp(time.Now().UTC()))
+	if err != nil {
+		return fmt.Errorf("mark Pod %q logs exhausted: %w", podUID, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("confirm Pod %q logs exhausted: %w", podUID, err)
+	}
+	if affected != 1 {
+		return fmt.Errorf("%w: Pod UID %q belongs to another attempt", ErrConflict, podUID)
+	}
+	return nil
 }
 
 func (s *Store) ReadLogTailCursor(ctx context.Context, taskID, attemptID string, lines int) (_ string, _ int64, resultErr error) {

@@ -5,6 +5,13 @@ info:
   description: |
     API for submitting and observing software-engineering tasks.
 
+    OpenCode owns the repository and forge workflow for the resulting pull
+    request: it edits, commits, pushes, creates or updates the pull request,
+    and writes its title and body. SimpleSWE validates the worker-reported
+    result and verifies the reported pull request against provider truth.
+    Pull-request URLs and titles in responses are provider-derived canonical
+    and actual values.
+
     The controller API is private by default on its ClusterIP and is reached
     through port-forward. Signed webhook paths are served by the separate
     webhook listener and `-webhooks` ClusterIP Service. No authentication
@@ -121,7 +128,7 @@ paths:
       tags: [tasks]
       operationId: create_task
       summary: Create a task
-      description: Queue a software-engineering task for asynchronous execution.
+      description: Queue a software-engineering task for asynchronous execution. OpenCode owns the resulting repository and forge workflow, including commit, push, pull-request creation or update, and pull-request title and body. SimpleSWE validates the result and provider-verifies the reported pull request.
       requestBody:
         required: true
         description: Task repository and instruction to submit for execution.
@@ -291,7 +298,7 @@ paths:
       summary: Get the task pull-request result
       responses:
         '200':
-          description: Pull-request result.
+          description: Provider-verified pull-request result.
           content:
             application/json:
               schema:
@@ -492,7 +499,7 @@ components:
           minLength: 1
           maxLength: 256
           pattern: .*\S.*
-          description: Optional pull request title. When provided, it is used as the PR title instead of the prompt.
+          description: Optional requested pull-request title passed to OpenCode for the task. It is not an authoritative controller-created title; the provider-reported pull-request title is returned in results.
 
     WebhookPayload:
       type: object
@@ -601,7 +608,7 @@ components:
 
     Task:
       type: object
-      description: Task request, lifecycle state, execution records, and results.
+      description: Task request, lifecycle state, execution records, and provider-verified results. OpenCode owns repository and forge actions for the resulting pull request; SimpleSWE validates and provider-verifies the reported result.
       additionalProperties: false
       required:
         - task_id
@@ -631,7 +638,7 @@ components:
         pr_title:
           type: string
           readOnly: true
-          description: Optional pull request title provided at creation.
+          description: Optional requested pull-request title passed to OpenCode at task creation; it is not the authoritative pull-request title.
         state:
           $ref: '#/components/schemas/TaskState'
         created_at:
@@ -950,7 +957,7 @@ components:
 
     GitResult:
       type: object
-      description: Git branch and commit outcome for an attempt.
+      description: Validated Git branch and commit outcome for an attempt. OpenCode owns committing and pushing; SimpleSWE validates the worker-reported branch and commit.
       additionalProperties: false
       required: [state]
       properties:
@@ -972,7 +979,7 @@ components:
 
     PullRequestResult:
       type: object
-      description: Pull request creation outcome for an attempt.
+      description: Provider-verified pull-request result for an attempt. OpenCode owns pull-request creation, updates, title, and body; SimpleSWE verifies the reported pull request with the provider.
       additionalProperties: false
       required: [state]
       properties:
@@ -988,9 +995,11 @@ components:
           type: string
           format: uri
           readOnly: true
+          description: Canonical pull-request URL returned by the configured provider after SimpleSWE verifies the reported pull request. An OpenCode-provided URL is not authoritative.
         title:
           type: string
           readOnly: true
+          description: Actual pull-request title returned by the configured provider after SimpleSWE verifies the reported pull request; it may differ from the requested pr_title.
         head_branch:
           type: string
           minLength: 1
@@ -1005,7 +1014,7 @@ components:
 
     PullRequestResponse:
       type: object
-      description: Response containing the pull request result for a task.
+      description: Response containing the provider-verified pull-request result for a task. OpenCode owns pull-request creation, updates, title, and body; SimpleSWE validates and provider-verifies the reported pull request.
       additionalProperties: false
       required: [data]
       properties:

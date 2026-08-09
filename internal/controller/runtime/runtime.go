@@ -63,11 +63,12 @@ type Runtime struct {
 	backend *Backend
 	options Options
 
-	mu       sync.Mutex
-	running  bool
-	pods     map[string]bool
-	cleanups map[string]*cleanupRun
-	tasks    sync.WaitGroup
+	mu          sync.Mutex
+	running     bool
+	pods        map[string]bool
+	eventDrains map[string]*sync.Mutex
+	cleanups    map[string]*cleanupRun
+	tasks       sync.WaitGroup
 }
 
 type cleanupRun struct {
@@ -114,7 +115,7 @@ func NewRuntime(client kubernetes.Interface, db *store.Store, controller Control
 	}
 	return &Runtime{
 		kubernetes: client, store: db, controller: controller, logEvents: logEvents, backend: backend, options: options,
-		pods: make(map[string]bool), cleanups: make(map[string]*cleanupRun),
+		pods: make(map[string]bool), eventDrains: make(map[string]*sync.Mutex), cleanups: make(map[string]*cleanupRun),
 	}, nil
 }
 
@@ -174,6 +175,9 @@ func (r *Runtime) recoverDurableWork(ctx context.Context) error {
 
 func (r *Runtime) recoverOnce(ctx context.Context) error {
 	var errs []error
+	if err := r.recoverWorkerEvents(ctx); err != nil {
+		r.options.Logger.ErrorContext(ctx, "recover pending worker events", "error", err)
+	}
 	if r.options.ProcessForgeEvents != nil {
 		if err := r.options.ProcessForgeEvents(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("process forge events: %w", err))
@@ -201,6 +205,20 @@ func (r *Runtime) recoverOnce(ctx context.Context) error {
 		}
 	}
 	r.recoverSecretCleanups(ctx)
+	return errors.Join(errs...)
+}
+
+func (r *Runtime) recoverWorkerEvents(ctx context.Context) error {
+	podUIDs, err := r.store.ListPendingWorkerEventPodUIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("list pending worker event Pods: %w", err)
+	}
+	var errs []error
+	for _, podUID := range podUIDs {
+		if err := r.drainWorkerEvents(ctx, podUID); err != nil {
+			errs = append(errs, fmt.Errorf("drain worker events for Pod %q: %w", podUID, err))
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -425,6 +443,16 @@ func (r *Runtime) CollectPodLogs(ctx context.Context, pod *corev1.Pod) error {
 		if cursor.Exhausted {
 			return nil
 		}
+		currentAttempt, err := r.store.GetAttempt(ctx, taskID, attempt.ID)
+		if err != nil {
+			return fmt.Errorf("get attempt for Pod log recovery: %w", err)
+		}
+		if currentAttempt.LogsExhausted {
+			if err := r.store.MarkPodLogsExhausted(ctx, podUID, taskID, attempt.ID); err != nil {
+				return fmt.Errorf("recover exhausted Pod logs: %w", err)
+			}
+			return nil
+		}
 		var since *time.Time
 		if !cursor.Timestamp.IsZero() {
 			value := cursor.Timestamp
@@ -453,7 +481,10 @@ func (r *Runtime) CollectPodLogs(ctx context.Context, pod *corev1.Pod) error {
 				if err := r.logEvents.WorkerLogsExhausted(ctx, jobName, pod.Name); err != nil {
 					return fmt.Errorf("record exhausted worker logs: %w", err)
 				}
-				return r.store.MarkPodLogsExhausted(ctx, podUID)
+				if err := r.store.MarkPodLogsExhausted(ctx, podUID, taskID, attempt.ID); err != nil {
+					return fmt.Errorf("mark Pod logs exhausted: %w", err)
+				}
+				return nil
 			}
 		}
 		if !sleepContext(ctx, backoff) {
@@ -487,15 +518,23 @@ func validateDurableWorkerEvent(event protocol.Event) error {
 		return errors.New("worker event task ID is empty")
 	}
 	switch event.Type {
-	case protocol.EventAgentStarted, protocol.EventValidationSucceeded, "worker_failed":
+	case protocol.EventAgentStarted, protocol.EventValidationSucceeded:
+		return nil
+	case protocol.EventWorkerFailed:
+		if err := protocol.ValidateEvent(event, ""); err != nil {
+			return fmt.Errorf("validate worker failure event: %w", err)
+		}
 		return nil
 	case protocol.EventValidationStarted, protocol.EventValidationResult, protocol.EventValidationFailed:
 		if len(event.Command) == 0 {
 			return fmt.Errorf("worker event %q command is empty", event.Type)
 		}
 		return nil
-	case protocol.EventBranchPushed:
-		return protocol.ValidateEvent(event, event.Branch)
+	case protocol.EventPullRequestPublished, protocol.EventPullRequestReady, protocol.EventBranchPushed:
+		if err := protocol.ValidateEvent(event, event.Branch); err != nil {
+			return fmt.Errorf("validate worker identity event: %w", err)
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported worker event type %q", event.Type)
 	}
@@ -586,6 +625,15 @@ func rawKubernetesLogLine(line []byte) ([]byte, time.Time, string) {
 }
 
 func (r *Runtime) drainWorkerEvents(ctx context.Context, podUID string) error {
+	r.mu.Lock()
+	drain := r.eventDrains[podUID]
+	if drain == nil {
+		drain = new(sync.Mutex)
+		r.eventDrains[podUID] = drain
+	}
+	r.mu.Unlock()
+	drain.Lock()
+	defer drain.Unlock()
 	events, err := r.store.ListPendingWorkerEvents(ctx, podUID)
 	if err != nil {
 		return err

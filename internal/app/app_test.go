@@ -21,7 +21,7 @@ const (
 	defaultManifest = "/run/simpleswe/task.json"
 	usageRoot       = "usage: simpleswe <controller|worker|tui|task>"
 	usageController = "usage: simpleswe controller --config PATH --database PATH"
-	usageWorker     = "usage: simpleswe worker [--manifest PATH]"
+	usageWorker     = "usage: simpleswe worker [--manifest PATH] | simpleswe worker report (--pull-request NUMBER | --failure REASON)"
 	usageTUI        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
 	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
 	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
@@ -50,6 +50,11 @@ func TestRunDispatchesCommandsAndRuntimeConfiguration(t *testing.T) {
 			name: "worker",
 			args: []string{"worker"},
 			want: []string{"workspace /isolated/workspace-1", "worker manifest=" + defaultManifest + " workspace=/isolated/workspace-1", "close workspace"},
+		},
+		{
+			name: "worker report",
+			args: []string{"worker", "report", "--pull-request", "42"},
+			want: []string{"worker report args=--pull-request 42"},
 		},
 		{
 			name: "tui with automatic port forward",
@@ -507,6 +512,10 @@ func recordingDependencies(t *testing.T, wantCtx context.Context, wantStdin io.R
 			checkContext(ctx)
 			checkOutput(stdout, stderr)
 			*calls = append(*calls, "worker manifest="+manifestPath+" workspace="+workspace)
+			return nil
+		},
+		ReportWorker: func(args []string) error {
+			*calls = append(*calls, "worker report args="+strings.Join(args, " "))
 			return nil
 		},
 		RunTUI: func(ctx context.Context, address, kubeContext, namespace string, stdin io.Reader, stdout, stderr io.Writer) error {

@@ -36,7 +36,7 @@ func TestNewRejectsInvalidDependenciesAndConfiguration(t *testing.T) {
 			_, err := New(fixture.store, nil, valid, fixture.pullRequests)
 			return err
 		}, "Kubernetes client is nil"},
-		{"nil pull requests", func() error { _, err := New(fixture.store, fixture.kube, valid, nil); return err }, "PullRequestCreator is nil"},
+		{"nil pull requests", func() error { _, err := New(fixture.store, fixture.kube, valid, nil); return err }, "PullRequestInspector is nil"},
 		{"empty namespace", func() error {
 			cfg := valid
 			cfg.Controller.Namespace = " "
@@ -222,33 +222,37 @@ func TestWorkerEventAuthorizationAndStateErrors(t *testing.T) {
 	if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventValidationSucceeded, TaskID: created.ID}); err == nil || !strings.Contains(err.Error(), "validation_succeeded") {
 		t.Fatalf("out-of-order validation error = %v", err)
 	}
-	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-1", jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: created.ID}); err != nil {
+	agentStarted := protocol.Event{Type: protocol.EventAgentStarted, TaskID: created.ID}
+	queueDurableWorkerEvent(t, fixture, "event-1", "pod-uid", jobName, podName, agentStarted)
+	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-1", jobName, podName, agentStarted); err != nil {
 		t.Fatalf("HandleWorkerEventOnce(): %v", err)
 	}
-	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-2", jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: created.ID, Command: []string{"go", "test"}}); err != nil {
+	validationStarted := protocol.Event{Type: protocol.EventValidationStarted, TaskID: created.ID, Command: []string{"go", "test"}}
+	queueDurableWorkerEvent(t, fixture, "event-2", "pod-uid", jobName, podName, validationStarted)
+	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-2", jobName, podName, validationStarted); err != nil {
 		t.Fatalf("validation start: %v", err)
 	}
-	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-2", jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: created.ID, Command: []string{"go", "test"}}); err != nil {
+	if err := control.HandleWorkerEventOnce(fixture.ctx, "event-2", jobName, podName, validationStarted); err != nil {
 		t.Fatalf("validation start replay: %v", err)
 	}
 }
 
 func TestBranchPushedValidationErrors(t *testing.T) {
-	fixture := newFixture(t)
-	created := createRunningTask(t, fixture, "branch validation", "branch-validation")
-	jobName, podName := jobs.Name(created.ID, 1), "worker-pod-a1"
 	for _, test := range []struct {
 		name   string
 		branch string
 		want   string
 	}{
-		{"empty", "", "branch is empty"},
-		{"wrong attempt", "simpleswe/wrong-a1", "does not match attempt branch"},
+		{"empty", "", "does not match expected branch"},
+		{"wrong attempt", "simpleswe/wrong-a1", "does not match expected branch"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: created.ID, Branch: test.branch, CommitSHA: fullCommitSHA})
+			fixture := newFixture(t)
+			created := createRunningTask(t, fixture, "branch validation", "branch-validation-"+test.name)
+			jobName, podName := jobs.Name(created.ID, 1), "worker-pod-a1"
+			err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: created.ID, PullRequestNumber: 42, Branch: test.branch, CommitSHA: fullCommitSHA})
 			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("branch_pushed error = %v; want %q", err, test.want)
+				t.Fatalf("pull_request_ready error = %v; want %q", err, test.want)
 			}
 		})
 	}
@@ -259,21 +263,20 @@ func TestPermanentPullRequestFailureIsDurablyTerminal(t *testing.T) {
 	created := createRunningTask(t, fixture, "permanent provider failure", "permanent-provider")
 	jobName, podName := jobs.Name(created.ID, 1), "worker-pod-a1"
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventAgentStarted, TaskID: created.ID})
+	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventPullRequestPublished, TaskID: created.ID, PullRequestNumber: 42, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationStarted, TaskID: created.ID, Command: []string{"go", "test"}})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationResult, TaskID: created.ID, Command: []string{"go", "test"}})
 	handleEvent(t, fixture, jobName, podName, protocol.Event{Type: protocol.EventValidationSucceeded, TaskID: created.ID})
-	fixture.pullRequests.failFind = 1
-	fixture.pullRequests.findErr = &bitbucket.HTTPError{StatusCode: 400, Status: "400 Bad Request", Message: "invalid branch"}
-	err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventBranchPushed, TaskID: created.ID, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA})
+	fixture.pullRequests.getErr = &bitbucket.HTTPError{StatusCode: 400, Status: "400 Bad Request", Message: "invalid branch"}
+	err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobName, podName, protocol.Event{Type: protocol.EventPullRequestReady, TaskID: created.ID, PullRequestNumber: 42, Branch: "simpleswe/" + created.ID + "-a1", CommitSHA: fullCommitSHA})
 	if err == nil || !strings.Contains(err.Error(), "invalid branch") {
-		t.Fatalf("branch_pushed error = %v; want provider failure", err)
+		t.Fatalf("pull_request_ready error = %v; want provider failure", err)
 	}
 	if got := getTask(t, fixture, created.ID); got.State != task.FAILED {
 		t.Fatalf("permanent provider state = %q; want FAILED", got.State)
 	}
-	pr, getErr := fixture.store.GetPullRequest(fixture.ctx, created.CurrentAttemptID)
-	if getErr != nil || pr.State != "failed" {
-		t.Fatalf("durable pull request = %#v, %v; want failed", pr, getErr)
+	if candidate, getErr := fixture.store.GetPullRequest(fixture.ctx, created.CurrentAttemptID); getErr != nil || candidate.State != "reported" || candidate.URL != "" {
+		t.Fatalf("permanent mismatch changed durable candidate: %#v, %v", candidate, getErr)
 	}
 }
 
@@ -420,6 +423,9 @@ func TestManifestParsingErrors(t *testing.T) {
 	}
 	if _, err := attemptManifest(store.Attempt{ID: "malformed", ManifestJSON: []byte("{")}); err == nil || !strings.Contains(err.Error(), "decode immutable manifest") {
 		t.Fatalf("malformed manifest error = %v", err)
+	}
+	if _, err := attemptManifest(store.Attempt{ID: "invalid", ManifestJSON: []byte(`{}`)}); err == nil || !strings.Contains(err.Error(), "validate immutable manifest") {
+		t.Fatalf("invalid manifest error = %v", err)
 	}
 }
 
