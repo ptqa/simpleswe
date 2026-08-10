@@ -219,7 +219,7 @@ func TestPodLogRecoveryClosesOwnedCursorAfterAttemptExhaustion(t *testing.T) {
 		t.Fatalf("recovery replayed logs or exhaustion callback: opens/calls = %d/%d, want 1/1", opens, controller.exhaustionCalls)
 	}
 	got, err := db.ReadLogTail(context.Background(), taskRecord.ID, attempt.ID, 10)
-	if err != nil || got != "final line\n" {
+	if err != nil || got != "2026-08-06T12:00:00Z final line\n" {
 		t.Fatalf("recovered logs = %q, %v; want final line once", got, err)
 	}
 }
@@ -367,7 +367,7 @@ func TestPodLogCollectionRetriesEOFWithoutWatchUpdateUntilJobTerminal(t *testing
 		t.Fatalf("log stream opens = %d, want independent retry after EOF", opens)
 	}
 	got, err := db.ReadLogTail(context.Background(), taskRecord.ID, attempt.ID, 10)
-	if err != nil || got != "first\nsecond\n" {
+	if err != nil || got != "2026-08-06T12:00:00.000000001Z first\n2026-08-06T12:00:00.000000002Z second\n" {
 		t.Fatalf("retried logs = %q, %v", got, err)
 	}
 }
