@@ -510,7 +510,8 @@ func (r *Runtime) readPodLogStream(ctx context.Context, stream io.ReadCloser, po
 	for {
 		line, oversized, err := readBoundedLine(reader, r.options.MaxLogBytes+128)
 		if len(line) > 0 {
-			raw, timestamp, timestampText := rawKubernetesLogLine(line)
+			content, timestamp, timestampText := rawKubernetesLogLine(line)
+			raw := line
 			if oversized {
 				raw = append(raw, 0) // Force the durable quota path without retaining the discarded suffix.
 			}
@@ -525,16 +526,16 @@ func (r *Runtime) readPodLogStream(ctx context.Context, stream io.ReadCloser, po
 				TaskID: taskID, AttemptID: attemptID, PodUID: string(pod.UID), JobName: jobName, PodName: pod.Name,
 				Timestamp: timestamp, TimestampOrdinal: ordinal, UntimestampedOrdinal: untimestamped, Content: raw,
 			}
-			if bytes.HasPrefix(raw, []byte(protocol.EventPrefix)) && len(raw) <= 1<<20 {
-				if _, ok := r.parseProtocolLine(ctx, jobName, pod.Name, raw); ok {
+			if bytes.HasPrefix(content, []byte(protocol.EventPrefix)) && len(content) <= 1<<20 {
+				if _, ok := r.parseProtocolLine(ctx, jobName, pod.Name, content); ok {
 					identity := timestampText + "/" + strconv.Itoa(ordinal)
 					if timestamp.IsZero() {
 						identity = "line/" + strconv.Itoa(untimestamped)
 					}
 					params.WorkerEventID = string(pod.UID) + "/" + identity
-					params.WorkerEvent = strings.TrimRight(string(raw), "\r\n")
+					params.WorkerEvent = strings.TrimRight(string(content), "\r\n")
 				}
-			} else if bytes.HasPrefix(raw, []byte(protocol.EventPrefix)) {
+			} else if bytes.HasPrefix(content, []byte(protocol.EventPrefix)) {
 				r.options.Logger.ErrorContext(ctx, "malformed worker event", "pod", pod.Name, "error", "worker event exceeds 1 MiB")
 			}
 			if _, appendErr := r.store.AppendPodLog(ctx, params, r.options.MaxLogBytes, r.options.LogChunkBytes); appendErr != nil {
