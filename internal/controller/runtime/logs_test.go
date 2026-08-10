@@ -221,7 +221,7 @@ func TestPodLogCollectionResumesFromDurableTimestampWithoutDuplicateEvent(t *tes
 	if err := inspection.QueryRow(`SELECT COALESCE(group_concat(CAST(content AS TEXT), ''), '') FROM (SELECT content FROM log_chunks ORDER BY sequence)`).Scan(&content); err != nil {
 		t.Fatalf("read logs: %v", err)
 	}
-	want := "first\n" + event + "\nlast\n"
+	want := t1 + " first\n" + t2 + " " + event + "\n2026-08-06T12:00:00.000000003Z last\n"
 	if content != want {
 		t.Fatalf("durable raw logs = %q, want %q", content, want)
 	}
