@@ -1,5 +1,7 @@
 # simpleswe
 
+![A robot carrying a box of gears](assets/simpleswe.png)
+
 `simpleswe` is a Kubernetes-native supervisor for software-engineering tasks. Its CLI and k9s-style terminal UI create, observe, and control tasks that run as immutable Kubernetes Jobs. OpenCode edits, commits, pushes, and creates or updates a Bitbucket or GitHub pull request; the worker validates the published result and the controller verifies it against provider truth.
 
 The CLI is also the automation boundary for external agents. Any agent that can run commands can create tasks and observe their results; agent choice, chat, conversation, and orchestration stay outside `simpleswe`.
