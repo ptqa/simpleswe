@@ -221,10 +221,18 @@ func (a *application) handleCreateTaskKey(key vaxis.Key) (bool, error) {
 		return false, nil
 	}
 	switch {
+	case len(a.projects) > 0 && a.createField == createRepositoryField && (key.MatchString("j") || key.Matches(vaxis.KeyDown)):
+		a.projectCursor = min(len(a.projects)-1, a.projectCursor+1)
+	case len(a.projects) > 0 && a.createField == createRepositoryField && (key.MatchString("k") || key.Matches(vaxis.KeyUp)):
+		a.projectCursor = max(0, a.projectCursor-1)
 	case key.Matches(vaxis.KeyTab):
 		a.createField = (a.createField + 1) % 2
 	case key.Matches(vaxis.KeyEnter):
 		if a.createField == createRepositoryField {
+			if len(a.projects) > 0 {
+				a.createField = createPromptField
+				return false, nil
+			}
 			if strings.TrimSpace(a.createRepo.String()) == "" {
 				a.createError = "repository required"
 				return false, nil
@@ -254,6 +262,9 @@ func (a *application) updateCreateInput(event vaxis.Event) {
 func (a *application) submitCreateTask() {
 	a.createError = ""
 	repository := strings.TrimSpace(a.createRepo.String())
+	if len(a.projects) > 0 {
+		repository = a.projects[a.projectCursor].Repository
+	}
 	prompt := strings.TrimSpace(a.createPrompt.String())
 	if repository == "" {
 		a.createError = "repository required"

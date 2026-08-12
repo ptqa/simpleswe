@@ -34,6 +34,10 @@ type dependency interface {
 	GetPullRequest(context.Context, string) ([]byte, error)
 }
 
+type projectsDependency interface {
+	ListProjects(context.Context) ([]byte, error)
+}
+
 type Handler struct {
 	dependency dependency
 	mux        *http.ServeMux
@@ -43,6 +47,7 @@ func NewHandler(dependency dependency) *Handler {
 	handler := &Handler{dependency: dependency}
 	handler.mux = http.NewServeMux()
 	handler.mux.HandleFunc("/v1/health", handler.health)
+	handler.mux.HandleFunc("/v1/projects", handler.projects)
 	handler.mux.HandleFunc("/v1/tasks", handler.tasks)
 	handler.mux.HandleFunc("/v1/tasks/{taskID}", handler.task)
 	handler.mux.HandleFunc("/v1/tasks/{taskID}/cancel", handler.cancel)
@@ -53,6 +58,24 @@ func NewHandler(dependency dependency) *Handler {
 	handler.mux.HandleFunc("/v1/tasks/{taskID}/pull-request", handler.pullRequest)
 	handler.mux.HandleFunc("/", handler.notFound)
 	return handler
+}
+
+func (h *Handler) projects(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	provider, ok := h.dependency.(projectsDependency)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "resource not found")
+		return
+	}
+	payload, err := provider.ListProjects(r.Context())
+	if err != nil {
+		writeDependencyError(w, err)
+		return
+	}
+	writeData(w, http.StatusOK, payload)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

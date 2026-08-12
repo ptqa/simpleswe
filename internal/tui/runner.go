@@ -131,6 +131,11 @@ type taskResult struct {
 	err        error
 }
 
+type projectResult struct {
+	projects []client.Project
+	err      error
+}
+
 type detailResult struct {
 	taskID     string
 	generation uint64
@@ -184,12 +189,16 @@ type application struct {
 	createField        int
 	createRepo         *textinput.Model
 	createPrompt       *textinput.Model
+	projects           []client.Project
+	projectCursor      int
+	projectsLoading    bool
 	createEventKey     string
 	createEventPayload [2]string
 	createError        string
 	createAccepted     bool
 
 	tasksCh     chan taskResult
+	projectsCh  chan projectResult
 	detailCh    chan detailResult
 	logsCh      chan logResult
 	actionCh    chan actionResult
@@ -211,6 +220,7 @@ func newApplication(parent context.Context, vx *vaxis.Vaxis, api *client.Client,
 		model:    NewModel(options.LogCapacity),
 		message:  "connecting to controller",
 		tasksCh:  make(chan taskResult, 1),
+		projectsCh: make(chan projectResult, 1),
 		detailCh: make(chan detailResult, 8),
 		logsCh:   make(chan logResult, 256),
 		actionCh: make(chan actionResult, 2),
@@ -238,6 +248,8 @@ func (a *application) run() error {
 			}
 		case result := <-a.tasksCh:
 			a.applyTasks(result)
+		case result := <-a.projectsCh:
+			a.applyProjects(result)
 		case result := <-a.detailCh:
 			a.applyDetail(result)
 		case result := <-a.logsCh:
@@ -271,6 +283,7 @@ func (a *application) refresh() {
 	}
 	a.refreshing = true
 	a.refreshGen++
+	a.projectsLoading = true
 	generation := a.refreshGen
 	go func() {
 		ctx, cancel := context.WithTimeout(a.ctx, a.options.RequestTimeout)
@@ -282,6 +295,23 @@ func (a *application) refresh() {
 		case <-a.ctx.Done():
 		}
 	}()
+	go func() {
+		ctx, cancel := context.WithTimeout(a.ctx, a.options.RequestTimeout)
+		defer cancel()
+		list, err := a.client.ListProjects(ctx)
+		select {
+		case a.projectsCh <- projectResult{projects: list.Projects, err: err}:
+		case <-a.ctx.Done():
+		}
+	}()
+}
+
+func (a *application) applyProjects(result projectResult) {
+	a.projectsLoading = false
+	if result.err == nil {
+		a.projects = append([]client.Project(nil), result.projects...)
+		a.projectCursor = min(a.projectCursor, max(0, len(a.projects)-1))
+	}
 }
 
 func (a *application) applyTasks(result taskResult) {

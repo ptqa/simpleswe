@@ -44,6 +44,12 @@ type Controller struct {
 	providerTimeout time.Duration
 }
 
+// ConfiguredProjects returns the safe project information needed by clients
+// to choose a repository without exposing worker or credential configuration.
+func (c *Controller) ConfiguredProjects() []config.RepositoryConfig {
+	return append([]config.RepositoryConfig(nil), c.config.Repositories...)
+}
+
 type attemptResourceSnapshot struct {
 	Job         batchv1.Job   `json:"job"`
 	Secret      corev1.Secret `json:"secret"`

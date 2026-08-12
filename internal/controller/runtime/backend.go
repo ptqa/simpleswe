@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/simpleswe/simpleswe/internal/api"
+	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -32,6 +33,10 @@ type Backend struct {
 	controller Controller
 }
 
+type configuredProjectProvider interface {
+	ConfiguredProjects() []config.RepositoryConfig
+}
+
 func NewBackend(db *store.Store, controller Controller) *Backend {
 	return &Backend{store: db, controller: controller}
 }
@@ -51,6 +56,23 @@ func (b *Backend) Health(ctx context.Context) ([]byte, error) {
 			"name": "store", "status": dependencyStatus, "message": message,
 		}},
 	})
+}
+
+func (b *Backend) ListProjects(context.Context) ([]byte, error) {
+	provider, ok := b.controller.(configuredProjectProvider)
+	if !ok {
+		return marshal(map[string]any{"projects": []any{}})
+	}
+	projects := provider.ConfiguredProjects()
+	items := make([]map[string]string, 0, len(projects))
+	for _, project := range projects {
+		name := project.Name
+		if name == "" {
+			name = project.CloneURL
+		}
+		items = append(items, map[string]string{"name": name, "repository": project.CloneURL})
+	}
+	return marshal(map[string]any{"projects": items})
 }
 
 func (b *Backend) CreateTask(ctx context.Context, body []byte) ([]byte, error) {
