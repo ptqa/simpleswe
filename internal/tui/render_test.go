@@ -237,6 +237,16 @@ func TestRenderHelpers(t *testing.T) {
 	if formatClock(started) == "—" || formatDuration(started, &completed) != "02m 18s" || formatDuration(time.Time{}, nil) != "—" {
 		t.Fatal("task timing helpers returned unexpected text")
 	}
+	pipelineDetail := TaskDetail{
+		Task: Task{State: "failed", UpdatedAt: started.Add(20 * time.Second)},
+		Events: []Event{
+			{OccurredAt: started},
+			{OccurredAt: started.Add(14 * time.Second)},
+		},
+	}
+	if pipelineEventDuration(pipelineDetail, 0) != "00:14" || pipelineEventDuration(pipelineDetail, 1) != "00:06" || pipelineEventDuration(pipelineDetail, 2) != "—" {
+		t.Fatal("pipelineEventDuration did not derive adjacent event timings")
+	}
 }
 
 func assertOutputContains(t *testing.T, output string, values ...string) {

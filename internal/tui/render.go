@@ -77,7 +77,7 @@ func (a *application) draw() {
 		a.vx.Render()
 		return
 	}
-	narrow := width < 88
+	narrow := width < 100
 	if narrow {
 		logRows := 0
 		if contentRows >= 10 {
@@ -97,7 +97,7 @@ func (a *application) draw() {
 		rightWidth := width - listWidth - 1
 		logRows := 0
 		if contentRows >= 14 {
-			logRows = max(5, min(12, contentRows/3))
+			logRows = max(5, min(12, contentRows/4))
 		}
 		bodyRows := contentRows - logRows
 		a.drawTasks(root.New(0, contentTop, listWidth, contentRows))
@@ -339,7 +339,6 @@ func (a *application) drawDetails(win vaxis.Window) {
 	if metadataTop >= height {
 		return
 	}
-	drawHorizontalRule(win, metadataTop, palette.border)
 	branch := firstNonempty(attempt.GitResult.Branch, detail.Task.GitResult.Branch, "—")
 	pod := firstNonempty(attempt.KubernetesPod.ResourceIdentity.Name, detail.Task.KubernetesPod.ResourceIdentity.Name, "—")
 	attemptLabel := "not scheduled"
@@ -361,33 +360,7 @@ func (a *application) drawDetails(win vaxis.Window) {
 		{"Pod", pod},
 		{"PR", pr},
 	}
-	metadataBottom := metadataTop + 2
-	if width >= 110 {
-		itemWidth := width / len(items)
-		for index, item := range items {
-			start := index * itemWidth
-			span := itemWidth
-			if index == len(items)-1 {
-				span = width - start
-			}
-			drawMetadataItem(win.New(start, metadataTop+1, span, 1), item, palette)
-		}
-	} else {
-		metadataBottom = metadataTop + 4
-		columnWidth := width / 2
-		for index, item := range items {
-			row := metadataTop + 1 + index/2
-			column := index % 2
-			span := columnWidth
-			if column == 1 {
-				span = width - columnWidth
-			}
-			drawMetadataItem(win.New(column*columnWidth, row, span, 1), item, palette)
-		}
-	}
-	if metadataBottom < height {
-		drawHorizontalRule(win, metadataBottom, palette.border)
-	}
+	metadataBottom := drawMetadataCard(win, metadataTop, items, palette)
 	a.drawPipeline(win, metadataBottom+2, detail)
 }
 
@@ -733,14 +706,48 @@ func drawHorizontalRule(win vaxis.Window, row int, style vaxis.Style) {
 	}
 }
 
-func drawMetadataItem(win vaxis.Window, item metadataItem, palette colorPalette) {
-	if win.Width <= 0 {
-		return
+func drawMetadataCard(win vaxis.Window, row int, items []metadataItem, palette colorPalette) int {
+	width, height := win.Size()
+	if width < 6 || row < 0 || row+2 >= height || len(items) == 0 {
+		return row
 	}
-	win.PrintTruncate(0,
-		vaxis.Segment{Text: "  " + item.label + "  ", Style: palette.dim},
-		vaxis.Segment{Text: item.value, Style: palette.base},
-	)
+	card := win.New(1, row, width-2, 3)
+	drawBoxRule(card, 0, "┌", "┐", palette.border)
+	drawBoxRule(card, 2, "└", "┘", palette.border)
+	card.SetCell(0, 1, vaxis.Cell{Character: vaxis.Character{Grapheme: "│", Width: 1}, Style: palette.border})
+	card.SetCell(card.Width-1, 1, vaxis.Cell{Character: vaxis.Character{Grapheme: "│", Width: 1}, Style: palette.border})
+	content := card.New(1, 1, card.Width-2, 1)
+	weights := []int{27, 23, 12, 25, 13}
+	compactLabels := []string{"Repo", "Branch", "Try", "Pod", "PR"}
+	cursor := 0
+	for index, item := range items {
+		if cursor >= content.Width {
+			break
+		}
+		span := content.Width - cursor
+		if index < len(items)-1 && index < len(weights) {
+			span = max(1, content.Width*weights[index]/100)
+		}
+		span = min(span, content.Width-cursor)
+		cell := content.New(cursor, 0, span, 1)
+		label := item.label
+		if content.Width < 100 && index < len(compactLabels) {
+			label = compactLabels[index]
+		}
+		valueStart := 0
+		if index > 0 && span > 0 {
+			cell.SetCell(0, 0, vaxis.Cell{Character: vaxis.Character{Grapheme: "│", Width: 1}, Style: palette.border})
+			valueStart = 1
+		}
+		if span > valueStart {
+			cell.New(valueStart, 0, span-valueStart, 1).PrintTruncate(0,
+				vaxis.Segment{Text: " " + label + " ", Style: palette.dim},
+				vaxis.Segment{Text: item.value, Style: palette.base},
+			)
+		}
+		cursor += span
+	}
+	return row + 2
 }
 
 func (a *application) drawPipeline(win vaxis.Window, start int, detail TaskDetail) {
@@ -784,10 +791,7 @@ func (a *application) drawPipeline(win vaxis.Window, start int, detail TaskDetai
 		style := a.stateStyle(event.ToState)
 		title := humanizeLabel(firstNonempty(event.Reason, event.ToState, "event"))
 		badge := "[" + strings.ToUpper(firstNonempty(event.ToState, "event")) + "]"
-		right := event.OccurredAt.Local().Format("15:04:05") + "  " + badge + " "
-		if event.OccurredAt.IsZero() {
-			right = badge + " "
-		}
+		right := pipelineEventDuration(detail, startIndex+index) + "  " + badge + " "
 		if textWidth(right) > width/2 {
 			right = badge + " "
 		}
@@ -992,6 +996,30 @@ func formatDuration(started time.Time, completed *time.Time) string {
 		return fmt.Sprintf("%02dm %02ds", int(duration.Minutes()), int(duration.Seconds())%60)
 	}
 	return fmt.Sprintf("%02ds", int(duration.Seconds()))
+}
+
+func pipelineEventDuration(detail TaskDetail, index int) string {
+	if index < 0 || index >= len(detail.Events) || detail.Events[index].OccurredAt.IsZero() {
+		return "—"
+	}
+	started := detail.Events[index].OccurredAt
+	completed := time.Now()
+	if index+1 < len(detail.Events) && !detail.Events[index+1].OccurredAt.IsZero() {
+		completed = detail.Events[index+1].OccurredAt
+	} else {
+		attempt := currentAttempt(detail)
+		switch {
+		case attempt.CompletedAt != nil:
+			completed = *attempt.CompletedAt
+		case isTerminalState(detail.Task.State) && !detail.Task.UpdatedAt.IsZero():
+			completed = detail.Task.UpdatedAt
+		}
+	}
+	duration := max(completed.Sub(started), 0).Round(time.Second)
+	if duration >= time.Hour {
+		return fmt.Sprintf("%02dh %02dm", int(duration.Hours()), int(duration.Minutes())%60)
+	}
+	return fmt.Sprintf("%02d:%02d", int(duration.Minutes()), int(duration.Seconds())%60)
 }
 
 func isTerminalState(state string) bool {
