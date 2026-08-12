@@ -110,6 +110,24 @@ func TestLoadSecretsIncludesNamedEnvironmentValuesAndMultilineParts(t *testing.T
 	}
 }
 
+func TestCommandEnvironmentTrimsSecretLineEndings(t *testing.T) {
+	t.Setenv(protocol.SecretEnvNamesVariable, " API_TOKEN ")
+	t.Setenv("API_TOKEN", "  header\nbody  \r\n")
+	t.Setenv("PLAIN_VALUE", "plain\n")
+
+	values := make(map[string]string)
+	for _, entry := range commandEnvironment(nil) {
+		name, value, _ := strings.Cut(entry, "=")
+		values[name] = value
+	}
+	if got, want := values["API_TOKEN"], "  header\nbody  "; got != want {
+		t.Fatalf("sanitized API_TOKEN = %q, want %q", got, want)
+	}
+	if got, want := values["PLAIN_VALUE"], "plain\n"; got != want {
+		t.Fatalf("plain environment value = %q, want %q", got, want)
+	}
+}
+
 func TestValidationFixPromptIsBoundedAndMarked(t *testing.T) {
 	failure := strings.Repeat("old-output-", validationFixPromptLimit)
 	prompt := validationFixPrompt(failure, 42)

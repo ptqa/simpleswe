@@ -66,9 +66,7 @@ func runCommandInDirWithOutputEnvMode(ctx context.Context, dir string, argv []st
 	// #nosec G204 -- executing the configured argv directly is the worker contract; no shell is used.
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = dir
-	if len(environment) > 0 {
-		cmd.Env = commandEnvironment(environment)
-	}
+	cmd.Env = commandEnvironment(environment)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if outputLimit <= 0 {
 		outputLimit = DefaultCommandOutputLimit
@@ -186,16 +184,28 @@ func waitCommandOutput(pipes ...*commandOutputPipe) (bool, error) {
 }
 
 func commandEnvironment(overrides map[string]string) []string {
+	secretNames := make(map[string]struct{})
+	for name := range strings.SplitSeq(os.Getenv(protocol.SecretEnvNamesVariable), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			secretNames[name] = struct{}{}
+		}
+	}
+	sanitize := func(name, value string) string {
+		if _, secret := secretNames[name]; secret {
+			return strings.TrimRight(value, "\r\n")
+		}
+		return value
+	}
 	environment := os.Environ()
 	filtered := environment[:0]
 	for _, value := range environment {
-		name, _, _ := strings.Cut(value, "=")
+		name, envValue, _ := strings.Cut(value, "=")
 		if _, overridden := overrides[name]; !overridden {
-			filtered = append(filtered, value)
+			filtered = append(filtered, name+"="+sanitize(name, envValue))
 		}
 	}
 	for name, value := range overrides {
-		filtered = append(filtered, name+"="+value)
+		filtered = append(filtered, name+"="+sanitize(name, value))
 	}
 	return filtered
 }
