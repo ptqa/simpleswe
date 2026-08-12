@@ -46,8 +46,16 @@ type Controller struct {
 
 // ConfiguredProjects returns the safe project information needed by clients
 // to choose a repository without exposing worker or credential configuration.
-func (c *Controller) ConfiguredProjects() []config.RepositoryConfig {
-	return append([]config.RepositoryConfig(nil), c.config.Repositories...)
+func (c *Controller) ConfiguredProjects() []store.ConfiguredProject {
+	projects := make([]store.ConfiguredProject, 0, len(c.config.Repositories))
+	for _, repository := range c.config.Repositories {
+		name := repository.Name
+		if name == "" {
+			name = repository.CloneURL
+		}
+		projects = append(projects, store.ConfiguredProject{Name: name, Repository: repository.CloneURL})
+	}
+	return projects
 }
 
 type attemptResourceSnapshot struct {

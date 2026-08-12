@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/simpleswe/simpleswe/internal/api"
-	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
@@ -34,7 +33,7 @@ type Backend struct {
 }
 
 type configuredProjectProvider interface {
-	ConfiguredProjects() []config.RepositoryConfig
+	ConfiguredProjects() []store.ConfiguredProject
 }
 
 func NewBackend(db *store.Store, controller Controller) *Backend {
@@ -66,11 +65,7 @@ func (b *Backend) ListProjects(context.Context) ([]byte, error) {
 	projects := provider.ConfiguredProjects()
 	items := make([]map[string]string, 0, len(projects))
 	for _, project := range projects {
-		name := project.Name
-		if name == "" {
-			name = project.CloneURL
-		}
-		items = append(items, map[string]string{"name": name, "repository": project.CloneURL})
+		items = append(items, map[string]string{"name": project.Name, "repository": project.Repository})
 	}
 	return marshal(map[string]any{"projects": items})
 }

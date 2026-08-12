@@ -638,6 +638,7 @@ components:
 
     Project:
       type: object
+      description: Configured project available for task creation.
       additionalProperties: false
       required: [name, repository]
       properties:
