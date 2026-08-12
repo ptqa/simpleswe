@@ -57,6 +57,15 @@ type TaskList struct {
 	NextCursor string `json:"next_cursor"`
 }
 
+type Project struct {
+	Name       string `json:"name"`
+	Repository string `json:"repository"`
+}
+
+type ProjectList struct {
+	Projects []Project `json:"projects"`
+}
+
 type EventList struct {
 	Events     []Event `json:"events"`
 	NextCursor string  `json:"next_cursor"`
@@ -183,6 +192,12 @@ type LogOptions struct {
 func (c *Client) ListTasks(ctx context.Context, options ListOptions) (TaskList, error) {
 	var result TaskList
 	err := c.getJSON(ctx, "/v1/tasks", options.values(), &result)
+	return result, err
+}
+
+func (c *Client) ListProjects(ctx context.Context) (ProjectList, error) {
+	var result ProjectList
+	err := c.getJSON(ctx, "/v1/projects", nil, &result)
 	return result, err
 }
 

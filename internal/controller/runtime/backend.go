@@ -32,6 +32,10 @@ type Backend struct {
 	controller Controller
 }
 
+type configuredProjectProvider interface {
+	ConfiguredProjects() []store.ConfiguredProject
+}
+
 func NewBackend(db *store.Store, controller Controller) *Backend {
 	return &Backend{store: db, controller: controller}
 }
@@ -51,6 +55,19 @@ func (b *Backend) Health(ctx context.Context) ([]byte, error) {
 			"name": "store", "status": dependencyStatus, "message": message,
 		}},
 	})
+}
+
+func (b *Backend) ListProjects(context.Context) ([]byte, error) {
+	provider, ok := b.controller.(configuredProjectProvider)
+	if !ok {
+		return marshal(map[string]any{"projects": []any{}})
+	}
+	projects := provider.ConfiguredProjects()
+	items := make([]map[string]string, 0, len(projects))
+	for _, project := range projects {
+		items = append(items, map[string]string{"name": project.Name, "repository": project.Repository})
+	}
+	return marshal(map[string]any{"projects": items})
 }
 
 func (b *Backend) CreateTask(ctx context.Context, body []byte) ([]byte, error) {

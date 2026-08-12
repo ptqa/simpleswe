@@ -13,12 +13,29 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stesting "k8s.io/client-go/testing"
 
+	"github.com/simpleswe/simpleswe/internal/config"
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/kubernetes/jobs"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
+
+func TestConfiguredProjectsAreSafeAndNamed(t *testing.T) {
+	controller := &Controller{config: config.Config{Repositories: config.RepositoryConfigs{
+		{Name: "widget", CloneURL: "https://example.com/widget.git"},
+		{CloneURL: "https://example.com/unnamed.git"},
+	}}}
+
+	got := controller.ConfiguredProjects()
+	want := []store.ConfiguredProject{
+		{Name: "widget", Repository: "https://example.com/widget.git"},
+		{Name: "https://example.com/unnamed.git", Repository: "https://example.com/unnamed.git"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ConfiguredProjects() = %#v, want %#v", got, want)
+	}
+}
 
 func TestCreateTaskPersistsQueuesAndCreatesSecretBeforeOneJob(t *testing.T) {
 	fixture := newFixture(t)

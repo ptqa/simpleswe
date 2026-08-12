@@ -106,6 +106,20 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /v1/projects:
+    get:
+      tags: [tasks]
+      operationId: list_projects
+      summary: List configured projects
+      description: Return the non-secret project names and repository URLs configured for task creation.
+      responses:
+        '200':
+          description: Configured projects.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectListResponse'
+
   /v1/tasks:
     get:
       tags: [tasks]
@@ -605,6 +619,33 @@ components:
             next_cursor:
               type: string
               description: Empty when there are no more results.
+
+    ProjectListResponse:
+      type: object
+      description: Configured projects available for task creation.
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [projects]
+          properties:
+            projects:
+              type: array
+              items:
+                $ref: '#/components/schemas/Project'
+
+    Project:
+      type: object
+      description: Configured project available for task creation.
+      additionalProperties: false
+      required: [name, repository]
+      properties:
+        name:
+          type: string
+        repository:
+          type: string
 
     Task:
       type: object

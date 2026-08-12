@@ -449,16 +449,34 @@ func (a *application) drawCreateTask(root vaxis.Window) {
 	} else {
 		promptStyle = palette.selected
 	}
-	a.createRepo.Content, a.createRepo.Prompt = repositoryStyle, repositoryStyle
-	a.createRepo.HideCursor = a.createField != createRepositoryField || a.createPending
-	a.createRepo.Draw(win.New(2, 2, width-4, 1))
+	if len(a.projects) > 0 {
+		win.New(2, 2, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: "Project: " + a.projects[a.projectCursor].Name, Style: repositoryStyle})
+		for row, index := 3, max(0, a.projectCursor-2); row < min(height-3, 6) && index < len(a.projects); row, index = row+1, index+1 {
+			style := palette.overlay
+			if index == a.projectCursor {
+				style = palette.selected
+			}
+			win.New(2, row, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: a.projects[index].Name, Style: style})
+		}
+	} else {
+		a.createRepo.Content, a.createRepo.Prompt = repositoryStyle, repositoryStyle
+		a.createRepo.HideCursor = a.createField != createRepositoryField || a.createPending
+		a.createRepo.Draw(win.New(2, 2, width-4, 1))
+	}
 	a.createPrompt.Content, a.createPrompt.Prompt = promptStyle, promptStyle
 	a.createPrompt.HideCursor = a.createField != createPromptField || a.createPending
-	a.createPrompt.Draw(win.New(2, 3, width-4, 1))
+	promptRow := 3
+	if len(a.projects) > 0 {
+		promptRow = 8
+	}
+	a.createPrompt.Draw(win.New(2, promptRow, width-4, 1))
 	if a.createError != "" {
 		win.New(2, 5, width-4, 1).PrintTruncate(0, vaxis.Segment{Text: a.createError, Style: palette.bad})
 	}
 	instructions := "tab next field  enter submit  esc cancel"
+	if len(a.projects) > 0 {
+		instructions = "j/k choose project  tab prompt  enter submit  esc cancel"
+	}
 	if a.createPending {
 		instructions = "creating task…  Esc hides; request continues"
 	}

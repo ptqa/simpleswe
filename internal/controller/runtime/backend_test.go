@@ -18,6 +18,33 @@ import (
 	"github.com/simpleswe/simpleswe/internal/task"
 )
 
+func TestBackendListProjectsReturnsConfiguredProjects(t *testing.T) {
+	controller := &fakeController{projects: []store.ConfiguredProject{
+		{Name: "widget", Repository: "https://example.com/widget.git"},
+	}}
+
+	payload, err := NewBackend(nil, controller).ListProjects(context.Background())
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	var got struct {
+		Projects []struct {
+			Name       string `json:"name"`
+			Repository string `json:"repository"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatalf("decode ListProjects() = %q: %v", payload, err)
+	}
+	want := []struct {
+		Name       string `json:"name"`
+		Repository string `json:"repository"`
+	}{{Name: "widget", Repository: "https://example.com/widget.git"}}
+	if len(got.Projects) != len(want) || got.Projects[0] != want[0] {
+		t.Fatalf("ListProjects() = %#v, want %#v", got.Projects, want)
+	}
+}
+
 func TestBackendFollowCatchesAppendAfterSnapshotAndClosesAtExhaustion(t *testing.T) {
 	db, taskRecord, attempt, _ := backendStore(t)
 	backend := NewBackend(db, newFakeController(db))

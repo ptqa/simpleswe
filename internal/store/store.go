@@ -71,6 +71,11 @@ type CreateTaskParams struct {
 	IdempotencyKey string
 }
 
+type ConfiguredProject struct {
+	Name       string
+	Repository string
+}
+
 type Task struct {
 	ID                    string
 	Repository            string

@@ -33,6 +33,7 @@ type fakeController struct {
 	mu         sync.Mutex
 	cancelled  []string
 	retried    []string
+	projects   []store.ConfiguredProject
 	reconciles int
 	events     []workerEventCall
 	exhausted  []workerEventCall
@@ -52,6 +53,10 @@ func newFakeController(db *store.Store) *fakeController {
 		reconcileC: make(chan struct{}, 16),
 		eventC:     make(chan struct{}, 16),
 	}
+}
+
+func (f *fakeController) ConfiguredProjects() []store.ConfiguredProject {
+	return f.projects
 }
 
 func (f *fakeController) CreateTask(ctx context.Context, params store.CreateTaskParams) (store.Task, error) {
