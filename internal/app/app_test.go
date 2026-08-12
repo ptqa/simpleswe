@@ -19,10 +19,11 @@ var _ func(context.Context, []string, io.Reader, io.Writer, io.Writer, Dependenc
 
 const (
 	defaultManifest = "/run/simpleswe/task.json"
-	usageRoot       = "usage: simpleswe <controller|worker|tui|task>"
+	usageRoot       = "usage: simpleswe <controller|worker|tui|gui|task>"
 	usageController = "usage: simpleswe controller --config PATH --database PATH"
 	usageWorker     = "usage: simpleswe worker [--manifest PATH] | simpleswe worker report (--pull-request NUMBER | --failure REASON)"
 	usageTUI        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
+	usageGUI        = "usage: simpleswe gui [--context NAME] [--namespace NAME] [--address URL]"
 	usageTask       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
 	usageTaskCreate = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
 	usageTaskList   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
@@ -60,6 +61,16 @@ func TestRunDispatchesCommandsAndRuntimeConfiguration(t *testing.T) {
 			name: "tui with automatic port forward",
 			args: []string{"tui", "--context", "development", "--namespace", "operators"},
 			want: []string{"port-forward context=development namespace=operators", "tui address=http://127.0.0.1:18080 context=development namespace=operators", "close port-forward"},
+		},
+		{
+			name: "gui with automatic port forward",
+			args: []string{"gui", "--context", "development", "--namespace", "operators"},
+			want: []string{"port-forward context=development namespace=operators", "gui address=http://127.0.0.1:18080 context=development namespace=operators", "close port-forward"},
+		},
+		{
+			name: "gui with explicit address",
+			args: []string{"gui", "--address", "https://controller.example"},
+			want: []string{"gui address=https://controller.example context= namespace=simpleswe"},
 		},
 		{
 			name: "task list with automatic port forward defaults",
@@ -132,6 +143,7 @@ func TestRunReportsExactUsageErrors(t *testing.T) {
 		{name: "controller positional argument", args: []string{"controller", "--config", "config.yaml", "--database", "tasks.db", "extra"}, want: usageController},
 		{name: "worker positional argument", args: []string{"worker", "extra"}, want: usageWorker},
 		{name: "tui positional argument", args: []string{"tui", "extra"}, want: usageTUI},
+		{name: "gui positional argument", args: []string{"gui", "extra"}, want: usageGUI},
 		{name: "missing task command", args: []string{"task"}, want: usageTask},
 		{name: "unknown task command", args: []string{"task", "delete"}, want: `unknown task command "delete"; ` + usageTask},
 		{name: "task create missing values", args: []string{"task", "create"}, want: usageTaskCreate},
@@ -439,6 +451,17 @@ func TestRunPropagatesContextCancellation(t *testing.T) {
 			},
 		},
 		{
+			name: "gui runtime",
+			args: []string{"gui", "--address", "http://controller"},
+			deps: func(started chan struct{}) Dependencies {
+				return Dependencies{RunGUI: func(ctx context.Context, _, _, _ string) error {
+					close(started)
+					<-ctx.Done()
+					return ctx.Err()
+				}}
+			},
+		},
+		{
 			name: "local API operation",
 			args: []string{"task", "list", "--address", "http://controller"},
 			deps: func(started chan struct{}) Dependencies {
@@ -525,6 +548,11 @@ func recordingDependencies(t *testing.T, wantCtx context.Context, wantStdin io.R
 				t.Errorf("TUI stdin differs from Run stdin")
 			}
 			*calls = append(*calls, "tui address="+address+" context="+kubeContext+" namespace="+namespace)
+			return nil
+		},
+		RunGUI: func(ctx context.Context, address, kubeContext, namespace string) error {
+			checkContext(ctx)
+			*calls = append(*calls, "gui address="+address+" context="+kubeContext+" namespace="+namespace)
 			return nil
 		},
 		PortForward: func(ctx context.Context, kubeContext, namespace string) (string, func() error, error) {

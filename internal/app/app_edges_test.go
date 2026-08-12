@@ -35,6 +35,7 @@ func TestRunRejectsInvalidContextsAndMissingRuntimes(t *testing.T) {
 		{args: []string{"controller", "--config", "config.yaml", "--database", "tasks.db"}, want: "controller runtime is not configured"},
 		{args: []string{"worker"}, want: "worker runtime is not configured"},
 		{args: []string{"tui", "--address", "http://controller"}, want: "TUI runtime is not configured"},
+		{args: []string{"gui", "--address", "http://controller"}, want: "GUI runtime is not configured"},
 		{args: []string{"task", "list", "--address", "http://controller"}, want: "task list runtime is not configured"},
 		{args: []string{"task", "show", "--address", "http://controller", "task-1"}, want: "task show runtime is not configured"},
 		{args: []string{"task", "cancel", "--address", "http://controller", "task-1"}, want: "task cancel runtime is not configured"},
@@ -70,6 +71,16 @@ func TestRunPropagatesDependencyAndCleanupErrors(t *testing.T) {
 	})
 	if !errors.Is(tuiErr, runErr) || !errors.Is(tuiErr, closeErr) {
 		t.Fatalf("Run(tui) error = %v, want runtime and cleanup errors", tuiErr)
+	}
+
+	guiErr := Run(context.Background(), []string{"gui"}, nil, nil, nil, Dependencies{
+		PortForward: func(context.Context, string, string) (string, func() error, error) {
+			return "http://controller", func() error { return closeErr }, nil
+		},
+		RunGUI: func(context.Context, string, string, string) error { return runErr },
+	})
+	if !errors.Is(guiErr, runErr) || !errors.Is(guiErr, closeErr) {
+		t.Fatalf("Run(gui) error = %v, want runtime and cleanup errors", guiErr)
 	}
 
 	apiErr := errors.New("API failed")
@@ -174,6 +185,10 @@ func TestParsersRejectDuplicateAndMissingFlagValues(t *testing.T) {
 		{"tui", "--context", "one", "--context", "two"},
 		{"tui", "--namespace", "one", "--namespace", "two"},
 		{"tui", "--address", "one", "--address", "two"},
+		{"gui", "--context", "one", "--context", "two"},
+		{"gui", "--namespace", ""},
+		{"gui", "--address", "--context"},
+		{"gui", "--address", "one", "--address", "two"},
 		{"tui", "--context"},
 		{"tui", "--namespace", ""},
 		{"tui", "--address", "--context"},

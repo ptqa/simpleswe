@@ -1,6 +1,6 @@
 # simpleswe
 
-`simpleswe` is a Kubernetes-native supervisor for software-engineering tasks. Its CLI and k9s-style terminal UI create, observe, and control tasks that run as immutable Kubernetes Jobs. OpenCode edits, commits, pushes, and creates or updates a Bitbucket or GitHub pull request; the worker validates the published result and the controller verifies it against provider truth.
+`simpleswe` is a Kubernetes-native supervisor for software-engineering tasks. Its CLI, k9s-style terminal UI, and desktop GUI create, observe, and control tasks that run as immutable Kubernetes Jobs. OpenCode edits, commits, pushes, and creates or updates a Bitbucket or GitHub pull request; the worker validates the published result and the controller verifies it against provider truth.
 
 The CLI is also the automation boundary for external agents. Any agent that can run commands can create tasks and observe their results; agent choice, chat, conversation, and orchestration stay outside `simpleswe`.
 
@@ -44,15 +44,15 @@ The initial vertical slice supports:
 - Bitbucket or GitHub credentials for each configured repository;
 - a webhook signing secret for each configured forge provider;
 - a repository-specific worker image containing `simpleswe`, OpenCode, Git, forge tooling and credentials, SSH, language runtimes, and validation tools;
-- Go 1.26.5 when building locally;
-- `kubectl` locally for automatic port-forwarding and TUI shell access.
+- Go 1.26.5 with `CGO_ENABLED=0` when building locally;
+- `kubectl` locally for automatic port-forwarding and TUI/GUI shell access.
 
 ## Build
 
 Build the binary:
 
 ```sh
-go build -o simpleswe ./cmd/simpleswe
+CGO_ENABLED=0 go build -o simpleswe ./cmd/simpleswe
 ```
 
 Build the controller image:
@@ -86,6 +86,7 @@ Inspect the controller:
 ```sh
 ./simpleswe task list --context kind-simpleswe --namespace simpleswe
 ./simpleswe tui --context kind-simpleswe --namespace simpleswe
+./simpleswe gui --context kind-simpleswe --namespace simpleswe
 ```
 
 The placeholders are only for startup and observation. Before executing tasks, replace or provide real GitHub, webhook, and OpenAI credentials, then build and load a worker image:
@@ -243,12 +244,13 @@ The chart creates one controller Deployment, private API Service, signed `simple
 
 The API is unauthenticated and is intended for `kubectl port-forward` access only. Keep the default NetworkPolicy enabled unless another access boundary is in place.
 
-## CLI and TUI
+## CLI, TUI, and GUI
 
 The local commands automatically run `kubectl port-forward` to the `simpleswe` Service using the selected kube context and namespace:
 
 ```sh
 simpleswe tui --context production --namespace simpleswe
+simpleswe gui --context production --namespace simpleswe
 
 simpleswe task create --context production --namespace simpleswe widget "Fix the failing ClaimService tests"
 simpleswe task create --context production --namespace simpleswe --idempotency-key request-123 widget "Fix the failing ClaimService tests"
@@ -263,6 +265,8 @@ simpleswe task retry --context production --namespace simpleswe swe-...
 The create command accepts a configured repository name followed by the task prompt. Quote prompts that contain spaces. `--idempotency-key` is optional and lets machine callers safely retry task creation. `task wait` polls until a pull-request URL appears or the task reaches `failed`, `cancelled`, or `ready`, then writes the final JSON.
 
 Use `--address http://127.0.0.1:8080` to connect to an existing port-forward instead.
+
+`simpleswe gui` opens a gogpu desktop window with selectable tasks, details, live logs, events, Job and Pod data, task creation, refresh, shell, confirmed retry/cancel actions, themes, help, and controller connectivity. It uses the same automatic port-forward and cleanup behavior as `simpleswe tui`. The gogpu renderer is pure Go and requires `CGO_ENABLED=0`.
 
 TUI keys:
 
@@ -328,7 +332,7 @@ The bundled skill limits Hermes to the seven `simpleswe task` commands above, po
 
 The controller is the only component that owns task intent and logical state. Kubernetes remains the execution scheduler and source of truth for Job and Pod lifecycle.
 
-- The CLI and TUI are the supported user interfaces; the CLI is also the automation contract for external agents.
+- The CLI and primary Vaxis TUI are the supported core interfaces; the optional desktop GUI is also supported for local operators, and the CLI remains the automation contract for external agents.
 - The controller has no chat or agent runtime. SQLite stores task intent, attempts, events, validation results, Git results, pull requests, log checkpoints, and idempotency records.
 - One immutable attempt maps to one deterministic Kubernetes Job.
 - The task prompt is delivered in a task-specific read-only Secret.

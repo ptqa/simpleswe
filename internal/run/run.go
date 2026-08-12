@@ -26,6 +26,7 @@ import (
 	"github.com/simpleswe/simpleswe/internal/forge"
 	"github.com/simpleswe/simpleswe/internal/forge/bitbucket"
 	"github.com/simpleswe/simpleswe/internal/forge/github"
+	"github.com/simpleswe/simpleswe/internal/gui"
 	"github.com/simpleswe/simpleswe/internal/store"
 	"github.com/simpleswe/simpleswe/internal/tui"
 	"github.com/simpleswe/simpleswe/internal/worker"
@@ -44,6 +45,7 @@ func Dependencies() app.Dependencies {
 		RunWorker:     RunWorker,
 		ReportWorker:  worker.Report,
 		RunTUI:        runTUI,
+		RunGUI:        gui.Run,
 		PortForward:   portForward,
 		CreateTask: func(ctx context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {
 			return client.New(address, nil).CreateTask(ctx, request)

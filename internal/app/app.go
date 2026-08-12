@@ -17,10 +17,11 @@ const (
 	workerManifestPath = "/run/simpleswe/task.json"
 	defaultNamespace   = "simpleswe"
 
-	rootUsage       = "usage: simpleswe <controller|worker|tui|task>"
+	rootUsage       = "usage: simpleswe <controller|worker|tui|gui|task>"
 	controllerUsage = "usage: simpleswe controller --config PATH --database PATH"
 	workerUsage     = "usage: simpleswe worker [--manifest PATH] | simpleswe worker report (--pull-request NUMBER | --failure REASON)"
 	tuiUsage        = "usage: simpleswe tui [--context NAME] [--namespace NAME] [--address URL]"
+	guiUsage        = "usage: simpleswe gui [--context NAME] [--namespace NAME] [--address URL]"
 	taskUsage       = "usage: simpleswe task <create|list|show|cancel|retry|logs|wait>"
 	taskCreateUsage = "usage: simpleswe task create [--context NAME] [--namespace NAME] [--address URL] [--idempotency-key KEY] [--pr-title TITLE] REPOSITORY PROMPT"
 	taskListUsage   = "usage: simpleswe task list [--context NAME] [--namespace NAME] [--address URL]"
@@ -40,6 +41,7 @@ type Dependencies struct {
 	RunWorker     func(context.Context, string, string, io.Writer, io.Writer) error
 	ReportWorker  func([]string) error
 	RunTUI        func(context.Context, string, string, string, io.Reader, io.Writer, io.Writer) error
+	RunGUI        func(context.Context, string, string, string) error
 	PortForward   func(context.Context, string, string) (string, func() error, error)
 
 	CreateTask func(context.Context, string, client.CreateTaskRequest) (client.Task, error)
@@ -80,6 +82,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return runWorker(ctx, args[1:], stdout, stderr, deps)
 	case "tui":
 		return runTUI(ctx, args[1:], stdin, stdout, stderr, deps)
+	case "gui":
+		return runGUI(ctx, args[1:], deps)
 	case "task":
 		return runTask(ctx, args[1:], stdout, stderr, deps)
 	default:
@@ -135,6 +139,22 @@ func runTUI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 	defer func() { runErr = errors.Join(runErr, closeForward()) }()
 	return deps.RunTUI(ctx, address, flags.kubeContext, flags.namespace, stdin, stdout, stderr)
+}
+
+func runGUI(ctx context.Context, args []string, deps Dependencies) (runErr error) {
+	flags, _, ok := parseRuntimeArgs(args, 0, false)
+	if !ok {
+		return errors.New(guiUsage)
+	}
+	if deps.RunGUI == nil {
+		return errors.New("GUI runtime is not configured")
+	}
+	address, closeForward, err := resolveAddress(ctx, flags, deps)
+	if err != nil {
+		return err
+	}
+	defer func() { runErr = errors.Join(runErr, closeForward()) }()
+	return deps.RunGUI(ctx, address, flags.kubeContext, flags.namespace)
 }
 
 func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps Dependencies) (runErr error) {

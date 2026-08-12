@@ -3,6 +3,9 @@ module github.com/simpleswe/simpleswe
 go 1.26.5
 
 require (
+	github.com/gogpu/gg v0.52.2
+	github.com/gogpu/gogpu v0.52.1
+	github.com/gogpu/ui v0.1.53
 	go.rockorager.dev/vaxis v0.17.1
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -14,6 +17,7 @@ require (
 )
 
 require (
+	github.com/coregx/signals v0.1.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emicklei/go-restful/v3 v3.11.0 // indirect
@@ -22,7 +26,13 @@ require (
 	github.com/go-openapi/jsonpointer v0.21.0 // indirect
 	github.com/go-openapi/jsonreference v0.20.2 // indirect
 	github.com/go-openapi/swag v0.23.0 // indirect
+	github.com/go-webgpu/goffi v0.6.3 // indirect
+	github.com/go-webgpu/webgpu v0.5.5 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/gogpu/gpucontext v0.27.0 // indirect
+	github.com/gogpu/gputypes v0.5.2 // indirect
+	github.com/gogpu/naga v0.18.0 // indirect
+	github.com/gogpu/wgpu v0.31.2 // indirect
 	github.com/google/gnostic-models v0.6.9 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -44,6 +54,7 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/image v0.44.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/term v0.45.0 // indirect
