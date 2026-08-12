@@ -354,11 +354,11 @@ func (a *application) drawDetails(win vaxis.Window) {
 		pr = fmt.Sprintf("#%d", pullRequest.Number)
 	}
 	items := []metadataItem{
-		{"Repository", firstNonempty(compactRepository(detail.Task.Repository), "—")},
-		{"Branch", branch},
-		{"Attempt", attemptLabel},
-		{"Pod", pod},
-		{"PR", pr},
+		{"▣", "Repository", firstNonempty(compactRepository(detail.Task.Repository), "—")},
+		{"⑂", "Branch", branch},
+		{"#", "Attempt", attemptLabel},
+		{"◇", "Pod", pod},
+		{"↗", "PR", pr},
 	}
 	metadataBottom := drawMetadataCard(win, metadataTop, items, palette)
 	a.drawPipeline(win, metadataBottom+2, detail)
@@ -400,7 +400,7 @@ func (a *application) drawJob(win vaxis.Window) {
 	if job.ResourceIdentity.Name == "" {
 		job = detail.Task.KubernetesJob
 	}
-	win.PrintTruncate(0, vaxis.Segment{Text: " JOB", Style: palette.title})
+	win.PrintTruncate(0, vaxis.Segment{Text: " ▣  JOB", Style: palette.title})
 	row := 2
 	row = a.drawField(win, row, "Name", firstNonempty(job.ResourceIdentity.Name, "—"), vaxis.Style{})
 	row = a.drawField(win, row, "Namespace", firstNonempty(job.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
@@ -416,7 +416,7 @@ func (a *application) drawPod(win vaxis.Window) {
 	if pod.ResourceIdentity.Name == "" {
 		pod = detail.Task.KubernetesPod
 	}
-	win.PrintTruncate(0, vaxis.Segment{Text: " POD", Style: palette.title})
+	win.PrintTruncate(0, vaxis.Segment{Text: " ◇  POD", Style: palette.title})
 	row := 2
 	row = a.drawField(win, row, "Name", firstNonempty(pod.ResourceIdentity.Name, "—"), vaxis.Style{})
 	row = a.drawField(win, row, "Namespace", firstNonempty(pod.ResourceIdentity.Namespace, a.options.Namespace), vaxis.Style{})
@@ -428,7 +428,7 @@ func (a *application) drawLogSummary(win vaxis.Window) {
 	palette := a.colors()
 	detail := a.model.Detail()
 	attempt := currentAttempt(detail)
-	win.PrintTruncate(0, vaxis.Segment{Text: " LOG STREAM", Style: palette.title})
+	win.PrintTruncate(0, vaxis.Segment{Text: " ≡  LOG STREAM", Style: palette.title})
 	row := 2
 	row = a.drawField(win, row, "Task", firstNonempty(detail.Task.ID, "—"), vaxis.Style{})
 	row = a.drawField(win, row, "Attempt", firstNonempty(attempt.ID, "—"), vaxis.Style{})
@@ -446,9 +446,9 @@ func (a *application) drawLogs(win vaxis.Window) {
 	for col := 0; col < width; col++ {
 		win.SetCell(col, 0, vaxis.Cell{Character: vaxis.Character{Grapheme: "─", Width: 1}, Style: palette.border})
 	}
-	title := " LOGS (latest) "
+	title := " ≡  LOGS (latest) "
 	if a.mode == viewLogs {
-		title = " LOG STREAM "
+		title = " ≡  LOG STREAM "
 	}
 	info := fmt.Sprintf("%d lines ", len(a.model.Logs()))
 	if a.wrapLogs {
@@ -681,7 +681,7 @@ type shortcut struct {
 }
 
 type metadataItem struct {
-	label, value string
+	icon, label, value string
 }
 
 func drawShortcuts(win vaxis.Window, shortcuts []shortcut, palette colorPalette) {
@@ -741,7 +741,8 @@ func drawMetadataCard(win vaxis.Window, row int, items []metadataItem, palette c
 		}
 		if span > valueStart {
 			cell.New(valueStart, 0, span-valueStart, 1).PrintTruncate(0,
-				vaxis.Segment{Text: " " + label + " ", Style: palette.dim},
+				vaxis.Segment{Text: " " + item.icon + " ", Style: palette.info},
+				vaxis.Segment{Text: label + " ", Style: palette.dim},
 				vaxis.Segment{Text: item.value, Style: palette.base},
 			)
 		}
@@ -756,7 +757,7 @@ func (a *application) drawPipeline(win vaxis.Window, start int, detail TaskDetai
 	if start < 0 || start >= height || width <= 0 {
 		return
 	}
-	win.PrintTruncate(start, vaxis.Segment{Text: " PIPELINE", Style: palette.title})
+	win.PrintTruncate(start, vaxis.Segment{Text: " ┃  PIPELINE", Style: palette.title})
 	row := start + 2
 	if row >= height {
 		return
@@ -908,9 +909,9 @@ func errorMessage(value *client.Error) string {
 func stateMarker(state string) string {
 	switch strings.ToLower(state) {
 	case "succeeded", "success", "completed", "complete", "ready", "open", "merged":
-		return "✓"
+		return "✔"
 	case "failed", "error", "cancelled", "canceled", "lost":
-		return "×"
+		return "✖"
 	case "running", "active", "retrying", "cancelling", "canceling":
 		return "●"
 	case "queued", "pending", "received", "unknown", "":

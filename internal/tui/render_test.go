@@ -29,7 +29,7 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	terminal.Resize(120, 30)
 
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1")
+	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1", "▣ Repo", "⑂ Branch", "# Try", "◇ Pod", "↗ PR")
 
 	failedTask := fixture.task
 	failedTask.State = "failed"
@@ -229,7 +229,7 @@ func TestRenderHelpers(t *testing.T) {
 	if textWidth("● ok") != 4 || humanizeLabel("authentication_failed") != "Authentication failed" {
 		t.Fatal("reference-layout text helpers returned unexpected text")
 	}
-	if stateMarker("succeeded") != "✓" || stateMarker("failed") != "×" || stateMarker("running") != "●" || stateMarker("queued") != "○" {
+	if stateMarker("succeeded") != "✔" || stateMarker("failed") != "✖" || stateMarker("running") != "●" || stateMarker("queued") != "○" {
 		t.Fatal("stateMarker returned unexpected marker")
 	}
 	started := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
