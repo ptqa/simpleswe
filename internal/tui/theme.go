@@ -18,9 +18,9 @@ type paletteColors struct {
 
 var themes = []colorPalette{
 	newPalette("Simpleswe Dark", paletteColors{
-		background: 0x10141b, foreground: 0xd8dee9, header: 0x1f2a44, title: 0x67e8f9, dim: 0x94a3b8,
-		selected: 0x5eead4, selectedForeground: 0x071015, border: 0x475569,
-		ok: 0x4ade80, warn: 0xfacc15, bad: 0xfb7185, info: 0x38bdf8, overlay: 0x172033,
+		background: 0x07111f, foreground: 0xc9d3e2, header: 0x07111f, title: 0x65d8ff, dim: 0x8793aa,
+		selected: 0x6bc8e8, selectedForeground: 0x07111f, border: 0x25354a,
+		ok: 0x72d17c, warn: 0xf2c66d, bad: 0xff6577, info: 0x67c7ef, overlay: 0x1b2940,
 	}),
 	newPalette("Simpleswe Light", paletteColors{
 		background: 0xf7f9fc, foreground: 0x182235, header: 0x24324d, title: 0x075985, dim: 0x526176,

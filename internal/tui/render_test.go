@@ -29,7 +29,21 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	terminal.Resize(120, 30)
 
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "simpleswe", "TASKS", "TASK / ATTEMPT", "LOGS", "task-1")
+	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1")
+
+	failedTask := fixture.task
+	failedTask.State = "failed"
+	failedAttempt := fixture.attempt
+	failedAttempt.State = "failed"
+	failedEvent := fixture.event
+	failedEvent.ToState = "failed"
+	failedEvent.Reason = "publishing pull request"
+	failedEvent.Error = &client.Error{Code: "authentication_failed", Message: "could not authenticate with the forge"}
+	model.SetDetail(TaskDetail{Task: failedTask, Attempts: []Attempt{failedAttempt}, Events: []Event{failedEvent}})
+	console.resetOutput()
+	app.draw()
+	assertOutputContains(t, renderedScreen(console, terminal), "[ FAILED ]", "Publishing pull request", "Authentication failed", "could not authenticate with the forge")
+	model.SetDetail(TaskDetail{Task: fixture.task, Attempts: []Attempt{fixture.attempt}, Events: []Event{fixture.event}})
 
 	for _, test := range []struct {
 		mode viewMode
@@ -64,7 +78,7 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	app.selectTheme(1)
 	console.resetOutput()
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "theme:Simpleswe Light")
+	assertOutputContains(t, renderedScreen(console, terminal), "theme: Simpleswe Light")
 
 	vx.Resize(vaxis.Resize{Cols: 60, Rows: 20})
 	terminal.Resize(60, 20)
@@ -208,6 +222,20 @@ func TestRenderHelpers(t *testing.T) {
 	}
 	if formatTime(time.Time{}) != "—" || !strings.Contains(formatTime(time.Date(2026, 8, 6, 1, 2, 3, 0, time.UTC)), "2026-08-06") {
 		t.Fatal("formatTime returned unexpected text")
+	}
+	if truncateText("pipeline", 5) != "pipe…" || truncateText("ok", 5) != "ok" || truncateText("ignored", 0) != "" {
+		t.Fatal("truncateText returned unexpected text")
+	}
+	if textWidth("● ok") != 4 || humanizeLabel("authentication_failed") != "Authentication failed" {
+		t.Fatal("reference-layout text helpers returned unexpected text")
+	}
+	if stateMarker("succeeded") != "✓" || stateMarker("failed") != "×" || stateMarker("running") != "●" || stateMarker("queued") != "○" {
+		t.Fatal("stateMarker returned unexpected marker")
+	}
+	started := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
+	completed := started.Add(2*time.Minute + 18*time.Second)
+	if formatClock(started) == "—" || formatDuration(started, &completed) != "02m 18s" || formatDuration(time.Time{}, nil) != "—" {
+		t.Fatal("task timing helpers returned unexpected text")
 	}
 }
 
