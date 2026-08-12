@@ -718,7 +718,6 @@ func drawMetadataCard(win vaxis.Window, row int, items []metadataItem, palette c
 	card.SetCell(card.Width-1, 1, vaxis.Cell{Character: vaxis.Character{Grapheme: "│", Width: 1}, Style: palette.border})
 	content := card.New(1, 1, card.Width-2, 1)
 	weights := []int{27, 23, 12, 25, 13}
-	compactLabels := []string{"Repo", "Branch", "Try", "Pod", "PR"}
 	cursor := 0
 	for index, item := range items {
 		if cursor >= content.Width {
@@ -731,8 +730,8 @@ func drawMetadataCard(win vaxis.Window, row int, items []metadataItem, palette c
 		span = min(span, content.Width-cursor)
 		cell := content.New(cursor, 0, span, 1)
 		label := item.label
-		if content.Width < 100 && index < len(compactLabels) {
-			label = compactLabels[index]
+		if content.Width < 100 {
+			label = ""
 		}
 		valueStart := 0
 		if index > 0 && span > 0 {
@@ -740,9 +739,13 @@ func drawMetadataCard(win vaxis.Window, row int, items []metadataItem, palette c
 			valueStart = 1
 		}
 		if span > valueStart {
+			labelText := ""
+			if label != "" {
+				labelText = label + " "
+			}
 			cell.New(valueStart, 0, span-valueStart, 1).PrintTruncate(0,
 				vaxis.Segment{Text: " " + item.icon + " ", Style: palette.info},
-				vaxis.Segment{Text: label + " ", Style: palette.dim},
+				vaxis.Segment{Text: labelText, Style: palette.dim},
 				vaxis.Segment{Text: item.value, Style: palette.base},
 			)
 		}

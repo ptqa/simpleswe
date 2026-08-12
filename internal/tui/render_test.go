@@ -29,7 +29,7 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	terminal.Resize(120, 30)
 
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1", "▣ Repo", "⑂ Branch", "# Try", "◇ Pod", "↗ PR")
+	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1", "▣ acme/widget", "⑂ —", "# #1", "◇ pod-1", "↗ N/A")
 
 	failedTask := fixture.task
 	failedTask.State = "failed"
