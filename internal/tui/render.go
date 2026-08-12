@@ -469,6 +469,7 @@ func (a *application) drawLogs(win vaxis.Window) {
 	}
 	rows := make([][]vaxis.Segment, 0, len(logs))
 	for _, line := range logs {
+		line = compactLogTimestamp(line)
 		if a.wrapLogs {
 			rows = append(rows, wrappedLogRows(line, palette.base, width)...)
 		} else {
@@ -980,6 +981,22 @@ func formatClock(value time.Time) string {
 		return "—"
 	}
 	return value.Local().Format("15:04:05")
+}
+
+func compactLogTimestamp(line string) string {
+	timestamp, remainder, found := strings.Cut(line, " ")
+	if !found {
+		timestamp = line
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, timestamp)
+	if err != nil {
+		return line
+	}
+	formatted := parsed.Format(time.RFC3339)
+	if !found {
+		return formatted
+	}
+	return formatted + " " + remainder
 }
 
 func formatDuration(started time.Time, completed *time.Time) string {

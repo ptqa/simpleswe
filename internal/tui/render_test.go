@@ -21,6 +21,7 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	model.SetConnectivity(ConnectivityConnected)
 	model.AppendLog("build started")
 	model.AppendLog("tests passed")
+	model.AppendLog("2026-08-12T10:24:29.596975475Z [stderr] patch output")
 	app := &application{
 		vx: vx, model: model, mode: viewDetails, message: "ready", logStop: func() {},
 		options: Options{Address: "http://controller", KubeContext: "dev", Namespace: "workers", LogCapacity: 4},
@@ -29,7 +30,11 @@ func TestDrawRendersViewsLayoutsAndOverlays(t *testing.T) {
 	terminal.Resize(120, 30)
 
 	app.draw()
-	assertOutputContains(t, renderedScreen(console, terminal), "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1", "▣ acme/widget", "⑂ —", "# #1", "◇ pod-1", "↗ N/A")
+	output := renderedScreen(console, terminal)
+	assertOutputContains(t, output, "SimpleSWE", "TASKS", "PIPELINE", "LOGS", "task-1", "▣ acme/widget", "⑂ —", "# #1", "◇ pod-1", "↗ N/A", "2026-08-12T10:24:29Z")
+	if strings.Contains(output, ".596975475Z") {
+		t.Fatalf("log timestamp retained sub-second precision: %q", output)
+	}
 
 	failedTask := fixture.task
 	failedTask.State = "failed"
@@ -222,6 +227,16 @@ func TestRenderHelpers(t *testing.T) {
 	}
 	if formatTime(time.Time{}) != "—" || !strings.Contains(formatTime(time.Date(2026, 8, 6, 1, 2, 3, 0, time.UTC)), "2026-08-06") {
 		t.Fatal("formatTime returned unexpected text")
+	}
+	for input, want := range map[string]string{
+		"2026-08-12T10:24:29.596975475Z [stderr] output": "2026-08-12T10:24:29Z [stderr] output",
+		"2026-08-12T13:24:29.123+03:00 message":          "2026-08-12T13:24:29+03:00 message",
+		"2026-08-12T10:24:29Z message":                   "2026-08-12T10:24:29Z message",
+		"ordinary log line":                              "ordinary log line",
+	} {
+		if got := compactLogTimestamp(input); got != want {
+			t.Errorf("compactLogTimestamp(%q) = %q, want %q", input, got, want)
+		}
 	}
 	if truncateText("pipeline", 5) != "pipe…" || truncateText("ok", 5) != "ok" || truncateText("ignored", 0) != "" {
 		t.Fatal("truncateText returned unexpected text")
