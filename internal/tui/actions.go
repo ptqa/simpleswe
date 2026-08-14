@@ -263,7 +263,7 @@ func (a *application) submitCreateTask() {
 	a.createError = ""
 	repository := strings.TrimSpace(a.createRepo.String())
 	if len(a.projects) > 0 {
-		repository = a.projects[a.projectCursor].Repository
+		repository = a.projects[a.projectCursor].Name
 	}
 	prompt := strings.TrimSpace(a.createPrompt.String())
 	if repository == "" {

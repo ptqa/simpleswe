@@ -208,6 +208,25 @@ func TestCreateTaskSubmissionIsSingleFlightAndImmediatelySelectsAndWatchesTask(t
 	}
 }
 
+func TestCreateTaskConfiguredProjectSubmitsName(t *testing.T) {
+	fixture := newControllerFixture(t)
+	app := newTestApplication(t, fixture.client())
+	app.projects = []client.Project{{
+		Name:       "acme/widget",
+		Repository: "ssh://git@example.test/acme/widget.git",
+	}}
+
+	app.openCreateTask()
+	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyEnter})
+	pressText(t, app, "fix configured project")
+	pressKey(t, app, vaxis.Key{Keycode: vaxis.KeyEnter})
+
+	request := receive(t, fixture.createRequestCh)
+	if request.Repository != "acme/widget" || request.Prompt != "fix configured project" {
+		t.Fatalf("configured project create request = %#v", request)
+	}
+}
+
 func TestCreateTaskSuccessAfterPendingModalIsClosedDoesNotReopenIt(t *testing.T) {
 	fixture := newControllerFixture(t)
 	releaseCreate := make(chan struct{}, 1)
