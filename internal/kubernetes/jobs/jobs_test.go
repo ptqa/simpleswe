@@ -159,6 +159,9 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 	if worker.Image != config.Image {
 		t.Errorf("worker image = %q; want %q", worker.Image, config.Image)
 	}
+	if worker.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("worker imagePullPolicy = %q; want %q", worker.ImagePullPolicy, corev1.PullAlways)
+	}
 	if !reflect.DeepEqual(worker.Resources, config.Resources) {
 		t.Errorf("resources = %#v; want %#v", worker.Resources, config.Resources)
 	}

@@ -183,12 +183,13 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 		env = append(env, corev1.EnvVar{Name: secretEnvNamesVariable, Value: strings.Join(secretEnvironmentNames, ",")})
 	}
 	worker := corev1.Container{
-		Name:         workerContainerName,
-		Image:        config.Image,
-		Command:      []string{workerCommand, workerSubcommand},
-		Env:          env,
-		Resources:    config.Resources,
-		VolumeMounts: volumeMounts,
+		Name:            workerContainerName,
+		Image:           config.Image,
+		ImagePullPolicy: corev1.PullAlways,
+		Command:         []string{workerCommand, workerSubcommand},
+		Env:             env,
+		Resources:       config.Resources,
+		VolumeMounts:    volumeMounts,
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 			ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
