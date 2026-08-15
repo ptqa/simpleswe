@@ -109,6 +109,7 @@ func newFixture(t *testing.T) *fixture {
 type fakePullRequestCreator struct {
 	mu         sync.Mutex
 	getResult  *forge.PullRequestState
+	getResults []forge.PullRequestState
 	getErr     error
 	getCalls   int
 	getTargets []forge.Target
@@ -126,6 +127,12 @@ func (f *fakePullRequestCreator) GetPullRequest(_ context.Context, target forge.
 		err := f.getErr
 		f.mu.Unlock()
 		return forge.PullRequestState{}, err
+	}
+	if len(f.getResults) > 0 {
+		result := f.getResults[0]
+		f.getResults = f.getResults[1:]
+		f.mu.Unlock()
+		return result, nil
 	}
 	if f.getResult != nil {
 		result := *f.getResult

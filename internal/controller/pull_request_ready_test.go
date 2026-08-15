@@ -190,6 +190,30 @@ func TestPullRequestReadyPermanentlyRejectsProviderMismatchWithoutAdoption(t *te
 	}
 }
 
+func TestPullRequestReadyRetriesUntilProviderHeadSettles(t *testing.T) {
+	fixture := newFixture(t)
+	record := createRunningTask(t, fixture, "fix it", "ready-head-settling")
+	attempt, branch := prepareAttemptForPush(t, fixture, record)
+	event := protocol.Event{Type: protocol.EventPullRequestReady, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: fullCommitSHA}
+	unsettled := forge.PullRequestState{
+		Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title",
+		SourceOwner: "acme", SourceRepository: "widget", SourceBranch: branch,
+		DestinationBranch: "main", HeadSHA: strings.Repeat("f", 40),
+	}
+	settled := unsettled
+	settled.HeadSHA = fullCommitSHA
+	fixture.pullRequests.getResults = []forge.PullRequestState{unsettled, settled}
+	if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobs.Name(record.ID, attempt.Number), "worker-pod-a1", event); err != nil {
+		t.Fatalf("settled provider head: %v", err)
+	}
+	if got := getTask(t, fixture, record.ID).State; got != task.PR_OPEN {
+		t.Fatalf("settled provider head state = %q, want %q", got, task.PR_OPEN)
+	}
+	if fixture.pullRequests.getCalls != 2 {
+		t.Fatalf("provider inspections = %d, want 2", fixture.pullRequests.getCalls)
+	}
+}
+
 func TestPullRequestReadyTransientInspectionReplaysAtomically(t *testing.T) {
 	fixture := newFixture(t)
 	record := createRunningTask(t, fixture, "fix it", "ready-transient")

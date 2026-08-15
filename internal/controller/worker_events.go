@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -17,6 +18,10 @@ import (
 	"github.com/simpleswe/simpleswe/internal/task"
 	"github.com/simpleswe/simpleswe/internal/worker/protocol"
 )
+
+var errPullRequestHeadUnsettled = errors.New("pull request head has not settled")
+
+const pullRequestHeadSettleRetries = 4
 
 // HandleWorkerEvent accepts only the structured worker protocol boundary. Job
 // and Pod names are provenance, never parsed for lifecycle instructions.
@@ -254,16 +259,30 @@ func (c *Controller) handlePullRequestReadyLocked(ctx context.Context, record st
 		return c.resumePullRequestLocked(ctx, record, attempt, "resumed durable reported pull request job="+jobName+" pod="+podName+" branch="+event.Branch)
 	}
 	providerCtx, cancel := context.WithTimeout(ctx, c.providerTimeout)
-	live, err := c.pullRequests.GetPullRequest(providerCtx, target, event.PullRequestNumber)
-	cancel()
-	if err != nil {
-		if !forge.IsPermanent(err) {
-			return fmt.Errorf("inspect reported pull request: %w", err)
+	defer cancel()
+	var live forge.PullRequestState
+	for retry := 0; ; retry++ {
+		live, err = c.pullRequests.GetPullRequest(providerCtx, target, event.PullRequestNumber)
+		if err != nil {
+			if !forge.IsPermanent(err) {
+				return fmt.Errorf("inspect reported pull request: %w", err)
+			}
+			return c.failPullRequestReceipt(ctx, record, err)
 		}
-		return c.failPullRequestReceipt(ctx, record, err)
-	}
-	if err := verifyReportedPullRequest(live, event, manifest, target); err != nil {
-		return c.failPullRequestReceipt(ctx, record, err)
+		if err = verifyReportedPullRequest(live, event, manifest, target); err == nil {
+			break
+		}
+		if !errors.Is(err, errPullRequestHeadUnsettled) {
+			return c.failPullRequestReceipt(ctx, record, err)
+		}
+		if retry == pullRequestHeadSettleRetries {
+			return c.failPullRequestReceipt(ctx, record, forge.MarkPermanent(err))
+		}
+		select {
+		case <-providerCtx.Done():
+			return c.failPullRequestReceipt(ctx, record, forge.MarkPermanent(errors.Join(err, providerCtx.Err())))
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
 	git := store.GitResult{AttemptID: attempt.ID, State: "pushed", Branch: event.Branch, CommitSHA: event.CommitSHA}
 	pullRequest := store.PullRequest{
@@ -353,7 +372,7 @@ func verifyReportedPullRequest(live forge.PullRequestState, event protocol.Event
 		return err
 	}
 	if !strings.EqualFold(live.HeadSHA, event.CommitSHA) {
-		return fmt.Errorf("reported pull request mismatch: %w", forge.MarkPermanent(fmt.Errorf("%w: reported pull request does not match immutable repository, refs, state, number, or full head SHA", store.ErrConflict)))
+		return fmt.Errorf("%w: provider head SHA %q, reported SHA %q", errPullRequestHeadUnsettled, live.HeadSHA, event.CommitSHA)
 	}
 	return nil
 }
