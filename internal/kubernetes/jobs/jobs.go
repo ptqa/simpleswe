@@ -168,7 +168,7 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 	terminationGracePeriod := int64(30)
 	automountServiceAccountToken := false
 	allowPrivilegeEscalation := false
-	readOnlyRootFilesystem := true
+	readOnlyRootFilesystem := false
 	runAsRoot := int64(0)
 	env := append([]corev1.EnvVar(nil), config.Env...)
 	env = append(env,
