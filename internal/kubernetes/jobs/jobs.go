@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 
@@ -46,6 +47,7 @@ type Config struct {
 	ServiceAccountName string
 	ImagePullSecrets   []string
 	Env                []corev1.EnvVar
+	Sidecars           []corev1.Container
 	Deadline           time.Duration
 	CredentialSecrets  []SecretMount
 	ConfigMaps         []ConfigMapMount
@@ -198,8 +200,17 @@ func Build(config Config, manifest TaskManifest, attempt Attempt) (*batchv1.Job,
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 	}
+	var initContainers []corev1.Container
+	for _, configured := range config.Sidecars {
+		sidecar := configured.DeepCopy()
+		sidecar.ImagePullPolicy = corev1.PullAlways
+		sidecarRestartPolicy := corev1.ContainerRestartPolicyAlways
+		sidecar.RestartPolicy = &sidecarRestartPolicy
+		initContainers = append(initContainers, *sidecar)
+	}
 	podSpec := corev1.PodSpec{
 		Containers:                    []corev1.Container{worker},
+		InitContainers:                initContainers,
 		RestartPolicy:                 corev1.RestartPolicyNever,
 		TerminationGracePeriodSeconds: &terminationGracePeriod,
 		AutomountServiceAccountToken:  &automountServiceAccountToken,
@@ -273,8 +284,55 @@ func validateConfig(config Config) error {
 		return fmt.Errorf("deadline must be at least one second")
 	}
 	for _, variable := range config.Env {
+		if len(validation.IsEnvVarName(variable.Name)) > 0 {
+			return fmt.Errorf("environment variable %s has an invalid name", variable.Name)
+		}
 		if variable.Name == "HOME" || variable.Name == "TMPDIR" || variable.Name == secretEnvNamesVariable {
 			return fmt.Errorf("environment variable %s is reserved", variable.Name)
+		}
+	}
+	return validateSidecars(config.Sidecars)
+}
+
+func validateSidecars(sidecars []corev1.Container) error {
+	names := map[string]struct{}{workerContainerName: {}}
+	ports := make(map[int32]struct{}, len(sidecars))
+	for i, sidecar := range sidecars {
+		if len(validation.IsDNS1123Label(sidecar.Name)) > 0 {
+			return fmt.Errorf("sidecar %d name is invalid", i)
+		}
+		if strings.TrimSpace(sidecar.Image) == "" {
+			return fmt.Errorf("sidecar %q image is required", sidecar.Name)
+		}
+		if strings.IndexFunc(sidecar.Image, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("sidecar %q image contains whitespace or control characters", sidecar.Name)
+		}
+		if _, exists := names[sidecar.Name]; exists {
+			return fmt.Errorf("sidecar %q name is duplicated", sidecar.Name)
+		}
+		names[sidecar.Name] = struct{}{}
+		for _, variable := range sidecar.Env {
+			if len(validation.IsEnvVarName(variable.Name)) > 0 {
+				return fmt.Errorf("sidecar %q environment variable %s has an invalid name", sidecar.Name, variable.Name)
+			}
+		}
+		probe := sidecar.StartupProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.Type != intstr.Int || probe.TCPSocket.Port.IntVal < 1 || probe.TCPSocket.Port.IntVal > 65535 {
+			return fmt.Errorf("sidecar %q startup probe must be a valid TCP port", sidecar.Name)
+		}
+		port := probe.TCPSocket.Port.IntVal
+		if _, exists := ports[port]; exists {
+			return fmt.Errorf("sidecar %q startup probe port %d is duplicated", sidecar.Name, port)
+		}
+		ports[port] = struct{}{}
+		for field, value := range map[string]int32{
+			"periodSeconds":    probe.PeriodSeconds,
+			"timeoutSeconds":   probe.TimeoutSeconds,
+			"failureThreshold": probe.FailureThreshold,
+		} {
+			if value < 0 {
+				return fmt.Errorf("sidecar %q startup probe %s is invalid", sidecar.Name, field)
+			}
 		}
 	}
 	return nil

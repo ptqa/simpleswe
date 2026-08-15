@@ -158,8 +158,9 @@ func TestValidateWorkerBranches(t *testing.T) {
 		"mounted config map": func(w *WorkerConfig) {
 			w.MountedConfigMaps = []NamedMount{{Name: "Bad", MountPath: "relative"}}
 		},
-		"env name":     func(w *WorkerConfig) { w.Env = []Env{{}} },
-		"reserved env": func(w *WorkerConfig) { w.Env = []Env{{Name: "SIMPLESWE_SECRET_PATHS"}} },
+		"env name":         func(w *WorkerConfig) { w.Env = []Env{{}} },
+		"invalid env name": func(w *WorkerConfig) { w.Env = []Env{{Name: "1BAD"}} },
+		"reserved env":     func(w *WorkerConfig) { w.Env = []Env{{Name: "SIMPLESWE_SECRET_PATHS"}} },
 		"env sources": func(w *WorkerConfig) {
 			w.Env = []Env{{Name: "TOKEN", Value: "value", Secret: &KeyRef{Name: "secret", Key: "token"}}}
 		},
@@ -188,6 +189,27 @@ func TestValidateWorkerBranches(t *testing.T) {
 	}
 	if err := validateWorker(valid, "worker"); err != nil {
 		t.Fatalf("valid worker rejected: %v", err)
+	}
+}
+
+func TestValidateWorkerSidecarsRejectsDuplicatePortsAndInvalidTiming(t *testing.T) {
+	validSidecar := func(name string) Sidecar {
+		return Sidecar{Name: name, Image: "service:v1", StartupProbe: &TCPStartupProbe{Port: 3306}}
+	}
+	duplicatePorts := WorkerConfig{Sidecars: []Sidecar{validSidecar("database"), validSidecar("cache")}}
+	if err := validateWorker(duplicatePorts, "worker"); err == nil || !strings.Contains(err.Error(), "startup_probe.port is duplicated") {
+		t.Fatalf("duplicate sidecar ports error = %v", err)
+	}
+	invalidEnv := validSidecar("database")
+	invalidEnv.Env = []Env{{Name: "1BAD", Value: "value"}}
+	if err := validateWorker(WorkerConfig{Sidecars: []Sidecar{invalidEnv}}, "worker"); err == nil || !strings.Contains(err.Error(), "environment variable name") {
+		t.Fatalf("invalid sidecar env name error = %v", err)
+	}
+	zero := int32(0)
+	invalidTiming := validSidecar("database")
+	invalidTiming.StartupProbe.PeriodSeconds = &zero
+	if err := validateWorker(WorkerConfig{Sidecars: []Sidecar{invalidTiming}}, "worker"); err == nil || !strings.Contains(err.Error(), "period_seconds must be positive") {
+		t.Fatalf("invalid sidecar probe timing error = %v", err)
 	}
 }
 

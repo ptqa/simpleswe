@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/simpleswe/simpleswe/internal/config"
@@ -673,7 +675,7 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 	if repository.Worker.Affinity != nil {
 		affinityMap = repository.Worker.Affinity
 	}
-	affinity, err := affinityFromMap(affinityMap)
+	affinity, err := decodeKubernetesMap[corev1.Affinity](affinityMap, "worker affinity")
 	if err != nil {
 		return jobs.Config{}, err
 	}
@@ -699,6 +701,45 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 		ServiceAccountName: serviceAccount,
 		ImagePullSecrets:   pullSecrets,
 		Deadline:           deadline,
+	}
+	sidecars := repository.Worker.Sidecars
+	if sidecars == nil {
+		sidecars = c.config.Worker.Sidecars
+	}
+	for _, sidecar := range sidecars {
+		if sidecar.StartupProbe == nil {
+			return jobs.Config{}, fmt.Errorf("sidecar %q startup_probe.port is required", sidecar.Name)
+		}
+		resources, err := resourceRequirements(sidecar.Resources)
+		if err != nil {
+			return jobs.Config{}, fmt.Errorf("sidecar %q resources: %w", sidecar.Name, err)
+		}
+		securityContext, err := decodeKubernetesMap[corev1.SecurityContext](sidecar.SecurityContext, "sidecar security context")
+		if err != nil {
+			return jobs.Config{}, err
+		}
+		probe := &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(int(sidecar.StartupProbe.Port))},
+		}}
+		if sidecar.StartupProbe.PeriodSeconds != nil {
+			probe.PeriodSeconds = *sidecar.StartupProbe.PeriodSeconds
+		}
+		if sidecar.StartupProbe.TimeoutSeconds != nil {
+			probe.TimeoutSeconds = *sidecar.StartupProbe.TimeoutSeconds
+		}
+		if sidecar.StartupProbe.FailureThreshold != nil {
+			probe.FailureThreshold = *sidecar.StartupProbe.FailureThreshold
+		}
+		jobConfig.Sidecars = append(jobConfig.Sidecars, corev1.Container{
+			Name:            sidecar.Name,
+			Image:           sidecar.Image,
+			Command:         append([]string(nil), sidecar.Command...),
+			Args:            append([]string(nil), sidecar.Args...),
+			Env:             envVars(sidecar.Env),
+			Resources:       resources,
+			StartupProbe:    probe,
+			SecurityContext: securityContext,
+		})
 	}
 	for _, toleration := range tolerations {
 		jobConfig.Tolerations = append(jobConfig.Tolerations, corev1.Toleration{
@@ -784,14 +825,7 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 		)
 	}
 	for _, env := range repository.Worker.Env {
-		value := corev1.EnvVar{Name: env.Name, Value: env.Value}
-		if env.Secret != nil {
-			value.ValueFrom = &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: env.Secret.Name}, Key: env.Secret.Key}}
-		}
-		if env.ConfigMap != nil {
-			value.ValueFrom = &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: env.ConfigMap.Name}, Key: env.ConfigMap.Key}}
-		}
-		jobConfig.Env = append(jobConfig.Env, value)
+		jobConfig.Env = append(jobConfig.Env, envVar(env))
 	}
 	secretPaths := make([]string, 0, len(jobConfig.CredentialSecrets))
 	for _, secret := range jobConfig.CredentialSecrets {
@@ -801,6 +835,25 @@ func (c *Controller) jobConfig(repository config.RepositoryConfig) (jobs.Config,
 		jobConfig.Env = append(jobConfig.Env, corev1.EnvVar{Name: "SIMPLESWE_SECRET_PATHS", Value: strings.Join(secretPaths, string(os.PathListSeparator))})
 	}
 	return jobConfig, nil
+}
+
+func envVars(envs []config.Env) []corev1.EnvVar {
+	result := make([]corev1.EnvVar, 0, len(envs))
+	for _, env := range envs {
+		result = append(result, envVar(env))
+	}
+	return result
+}
+
+func envVar(env config.Env) corev1.EnvVar {
+	value := corev1.EnvVar{Name: env.Name, Value: env.Value}
+	if env.Secret != nil {
+		value.ValueFrom = &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: env.Secret.Name}, Key: env.Secret.Key}}
+	}
+	if env.ConfigMap != nil {
+		value.ValueFrom = &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: env.ConfigMap.Name}, Key: env.ConfigMap.Key}}
+	}
+	return value
 }
 
 func forgeTarget(cfg config.Config, repository config.RepositoryConfig) (forge.Target, error) {
@@ -827,17 +880,19 @@ func forgeTarget(cfg config.Config, repository config.RepositoryConfig) (forge.T
 	return target, nil
 }
 
-func affinityFromMap(input map[string]any) (*corev1.Affinity, error) {
+func decodeKubernetesMap[T any](input map[string]any, label string) (*T, error) {
 	if len(input) == 0 {
 		return nil, nil
 	}
 	data, err := json.Marshal(input)
 	if err != nil {
-		return nil, fmt.Errorf("marshal worker affinity: %w", err)
+		return nil, fmt.Errorf("marshal %s: %w", label, err)
 	}
-	var result corev1.Affinity
-	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, fmt.Errorf("decode worker affinity: %w", err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var result T
+	if err := decoder.Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", label, err)
 	}
 	return &result, nil
 }

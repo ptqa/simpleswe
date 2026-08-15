@@ -69,6 +69,7 @@ func TestJobConfigMapsResourcesSchedulingMountsAndEnvironment(t *testing.T) {
 	fixture := newFixture(t)
 	control := fixture.controller.(*Controller)
 	seconds := int64(30)
+	period, timeout, failure := int32(5), int32(2), int32(30)
 	size := config.Quantity("1Gi")
 	repository := fixture.config.Repositories[0]
 	repository.Credentials.SecretName = "repository-creds"
@@ -94,6 +95,20 @@ func TestJobConfigMapsResourcesSchedulingMountsAndEnvironment(t *testing.T) {
 			{Name: "FROM_SECRET", Secret: &config.KeyRef{Name: "env-secret", Key: "token"}},
 			{Name: "FROM_CONFIG", ConfigMap: &config.KeyRef{Name: "env-config", Key: "setting"}},
 		},
+		Sidecars: []config.Sidecar{{
+			Name:    "database",
+			Image:   "registry.example/database:v1",
+			Command: []string{"database"},
+			Args:    []string{"--listen", "3306"},
+			Env:     []config.Env{{Name: "DATABASE_PASSWORD", Secret: &config.KeyRef{Name: "database-secret", Key: "password"}}},
+			Resources: config.ResourceRequirements{
+				Requests: config.ResourceList{"cpu": "100m"},
+			},
+			StartupProbe: &config.TCPStartupProbe{Port: 3306, PeriodSeconds: &period, TimeoutSeconds: &timeout, FailureThreshold: &failure},
+			SecurityContext: map[string]any{
+				"runAsNonRoot": true,
+			},
+		}},
 	}
 	repository.Git.SSHSecret = "git-ssh"
 	repository.OpenCode.ConfigSecret = "opencode-config"
@@ -105,8 +120,27 @@ func TestJobConfigMapsResourcesSchedulingMountsAndEnvironment(t *testing.T) {
 	if got.Deadline != 3*time.Minute || got.Resources.Requests.Cpu().Cmp(resource.MustParse("250m")) != 0 || got.Resources.Limits.Memory().Cmp(resource.MustParse("2Gi")) != 0 {
 		t.Fatalf("resource configuration = %#v", got)
 	}
-	if len(got.Tolerations) != 1 || got.Affinity == nil || len(got.CredentialSecrets) != 6 || len(got.ConfigMaps) != 2 || len(got.EmptyDirs) != 1 {
+	if len(got.Tolerations) != 1 || got.Affinity == nil || len(got.CredentialSecrets) != 6 || len(got.ConfigMaps) != 2 || len(got.EmptyDirs) != 1 || len(got.Sidecars) != 1 {
 		t.Fatalf("scheduling and mounts = %#v", got)
+	}
+	sidecar := got.Sidecars[0]
+	if sidecar.Name != "database" || sidecar.Image != "registry.example/database:v1" || strings.Join(sidecar.Command, " ") != "database" || strings.Join(sidecar.Args, " ") != "--listen 3306" {
+		t.Fatalf("sidecar identity/command = %#v", sidecar)
+	}
+	if sidecar.StartupProbe == nil || sidecar.StartupProbe.TCPSocket == nil || sidecar.StartupProbe.TCPSocket.Port.IntValue() != 3306 {
+		t.Fatalf("sidecar startup probe = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.StartupProbe.PeriodSeconds != 5 || sidecar.StartupProbe.TimeoutSeconds != 2 || sidecar.StartupProbe.FailureThreshold != 30 {
+		t.Fatalf("sidecar startup probe timing = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.SecurityContext == nil || sidecar.SecurityContext.RunAsNonRoot == nil || !*sidecar.SecurityContext.RunAsNonRoot {
+		t.Fatalf("sidecar security context = %#v", sidecar.SecurityContext)
+	}
+	if sidecar.Env[0].Value != "" || sidecar.Env[0].ValueFrom == nil || sidecar.Env[0].ValueFrom.SecretKeyRef == nil || sidecar.Env[0].ValueFrom.SecretKeyRef.Name != "database-secret" {
+		t.Fatalf("sidecar secret env = %#v", sidecar.Env[0])
+	}
+	if sidecar.Resources.Requests.Cpu().Cmp(resource.MustParse("100m")) != 0 {
+		t.Fatalf("sidecar resources = %#v", sidecar.Resources)
 	}
 	wantEnv := map[string]bool{"PLAIN": false, "FROM_SECRET": false, "FROM_CONFIG": false, "GIT_SSH_COMMAND": false, "GIT_TERMINAL_PROMPT": false, "SIMPLESWE_SECRET_PATHS": false}
 	for _, value := range got.Env {
@@ -122,6 +156,9 @@ func TestJobConfigMapsResourcesSchedulingMountsAndEnvironment(t *testing.T) {
 }
 
 func TestConfigurationHelpersRejectInvalidValues(t *testing.T) {
+	if got, err := decodeKubernetesMap[corev1.Affinity](nil, "worker affinity"); err != nil || got != nil {
+		t.Fatalf("decodeKubernetesMap(empty) = %#v, %v; want nil, nil", got, err)
+	}
 	for _, test := range []struct {
 		name  string
 		input config.ResourceRequirements
@@ -136,11 +173,48 @@ func TestConfigurationHelpersRejectInvalidValues(t *testing.T) {
 			}
 		})
 	}
-	if _, err := affinityFromMap(map[string]any{"nodeAffinity": "invalid"}); err == nil || !strings.Contains(err.Error(), "decode worker affinity") {
-		t.Fatalf("affinityFromMap() error = %v", err)
+	if _, err := decodeKubernetesMap[corev1.Affinity](map[string]any{"nodeAffinity": "invalid"}, "worker affinity"); err == nil || !strings.Contains(err.Error(), "decode worker affinity") {
+		t.Fatalf("decodeKubernetesMap(affinity) error = %v", err)
 	}
-	if _, err := affinityFromMap(map[string]any{"invalid": make(chan int)}); err == nil || !strings.Contains(err.Error(), "marshal worker affinity") {
-		t.Fatalf("affinityFromMap(unmarshalable) error = %v", err)
+	if _, err := decodeKubernetesMap[corev1.SecurityContext](map[string]any{"runAsUser": "invalid"}, "sidecar security context"); err == nil || !strings.Contains(err.Error(), "decode sidecar security context") {
+		t.Fatalf("decodeKubernetesMap(security context) error = %v", err)
+	}
+}
+
+func TestJobConfigUsesGlobalSidecarsUnlessRepositoryOverrides(t *testing.T) {
+	fixture := newFixture(t)
+	control := fixture.controller.(*Controller)
+	global := config.Sidecar{Name: "global", Image: "global:v1", StartupProbe: &config.TCPStartupProbe{Port: 3306}}
+	override := config.Sidecar{Name: "override", Image: "override:v1", StartupProbe: &config.TCPStartupProbe{Port: 6379}}
+	control.config.Worker.Sidecars = []config.Sidecar{global}
+	repository := fixture.config.Repositories[0]
+	got, err := control.jobConfig(repository)
+	if err != nil {
+		t.Fatalf("jobConfig(global sidecars): %v", err)
+	}
+	if len(got.Sidecars) != 1 || got.Sidecars[0].Name != "global" {
+		t.Fatalf("global sidecar fallback = %#v", got.Sidecars)
+	}
+	repository.Worker.Sidecars = []config.Sidecar{override}
+	got, err = control.jobConfig(repository)
+	if err != nil {
+		t.Fatalf("jobConfig(repository sidecars): %v", err)
+	}
+	if len(got.Sidecars) != 1 || got.Sidecars[0].Name != "override" {
+		t.Fatalf("repository sidecar override = %#v", got.Sidecars)
+	}
+}
+
+func TestJobConfigRejectsUnknownSidecarSecurityContextFields(t *testing.T) {
+	fixture := newFixture(t)
+	control := fixture.controller.(*Controller)
+	repository := fixture.config.Repositories[0]
+	repository.Worker.Sidecars = []config.Sidecar{{
+		Name: "database", Image: "database:v1", StartupProbe: &config.TCPStartupProbe{Port: 3306},
+		SecurityContext: map[string]any{"runAsNonRoot": true, "typoField": true},
+	}}
+	if _, err := control.jobConfig(repository); err == nil || !strings.Contains(err.Error(), "decode sidecar security context") || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("jobConfig() security context error = %v", err)
 	}
 }
 

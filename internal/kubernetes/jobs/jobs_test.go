@@ -18,6 +18,7 @@ import (
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -221,6 +222,119 @@ func TestBuildJobAndTaskSecret(t *testing.T) {
 		t.Errorf("volumes = %d; want task Secret, workspace, plus %d credential Secrets", len(pod.Volumes), len(config.CredentialSecrets))
 	}
 
+}
+
+func TestBuildRendersSidecarsAsRestartableInitContainers(t *testing.T) {
+	runAsNonRoot := true
+	configuredRestartPolicy := corev1.ContainerRestartPolicy("Never")
+	config := Config{
+		Namespace: "workers",
+		Image:     "worker:latest",
+		Deadline:  time.Minute,
+		Sidecars: []corev1.Container{{
+			Name:            "database",
+			Image:           "registry.example/database:v1",
+			ImagePullPolicy: corev1.PullNever,
+			RestartPolicy:   &configuredRestartPolicy,
+			Command:         []string{"database"},
+			Args:            []string{"--listen", "3306"},
+			Env:             []corev1.EnvVar{{Name: "DATABASE_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "database-secret"}, Key: "password"}}}},
+			Resources:       resourceRequirements(),
+			StartupProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(3306)},
+			}, PeriodSeconds: 5, TimeoutSeconds: 2, FailureThreshold: 30},
+			SecurityContext: &corev1.SecurityContext{
+				RunAsNonRoot: &runAsNonRoot,
+			}},
+		},
+	}
+	job, _, err := Build(config, TaskManifest{TaskID: "task", Prompt: "prompt"}, Attempt{ID: "attempt", Number: 1})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	pod := job.Spec.Template.Spec
+	if len(pod.Containers) != 1 || pod.Containers[0].Name != workerContainerName {
+		t.Fatalf("containers = %#v; want one worker", pod.Containers)
+	}
+	if len(pod.InitContainers) != 1 {
+		t.Fatalf("init containers = %d; want one sidecar", len(pod.InitContainers))
+	}
+	sidecar := pod.InitContainers[0]
+	if sidecar.Name != "database" || sidecar.Image != "registry.example/database:v1" {
+		t.Fatalf("sidecar identity = %#v", sidecar)
+	}
+	if sidecar.RestartPolicy == nil || *sidecar.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Fatalf("sidecar restartPolicy = %v; want Always", sidecar.RestartPolicy)
+	}
+	if config.Sidecars[0].ImagePullPolicy != corev1.PullNever || config.Sidecars[0].RestartPolicy == nil || *config.Sidecars[0].RestartPolicy != configuredRestartPolicy {
+		t.Fatalf("Build mutated configured sidecar = %#v", config.Sidecars[0])
+	}
+	if sidecar.StartupProbe == nil || sidecar.StartupProbe.TCPSocket == nil || sidecar.StartupProbe.TCPSocket.Port.IntValue() != 3306 {
+		t.Fatalf("sidecar startup probe = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.StartupProbe.PeriodSeconds != 5 || sidecar.StartupProbe.TimeoutSeconds != 2 || sidecar.StartupProbe.FailureThreshold != 30 {
+		t.Fatalf("sidecar startup probe timing = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.SecurityContext == nil || sidecar.SecurityContext.RunAsNonRoot == nil || !*sidecar.SecurityContext.RunAsNonRoot {
+		t.Fatalf("sidecar security context = %#v", sidecar.SecurityContext)
+	}
+	if !reflect.DeepEqual(sidecar.Command, config.Sidecars[0].Command) || !reflect.DeepEqual(sidecar.Args, config.Sidecars[0].Args) || !reflect.DeepEqual(sidecar.Resources, config.Sidecars[0].Resources) {
+		t.Fatalf("sidecar execution config = %#v", sidecar)
+	}
+	if sidecar.Env[0].Value != "" || sidecar.Env[0].ValueFrom == nil || sidecar.Env[0].ValueFrom.SecretKeyRef == nil || sidecar.Env[0].ValueFrom.SecretKeyRef.Name != "database-secret" || sidecar.Env[0].ValueFrom.SecretKeyRef.Key != "password" {
+		t.Fatalf("sidecar secret env = %#v", sidecar.Env[0])
+	}
+}
+
+func TestBuildRejectsInvalidSidecarConfiguration(t *testing.T) {
+	probe := func(port int, period int32) *corev1.Probe {
+		return &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt(port)}}, PeriodSeconds: period}
+	}
+	base := Config{Namespace: "workers", Image: "worker:latest", Deadline: time.Minute}
+	for _, test := range []struct {
+		name   string
+		config Config
+		want   string
+	}{
+		{
+			name: "duplicate startup ports",
+			config: Config{
+				Namespace: "workers", Image: "worker:latest", Deadline: time.Minute,
+				Sidecars: []corev1.Container{{Name: "database", Image: "database:v1", StartupProbe: probe(3306, 0)}, {Name: "cache", Image: "cache:v1", StartupProbe: probe(3306, 0)}},
+			},
+			want: "startup probe port 3306 is duplicated",
+		},
+		{
+			name: "sidecar environment name",
+			config: Config{
+				Namespace: "workers", Image: "worker:latest", Deadline: time.Minute,
+				Sidecars: []corev1.Container{{Name: "database", Image: "database:v1", Env: []corev1.EnvVar{{Name: "1BAD"}}, StartupProbe: probe(3306, 0)}},
+			},
+			want: "environment variable 1BAD has an invalid name",
+		},
+		{
+			name:   "worker environment name",
+			config: Config{Namespace: "workers", Image: "worker:latest", Deadline: time.Minute, Env: []corev1.EnvVar{{Name: "1BAD"}}},
+			want:   "environment variable 1BAD has an invalid name",
+		},
+		{
+			name: "negative probe timing",
+			config: Config{
+				Namespace: "workers", Image: "worker:latest", Deadline: time.Minute,
+				Sidecars: []corev1.Container{{Name: "database", Image: "database:v1", StartupProbe: probe(3306, -1)}},
+			},
+			want: "startup probe periodSeconds is invalid",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := Build(test.config, TaskManifest{TaskID: "task", Prompt: "prompt"}, Attempt{ID: "attempt", Number: 1}); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Build() error = %v; want %q", err, test.want)
+			}
+		})
+	}
+	if _, _, err := Build(base, TaskManifest{TaskID: "task", Prompt: "prompt"}, Attempt{ID: "attempt", Number: 1}); err != nil {
+		t.Fatalf("Build(valid sidecar-free config) error = %v", err)
+	}
 }
 
 func TestBuildRetryUsesDistinctJobsAndTaskSecrets(t *testing.T) {

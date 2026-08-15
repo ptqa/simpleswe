@@ -10,8 +10,10 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 const (
@@ -76,8 +78,27 @@ type WorkerConfig struct {
 	ServiceAccountName string               `yaml:"service_account_name,omitempty"`
 	ImagePullSecrets   []string             `yaml:"image_pull_secrets,omitempty"`
 	Env                []Env                `yaml:"env,omitempty"`
+	Sidecars           []Sidecar            `yaml:"sidecars,omitempty"`
 	MountedSecrets     []NamedMount         `yaml:"mounted_secrets,omitempty"`
 	MountedConfigMaps  []NamedMount         `yaml:"mounted_config_maps,omitempty"`
+}
+
+type Sidecar struct {
+	Name            string               `yaml:"name"`
+	Image           string               `yaml:"image"`
+	Command         []string             `yaml:"command,omitempty"`
+	Args            []string             `yaml:"args,omitempty"`
+	Env             []Env                `yaml:"env,omitempty"`
+	Resources       ResourceRequirements `yaml:"resources,omitempty"`
+	StartupProbe    *TCPStartupProbe     `yaml:"startup_probe,omitempty"`
+	SecurityContext map[string]any       `yaml:"security_context,omitempty"`
+}
+
+type TCPStartupProbe struct {
+	Port             int32  `yaml:"port"`
+	PeriodSeconds    *int32 `yaml:"period_seconds,omitempty"`
+	TimeoutSeconds   *int32 `yaml:"timeout_seconds,omitempty"`
+	FailureThreshold *int32 `yaml:"failure_threshold,omitempty"`
 }
 
 type RepositoryConfigs []RepositoryConfig
@@ -538,29 +559,87 @@ func validateWorker(worker WorkerConfig, path string) error {
 		}
 	}
 	for i, env := range worker.Env {
-		if strings.TrimSpace(env.Name) == "" {
-			return fmt.Errorf("%s.env[%d].name is required", path, i)
+		if err := validateEnv(env, fmt.Sprintf("%s.env[%d]", path, i), true); err != nil {
+			return err
 		}
-		if env.Name == "SIMPLESWE_SECRET_PATHS" {
-			return fmt.Errorf("%s.env[%d].name is reserved", path, i)
+	}
+	sidecarNames := map[string]struct{}{"worker": {}}
+	sidecarPorts := make(map[int32]struct{}, len(worker.Sidecars))
+	for i, sidecar := range worker.Sidecars {
+		sidecarPath := fmt.Sprintf("%s.sidecars[%d]", path, i)
+		if strings.TrimSpace(sidecar.Name) == "" {
+			return fmt.Errorf("%s.name is required", sidecarPath)
 		}
-		sources := 0
-		if env.Value != "" {
-			sources++
+		if len(k8svalidation.IsDNS1123Label(sidecar.Name)) > 0 {
+			return fmt.Errorf("%s.name must be a valid Kubernetes container name", sidecarPath)
 		}
-		if env.Secret != nil {
-			sources++
+		if _, exists := sidecarNames[sidecar.Name]; exists {
+			return fmt.Errorf("%s.name is duplicated", sidecarPath)
 		}
-		if env.ConfigMap != nil {
-			sources++
+		sidecarNames[sidecar.Name] = struct{}{}
+		if strings.TrimSpace(sidecar.Image) == "" {
+			return fmt.Errorf("%s.image is required", sidecarPath)
 		}
-		if sources > 1 {
-			return fmt.Errorf("%s.env[%d] has multiple value sources", path, i)
+		if strings.IndexFunc(sidecar.Image, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+			return fmt.Errorf("%s.image contains whitespace or control characters", sidecarPath)
 		}
-		for kind, ref := range map[string]*KeyRef{"secret": env.Secret, "config_map": env.ConfigMap} {
-			if ref != nil && (!validDNSName(ref.Name) || strings.TrimSpace(ref.Key) == "") {
-				return fmt.Errorf("%s.env[%d].%s is invalid", path, i, kind)
+		if err := validateResources(sidecar.Resources, sidecarPath+".resources"); err != nil {
+			return err
+		}
+		for j, env := range sidecar.Env {
+			if err := validateEnv(env, fmt.Sprintf("%s.env[%d]", sidecarPath, j), false); err != nil {
+				return err
 			}
+		}
+		if sidecar.StartupProbe == nil {
+			return fmt.Errorf("%s.startup_probe.port is required", sidecarPath)
+		}
+		if sidecar.StartupProbe.Port < 1 || sidecar.StartupProbe.Port > 65535 {
+			return fmt.Errorf("%s.startup_probe.port must be between 1 and 65535", sidecarPath)
+		}
+		if _, exists := sidecarPorts[sidecar.StartupProbe.Port]; exists {
+			return fmt.Errorf("%s.startup_probe.port is duplicated", sidecarPath)
+		}
+		sidecarPorts[sidecar.StartupProbe.Port] = struct{}{}
+		for field, value := range map[string]*int32{
+			"period_seconds":    sidecar.StartupProbe.PeriodSeconds,
+			"timeout_seconds":   sidecar.StartupProbe.TimeoutSeconds,
+			"failure_threshold": sidecar.StartupProbe.FailureThreshold,
+		} {
+			if value != nil && *value <= 0 {
+				return fmt.Errorf("%s.startup_probe.%s must be positive", sidecarPath, field)
+			}
+		}
+	}
+	return nil
+}
+
+func validateEnv(env Env, path string, reserveSecretPaths bool) error {
+	if strings.TrimSpace(env.Name) == "" {
+		return fmt.Errorf("%s.name is required", path)
+	}
+	if errors := k8svalidation.IsEnvVarName(env.Name); len(errors) > 0 {
+		return fmt.Errorf("%s.name is not a valid Kubernetes environment variable name", path)
+	}
+	if reserveSecretPaths && env.Name == "SIMPLESWE_SECRET_PATHS" {
+		return fmt.Errorf("%s.name is reserved", path)
+	}
+	sources := 0
+	if env.Value != "" {
+		sources++
+	}
+	if env.Secret != nil {
+		sources++
+	}
+	if env.ConfigMap != nil {
+		sources++
+	}
+	if sources > 1 {
+		return fmt.Errorf("%s has multiple value sources", path)
+	}
+	for kind, ref := range map[string]*KeyRef{"secret": env.Secret, "config_map": env.ConfigMap} {
+		if ref != nil && (!validDNSName(ref.Name) || strings.TrimSpace(ref.Key) == "") {
+			return fmt.Errorf("%s.%s is invalid", path, kind)
 		}
 	}
 	return nil

@@ -314,3 +314,79 @@ repositories:
 		t.Fatalf("Load loopback test server: %v", err)
 	}
 }
+
+func TestLoadSidecarsAndRejectsMalformedSidecars(t *testing.T) {
+	valid := `
+bitbucket:
+  webhook_secret: {file: /run/secrets/webhooks/bitbucket}
+repositories:
+  - clone_url: https://bitbucket.example/acme/widget.git
+    default_branch: main
+    worker:
+      image: worker:v1
+      sidecars:
+        - name: database
+          image: registry.example/database:v1
+          command: [database]
+          args: [--listen, "3306"]
+          env:
+            - name: DATABASE_PASSWORD
+              secret: {name: database-secret, key: password}
+            - name: DATABASE_MODE
+              value: test
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+          startup_probe:
+            port: 3306
+            period_seconds: 5
+            timeout_seconds: 2
+            failure_threshold: 30
+          security_context: {runAsNonRoot: true}
+    bitbucket: {workspace: acme, repository: widget, credentials_secret_name: widget-bitbucket}
+`
+	cfg, err := Load(strings.NewReader(valid))
+	if err != nil {
+		t.Fatalf("Load valid sidecar config: %v", err)
+	}
+	sidecar := cfg.Repositories[0].Worker.Sidecars[0]
+	if sidecar.Name != "database" || sidecar.Image != "registry.example/database:v1" || fmt.Sprint(sidecar.Command) != "[database]" || fmt.Sprint(sidecar.Args) != "[--listen 3306]" {
+		t.Fatalf("sidecar identity/command = %#v", sidecar)
+	}
+	if sidecar.StartupProbe == nil || sidecar.StartupProbe.Port != 3306 {
+		t.Fatalf("sidecar startup probe = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.StartupProbe.PeriodSeconds == nil || *sidecar.StartupProbe.PeriodSeconds != 5 || sidecar.StartupProbe.TimeoutSeconds == nil || *sidecar.StartupProbe.TimeoutSeconds != 2 || sidecar.StartupProbe.FailureThreshold == nil || *sidecar.StartupProbe.FailureThreshold != 30 {
+		t.Fatalf("sidecar startup probe timing = %#v", sidecar.StartupProbe)
+	}
+	if sidecar.SecurityContext["runAsNonRoot"] != true {
+		t.Fatalf("sidecar security context = %#v", sidecar.SecurityContext)
+	}
+	if sidecar.Env[0].Value != "" || sidecar.Env[0].Secret == nil || sidecar.Env[0].Secret.Name != "database-secret" {
+		t.Fatalf("sidecar secret env = %#v", sidecar.Env[0])
+	}
+	withoutTiming := strings.NewReplacer("            period_seconds: 5\n", "", "            timeout_seconds: 2\n", "", "            failure_threshold: 30\n", "").Replace(valid)
+	defaults, err := Load(strings.NewReader(withoutTiming))
+	if err != nil {
+		t.Fatalf("Load sidecar config with native probe defaults: %v", err)
+	}
+	defaultProbe := defaults.Repositories[0].Worker.Sidecars[0].StartupProbe
+	if defaultProbe == nil || defaultProbe.PeriodSeconds != nil || defaultProbe.TimeoutSeconds != nil || defaultProbe.FailureThreshold != nil {
+		t.Fatalf("omitted startup probe timing = %#v; want native defaults", defaultProbe)
+	}
+
+	for name, input := range map[string]string{
+		"missing name":         strings.Replace(valid, "name: database\n", "name:\n", 1),
+		"missing image":        strings.Replace(valid, "          image: registry.example/database:v1\n", "", 1),
+		"invalid image":        strings.Replace(valid, "          image: registry.example/database:v1\n", "          image: 'database image'\n", 1),
+		"missing startup":      strings.Replace(valid, "          startup_probe:\n", "", 1),
+		"invalid startup port": strings.Replace(valid, "            port: 3306\n", "            port: 0\n", 1),
+		"invalid probe period": strings.Replace(valid, "            period_seconds: 5\n", "            period_seconds: 0\n", 1),
+		"unknown field":        strings.Replace(valid, "          security_context: {runAsNonRoot: true}\n", "          security_context: {runAsNonRoot: true}\n          unknown: true\n", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(strings.NewReader(input)); err == nil {
+				t.Fatalf("Load accepted malformed sidecar config")
+			}
+		})
+	}
+}
