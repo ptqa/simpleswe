@@ -326,13 +326,15 @@ func (c *Controller) verifyAttemptProviderOwnership(ctx context.Context, record 
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
 		return err
 	}
-	if !validLiveProviderCommit(live.HeadSHA) {
-		return fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID", store.ErrConflict, live.HeadSHA)))
+	if !validLiveProviderCommit(live.HeadSHA) &&
+		!webhookCommitMatchesDurable(live.HeadSHA, durableHead.CommitSHA) &&
+		(priorHead.CommitSHA == "" || !webhookCommitMatchesDurable(live.HeadSHA, priorHead.CommitSHA)) {
+		return fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID or a matching abbreviated SHA", store.ErrConflict, live.HeadSHA)))
 	}
-	if liveProviderCommitExactlyMatchesDurable(live.HeadSHA, durableHead.CommitSHA) {
+	if webhookCommitMatchesDurable(live.HeadSHA, durableHead.CommitSHA) {
 		return nil
 	}
-	if priorHead.CommitSHA != "" && liveProviderCommitExactlyMatchesDurable(live.HeadSHA, priorHead.CommitSHA) {
+	if priorHead.CommitSHA != "" && webhookCommitMatchesDurable(live.HeadSHA, priorHead.CommitSHA) {
 		return fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for candidate SHA %q", priorHead.CommitSHA, durableHead.CommitSHA)
 	}
 	if durableHead.State == "candidate" && candidateReplacementMaySettle(record, attempt) {
@@ -691,11 +693,13 @@ func (c *Controller) forgeCompletionEvidence(ctx context.Context, record store.T
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
 		return store.PullRequest{}, forge.Target{}, false, err
 	}
-	if !validLiveProviderCommit(live.HeadSHA) {
-		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID", store.ErrConflict, live.HeadSHA)))
+	if !validLiveProviderCommit(live.HeadSHA) &&
+		!webhookCommitMatchesDurable(live.HeadSHA, git.CommitSHA) &&
+		!webhookCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID or a matching abbreviated SHA", store.ErrConflict, live.HeadSHA)))
 	}
-	if !liveProviderCommitExactlyMatchesDurable(live.HeadSHA, git.CommitSHA) {
-		if liveProviderCommitExactlyMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
+	if !webhookCommitMatchesDurable(live.HeadSHA, git.CommitSHA) {
+		if webhookCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
 			return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA)
 		}
 		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("completion head drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
@@ -728,12 +732,6 @@ func (c *Controller) handleCompletedForgeEvents(ctx context.Context, events []st
 		c.logger.InfoContext(ctx, "forge follow-up event handled", "task", record.ID, "attempt", attempt.ID, "forge_event", event.ID)
 	}
 	return errors.Join(persistenceErrors...)
-}
-
-func liveProviderCommitExactlyMatchesDurable(providerSHA, durableSHA string) bool {
-	return validLiveProviderCommit(providerSHA) &&
-		protocol.FullLowerGitObjectID(strings.ToLower(durableSHA)) &&
-		strings.EqualFold(providerSHA, durableSHA)
 }
 
 func validLiveProviderCommit(providerSHA string) bool {

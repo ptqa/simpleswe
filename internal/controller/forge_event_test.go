@@ -677,24 +677,6 @@ func TestWebhookCommitMatchesDurable(t *testing.T) {
 	}
 }
 
-func TestLiveProviderCommitExactlyMatchesDurable(t *testing.T) {
-	for _, test := range []struct {
-		provider string
-		durable  string
-		want     bool
-	}{
-		{provider: fullCommitSHA, durable: fullCommitSHA, want: true},
-		{provider: strings.ToUpper(fullCommitSHA), durable: fullCommitSHA, want: true},
-		{provider: strings.ToUpper(strings.Repeat("ab", 32)), durable: strings.Repeat("ab", 32), want: true},
-		{provider: fullCommitSHA[:12], durable: fullCommitSHA},
-		{provider: strings.Repeat("g", 40), durable: strings.Repeat("g", 40)},
-	} {
-		if got := liveProviderCommitExactlyMatchesDurable(test.provider, test.durable); got != test.want {
-			t.Errorf("liveProviderCommitExactlyMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
-		}
-	}
-}
-
 func recordPushedFollowUp(t *testing.T, fixture *fixture, attempt store.Attempt) {
 	t.Helper()
 	recordPushedFollowUpWithSHA(t, fixture, attempt, fullCommitSHA)
@@ -1000,7 +982,7 @@ func TestForgeFollowUpRejectsPullRequestThatIsNoLongerExactAndOpen(t *testing.T)
 		{name: "changed head", mutate: func(state *forge.PullRequestState) { state.SourceBranch = "other/head" }},
 		{name: "changed source repository", mutate: func(state *forge.PullRequestState) { state.SourceRepository = "fork" }},
 		{name: "changed head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("f", 40) }},
-		{name: "abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = fullCommitSHA[:12] }},
+		{name: "nonmatching abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("f", 12) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t)
@@ -1313,7 +1295,7 @@ func TestForgeCompletionPermanentlyRejectsProviderOwnershipDrift(t *testing.T) {
 		{name: "retargeted base", mutate: func(state *forge.PullRequestState) { state.DestinationBranch = "release" }},
 		{name: "changed head ref", mutate: func(state *forge.PullRequestState) { state.SourceBranch = "external/head" }},
 		{name: "unrelated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("f", 40) }},
-		{name: "abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("1", 12) }},
+		{name: "nonmatching abbreviated head SHA", mutate: func(state *forge.PullRequestState) { state.HeadSHA = strings.Repeat("2", 12) }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newFixture(t)
@@ -1376,6 +1358,35 @@ func TestForgeFollowUpStartAndCompletionAcceptFullUppercaseProviderSHA(t *testin
 	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
 	if err != nil || handled.Status != store.ForgeEventHandled {
 		t.Fatalf("uppercase exact live SHA outcome = %#v, %v", handled, err)
+	}
+}
+
+func TestForgeFollowUpStartAndCompletionAcceptAbbreviatedProviderSHA(t *testing.T) {
+	fixture := newFixture(t)
+	record, _, branch := createOwnedOpenPullRequest(t, fixture)
+	fixture.pullRequests.getResult.HeadSHA = fullCommitSHA[:12]
+	event := controllerForgeEvent("abbreviated-live-provider-sha", "review_comment", 42)
+	event.Branch = branch
+	if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.controller.(*Controller)
+	if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+		t.Fatalf("ProcessForgeEvents(): %v", err)
+	}
+	followUp, err := fixture.store.CurrentAttempt(fixture.ctx, record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSHA := strings.Repeat("a1", 20)
+	recordPushedFollowUpWithSHA(t, fixture, followUp, newSHA)
+	fixture.pullRequests.getResult.HeadSHA = newSHA[:12]
+	if err := control.completeForgeEventLocked(fixture.ctx, record, followUp, false); err != nil {
+		t.Fatalf("completeForgeEventLocked(): %v", err)
+	}
+	handled, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+	if err != nil || handled.Status != store.ForgeEventHandled {
+		t.Fatalf("abbreviated provider SHA outcome = %#v, %v", handled, err)
 	}
 }
 
