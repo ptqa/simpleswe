@@ -201,7 +201,7 @@ func TestPullRequestReadyRetriesUntilProviderHeadSettles(t *testing.T) {
 		DestinationBranch: "main", HeadSHA: strings.Repeat("f", 40),
 	}
 	settled := unsettled
-	settled.HeadSHA = fullCommitSHA
+	settled.HeadSHA = fullCommitSHA[:12]
 	fixture.pullRequests.getResults = []forge.PullRequestState{unsettled, settled}
 	if err := fixture.controller.HandleWorkerEvent(fixture.ctx, jobs.Name(record.ID, attempt.Number), "worker-pod-a1", event); err != nil {
 		t.Fatalf("settled provider head: %v", err)
