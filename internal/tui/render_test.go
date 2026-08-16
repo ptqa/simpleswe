@@ -160,15 +160,25 @@ func TestDrawTasksSelectedStateUsesSelectedForeground(t *testing.T) {
 	vx.Render()
 	renderedScreen(console, terminal)
 
+	var stateStyle, repositoryStyle vaxis.Style
+	var stateFound, repositoryFound bool
 	for _, cell := range terminal.Snapshot().Cells {
-		if cell.Row == 2 && cell.Col == 3 {
-			if cell.Cell.Foreground != app.colors().selected.Foreground || cell.Cell.Background != app.colors().selected.Background {
-				t.Fatalf("selected state style = %#v, want %#v", cell.Cell.Style, app.colors().selected)
-			}
-			return
+		if cell.Row != 2 {
+			continue
+		}
+		switch cell.Col {
+		case 3:
+			stateStyle, stateFound = cell.Cell.Style, true
+		case 13:
+			repositoryStyle, repositoryFound = cell.Cell.Style, true
 		}
 	}
-	t.Fatal("selected state was not rendered")
+	if !stateFound || !repositoryFound {
+		t.Fatal("selected task was not rendered")
+	}
+	if stateStyle.Foreground != repositoryStyle.Foreground || stateStyle.Background != repositoryStyle.Background {
+		t.Fatalf("selected state style = %#v, repository style = %#v", stateStyle, repositoryStyle)
+	}
 }
 
 func TestRenderHelpers(t *testing.T) {
