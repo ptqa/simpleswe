@@ -261,7 +261,10 @@ func (a *application) drawTasks(win vaxis.Window) {
 		state := strings.ToUpper(task.State)
 		marker := stateMarker(task.State)
 		stateText := fmt.Sprintf(" %s %-9s", marker, truncateText(state, 9))
-		stateStyle := mergeStyle(rowStyle, a.stateStyle(task.State))
+		stateStyle := rowStyle
+		if index != selected {
+			stateStyle = mergeStyle(rowStyle, a.stateStyle(task.State))
+		}
 		repository := compactRepository(task.Repository)
 		if repository == "" {
 			repository = "—"

@@ -148,6 +148,29 @@ func TestDrawEmptyAndFallbackViews(t *testing.T) {
 	app.drawLogs(vaxis.Window{Vx: vx})
 }
 
+func TestDrawTasksSelectedStateUsesSelectedForeground(t *testing.T) {
+	vx, console := newTestVaxis(t, 50, 10)
+	model := NewModel(1)
+	model.RefreshTasks([]Task{{ID: "task-1", State: "agent_running", Repository: "acme/widget"}})
+	app := &application{vx: vx, model: model}
+	terminal := term.New()
+	terminal.Resize(50, 10)
+
+	app.drawTasks(vx.Window())
+	vx.Render()
+	renderedScreen(console, terminal)
+
+	for _, cell := range terminal.Snapshot().Cells {
+		if cell.Row == 2 && cell.Col == 3 {
+			if cell.Cell.Foreground != app.colors().selected.Foreground || cell.Cell.Background != app.colors().selected.Background {
+				t.Fatalf("selected state style = %#v, want %#v", cell.Cell.Style, app.colors().selected)
+			}
+			return
+		}
+	}
+	t.Fatal("selected state was not rendered")
+}
+
 func TestRenderHelpers(t *testing.T) {
 	now := time.Now()
 	app := &application{}
