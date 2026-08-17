@@ -36,6 +36,8 @@ type PortForwardOptions struct {
 	StartupTimeout time.Duration
 }
 
+const portForwardReconnectDelay = 500 * time.Millisecond
+
 type portForwardTarget struct {
 	PodName string
 	Port    int
@@ -202,8 +204,100 @@ func portForwardTransportConfig(ctx context.Context, config *rest.Config) *rest.
 	return forwardingConfig
 }
 
-// PortForward owns an in-process Kubernetes port-forward lifecycle.
+// PortForward keeps an in-process Kubernetes port-forward available until it
+// is closed, resolving a replacement service pod whenever a tunnel ends.
 type PortForward struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
+	start     portForwardStarter
+	localPort int
+	done      chan struct{}
+}
+
+type portForwardStarter func(context.Context, int) (*portForwardTunnel, error)
+
+func startRestartingPortForward(ctx context.Context, start portForwardStarter) (*PortForward, error) {
+	if start == nil {
+		return nil, errors.New("port-forward starter is nil")
+	}
+	forwardingCtx, cancel := context.WithCancel(ctx)
+	initial, err := start(forwardingCtx, 0)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	forward := &PortForward{
+		ctx:       forwardingCtx,
+		cancel:    cancel,
+		start:     start,
+		localPort: initial.LocalPort(),
+		done:      make(chan struct{}),
+	}
+	go forward.run(initial)
+	return forward, nil
+}
+
+func (p *PortForward) run(current *portForwardTunnel) {
+	defer close(p.done)
+	for {
+		_ = current.Wait()
+		if p.ctx.Err() != nil {
+			return
+		}
+
+		for {
+			if p.ctx.Err() != nil {
+				return
+			}
+			next, err := p.start(p.ctx, p.localPort)
+			if err == nil && next == nil {
+				err = errors.New("port-forward starter returned nil")
+			}
+			if err == nil {
+				if p.ctx.Err() != nil {
+					_ = next.Close()
+					return
+				}
+				current = next
+				break
+			}
+			timer := time.NewTimer(portForwardReconnectDelay)
+			select {
+			case <-p.ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+// WaitReady reports readiness. StartPortForward only returns a ready forward.
+func (p *PortForward) WaitReady(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("context is nil")
+	}
+	return nil
+}
+
+// LocalPort returns the stable local port used across tunnel replacements.
+func (p *PortForward) LocalPort() int {
+	return p.localPort
+}
+
+// Wait blocks until forwarding is closed or its context is canceled.
+func (p *PortForward) Wait() error {
+	<-p.done
+	return nil
+}
+
+// Close stops forwarding and waits for it to exit.
+func (p *PortForward) Close() error {
+	p.cancel()
+	return p.Wait()
+}
+
+type portForwardTunnel struct {
 	forwarder forwarder
 	ctx       context.Context
 	ready     chan struct{}
@@ -226,17 +320,22 @@ func StartPortForward(ctx context.Context, options PortForwardOptions) (*PortFor
 	if err := ctx.Err(); err != nil {
 		return nil, portForwardStartupError(options, "initialization", err)
 	}
-	return startPortForward(ctx, options, func(setupCtx, forwardingCtx context.Context) (forwarder, <-chan struct{}, error) {
-		return setupKubernetesPortForward(setupCtx, forwardingCtx, options)
+	return startRestartingPortForward(ctx, func(ctx context.Context, localPort int) (*portForwardTunnel, error) {
+		return startPortForward(ctx, options, func(setupCtx, forwardingCtx context.Context) (forwarder, <-chan struct{}, error) {
+			return setupKubernetesPortForward(setupCtx, forwardingCtx, options, localPort)
+		})
 	})
 }
 
-func startPortForward(ctx context.Context, options PortForwardOptions, setup func(context.Context, context.Context) (forwarder, <-chan struct{}, error)) (*PortForward, error) {
+func startPortForward(ctx context.Context, options PortForwardOptions, setup func(context.Context, context.Context) (forwarder, <-chan struct{}, error)) (*portForwardTunnel, error) {
 	setupCtx, cancelSetup := context.WithCancel(ctx)
 	if options.StartupTimeout > 0 {
 		setupCtx, cancelSetup = context.WithTimeout(ctx, options.StartupTimeout)
 	}
 	defer cancelSetup()
+	if err := setupCtx.Err(); err != nil {
+		return nil, portForwardStartupError(options, "setup", err)
+	}
 
 	forwarder, ready, err := setup(setupCtx, ctx)
 	if err != nil {
@@ -260,7 +359,7 @@ func portForwardStartupError(options PortForwardOptions, phase string, err error
 	return fmt.Errorf("port-forward startup for context %q service %s/%s during %s: %w", options.KubeContext, options.Namespace, options.Service, phase, err)
 }
 
-func setupKubernetesPortForward(setupCtx, forwardingCtx context.Context, options PortForwardOptions) (forwarder, <-chan struct{}, error) {
+func setupKubernetesPortForward(setupCtx, forwardingCtx context.Context, options PortForwardOptions, localPort int) (forwarder, <-chan struct{}, error) {
 	config, err := loadPortForwardConfig(options)
 	if err != nil {
 		return nil, nil, err
@@ -280,10 +379,10 @@ func setupKubernetesPortForward(setupCtx, forwardingCtx context.Context, options
 	requestURL := kube.CoreV1().RESTClient().Post().
 		Resource("pods").Namespace(options.Namespace).Name(target.PodName).
 		SubResource("portforward").URL()
-	return newKubernetesPortForward(forwardingCtx, config, requestURL, options, target)
+	return newKubernetesPortForward(forwardingCtx, config, requestURL, options, target, localPort)
 }
 
-func newKubernetesPortForward(ctx context.Context, config *rest.Config, requestURL *url.URL, options PortForwardOptions, target portForwardTarget) (forwarder, <-chan struct{}, error) {
+func newKubernetesPortForward(ctx context.Context, config *rest.Config, requestURL *url.URL, options PortForwardOptions, target portForwardTarget, localPort int) (forwarder, <-chan struct{}, error) {
 	forwardingCtx, cancel := context.WithCancel(ctx)
 	forwardingConfig := portForwardTransportConfig(forwardingCtx, config)
 	roundTripper, upgrader, err := spdy.RoundTripperFor(forwardingConfig)
@@ -301,7 +400,7 @@ func newKubernetesPortForward(ctx context.Context, config *rest.Config, requestU
 	kubeForwarder, err := portforward.NewOnAddresses(
 		portforward.NewFallbackDialer(websocketDialer, spdyDialer, shouldFallbackPortForwardDial),
 		[]string{"127.0.0.1"},
-		[]string{"0:" + strconv.Itoa(target.Port)},
+		[]string{strconv.Itoa(localPort) + ":" + strconv.Itoa(target.Port)},
 		forwardingCtx.Done(),
 		ready,
 		io.Discard,
@@ -320,8 +419,8 @@ func newKubernetesPortForward(ctx context.Context, config *rest.Config, requestU
 	}, ready, nil
 }
 
-func newPortForward(ctx context.Context, forwarder forwarder, forwarderReady <-chan struct{}) *PortForward {
-	p := &PortForward{
+func newPortForward(ctx context.Context, forwarder forwarder, forwarderReady <-chan struct{}) *portForwardTunnel {
+	p := &portForwardTunnel{
 		forwarder: forwarder,
 		ctx:       ctx,
 		ready:     make(chan struct{}),
@@ -339,7 +438,7 @@ func newPortForward(ctx context.Context, forwarder forwarder, forwarderReady <-c
 	return p
 }
 
-func (p *PortForward) run() {
+func (p *portForwardTunnel) run() {
 	err := p.forwarder.ForwardPorts()
 	p.mu.Lock()
 	if p.stopping {
@@ -351,7 +450,7 @@ func (p *PortForward) run() {
 	close(p.done)
 }
 
-func (p *PortForward) observeReady(forwarderReady <-chan struct{}) {
+func (p *portForwardTunnel) observeReady(forwarderReady <-chan struct{}) {
 	var port int
 	var err error
 	var stop bool
@@ -381,7 +480,7 @@ func (p *PortForward) observeReady(forwarderReady <-chan struct{}) {
 	}
 }
 
-func (p *PortForward) markReady(port int, err error) {
+func (p *portForwardTunnel) markReady(port int, err error) {
 	p.mu.Lock()
 	if p.finished && (err == nil || p.waitErr != nil) {
 		port = 0
@@ -397,7 +496,7 @@ func (p *PortForward) markReady(port int, err error) {
 }
 
 // WaitReady waits for readiness and returns an early forwarding failure.
-func (p *PortForward) WaitReady(ctx context.Context) error {
+func (p *portForwardTunnel) WaitReady(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("context is nil")
 	}
@@ -412,14 +511,14 @@ func (p *PortForward) WaitReady(ctx context.Context) error {
 }
 
 // LocalPort returns the actual bound local port after readiness.
-func (p *PortForward) LocalPort() int {
+func (p *portForwardTunnel) LocalPort() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.localPort
 }
 
 // Wait returns the forwarding result.
-func (p *PortForward) Wait() error {
+func (p *portForwardTunnel) Wait() error {
 	<-p.done
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -427,12 +526,12 @@ func (p *PortForward) Wait() error {
 }
 
 // Close stops forwarding and waits for it to exit.
-func (p *PortForward) Close() error {
+func (p *portForwardTunnel) Close() error {
 	p.requestStop()
 	return p.Wait()
 }
 
-func (p *PortForward) requestStop() {
+func (p *portForwardTunnel) requestStop() {
 	p.stopOnce.Do(func() {
 		p.mu.Lock()
 		if p.finished {

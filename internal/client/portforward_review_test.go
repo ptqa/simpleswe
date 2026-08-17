@@ -117,7 +117,7 @@ func TestPortForwardStartupWaitsForEligiblePod(t *testing.T) {
 	fakeForwarder := newFakePortForwarder(49156, nil)
 	close(fakeForwarder.ready)
 	type startupResult struct {
-		forward *PortForward
+		forward *portForwardTunnel
 		err     error
 	}
 	result := make(chan startupResult, 1)
@@ -219,7 +219,7 @@ func TestPortForwardStartupTimeoutCancelsUnderlyingRoundTrip(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := startPortForward(context.Background(), options, func(_ context.Context, forwardingCtx context.Context) (forwarder, <-chan struct{}, error) {
-			return newKubernetesPortForward(forwardingCtx, config, requestURL, options, portForwardTarget{PodName: "controller-pod", Port: 8080})
+			return newKubernetesPortForward(forwardingCtx, config, requestURL, options, portForwardTarget{PodName: "controller-pod", Port: 8080}, 0)
 		})
 		result <- err
 	}()
@@ -290,7 +290,7 @@ func TestReadyPortForwardOutlivesStartupContext(t *testing.T) {
 func TestPortForwardRecordedFailureBeatsReadiness(t *testing.T) {
 	wantErr := errors.New("forwarding failed")
 	fakeForwarder := newFakePortForwarder(49155, nil)
-	forward := &PortForward{
+	forward := &portForwardTunnel{
 		forwarder: fakeForwarder,
 		ctx:       context.Background(),
 		ready:     make(chan struct{}),
@@ -307,6 +307,114 @@ func TestPortForwardRecordedFailureBeatsReadiness(t *testing.T) {
 	}
 	if got := forward.LocalPort(); got != 0 {
 		t.Fatalf("LocalPort() = %d after failed startup, want 0", got)
+	}
+}
+
+func TestRestartingPortForwardRejectsInvalidStartup(t *testing.T) {
+	if _, err := startRestartingPortForward(context.Background(), nil); err == nil {
+		t.Fatal("startRestartingPortForward() error = nil for nil starter")
+	}
+	wantErr := errors.New("startup failed")
+	if _, err := startRestartingPortForward(context.Background(), func(context.Context, int) (*portForwardTunnel, error) {
+		return nil, wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("startRestartingPortForward() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestRestartingPortForwardIsReadyWhenReturned(t *testing.T) {
+	forward := &PortForward{}
+	var nilCtx context.Context
+	if err := forward.WaitReady(nilCtx); err == nil {
+		t.Fatal("WaitReady(nil) error = nil")
+	}
+	if err := forward.WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+}
+
+func TestPortForwardReconnectsOnTheSameLocalPort(t *testing.T) {
+	first := newFakePortForwarder(49157, nil)
+	second := newFakePortForwarder(49157, nil)
+	close(first.ready)
+	close(second.ready)
+	requestedPorts := make(chan int, 2)
+	forwarders := make(chan *fakePortForwarder, 2)
+	forwarders <- first
+	forwarders <- second
+
+	forward, err := startRestartingPortForward(context.Background(), func(ctx context.Context, localPort int) (*portForwardTunnel, error) {
+		requestedPorts <- localPort
+		fakeForwarder := <-forwarders
+		return startPortForward(ctx, PortForwardOptions{StartupTimeout: time.Second}, func(context.Context, context.Context) (forwarder, <-chan struct{}, error) {
+			return fakeForwarder, fakeForwarder.ready, nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("startRestartingPortForward() error = %v", err)
+	}
+	if got := <-requestedPorts; got != 0 {
+		t.Fatalf("initial requested local port = %d, want 0", got)
+	}
+
+	close(first.stop)
+	select {
+	case got := <-requestedPorts:
+		if got != 49157 {
+			t.Fatalf("replacement requested local port = %d, want 49157", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("port-forward did not restart after the first tunnel ended")
+	}
+	if got := forward.LocalPort(); got != 49157 {
+		t.Fatalf("LocalPort() after restart = %d, want 49157", got)
+	}
+
+	waited := make(chan error, 1)
+	go func() { waited <- forward.Wait() }()
+	select {
+	case err := <-waited:
+		t.Fatalf("Wait() returned during replacement forwarding: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := forward.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+}
+
+func TestPortForwardCancellationDuringReconnectBackoffDoesNotRestart(t *testing.T) {
+	first := newFakePortForwarder(49158, nil)
+	close(first.ready)
+	attempts := make(chan int, 3)
+	attempt := 0
+	forward, err := startRestartingPortForward(context.Background(), func(ctx context.Context, _ int) (*portForwardTunnel, error) {
+		attempt++
+		attempts <- attempt
+		if attempt > 1 {
+			return nil, errors.New("replacement unavailable")
+		}
+		return startPortForward(ctx, PortForwardOptions{StartupTimeout: time.Second}, func(context.Context, context.Context) (forwarder, <-chan struct{}, error) {
+			return first, first.ready, nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("startRestartingPortForward() error = %v", err)
+	}
+	<-attempts
+	close(first.stop)
+	if got := <-attempts; got != 2 {
+		t.Fatalf("replacement attempt = %d, want 2", got)
+	}
+	if err := forward.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	select {
+	case got := <-attempts:
+		t.Fatalf("attempt %d started after cancellation", got)
+	default:
 	}
 }
 
