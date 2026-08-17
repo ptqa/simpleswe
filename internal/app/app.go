@@ -28,7 +28,7 @@ const (
 	taskWaitUsage   = "usage: simpleswe task wait [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskCancelUsage = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
 	taskRetryUsage  = "usage: simpleswe task retry [--context NAME] [--namespace NAME] [--address URL] ID"
-	taskLogsUsage   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] ID"
+	taskLogsUsage   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] [-f|--follow] ID"
 )
 
 // Dependencies is the composition seam used by the binary entrypoint. The
@@ -48,7 +48,7 @@ type Dependencies struct {
 	WaitTask   func(context.Context, string, string) (client.Task, error)
 	CancelTask func(context.Context, string, string) (client.Task, error)
 	RetryTask  func(context.Context, string, string) (client.Task, error)
-	StreamLogs func(context.Context, string, string, io.Writer) error
+	StreamLogs func(context.Context, string, string, bool, io.Writer) error
 }
 
 // Run dispatches one simpleswe command. It does not derive a child context so
@@ -122,7 +122,7 @@ func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer, dep
 }
 
 func runTUI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, deps Dependencies) (runErr error) {
-	flags, _, ok := parseRuntimeArgs(args, 0, false)
+	flags, _, ok := parseRuntimeArgs(args, 0, false, false)
 	if !ok {
 		return errors.New(tuiUsage)
 	}
@@ -146,7 +146,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	if !ok {
 		return fmt.Errorf("unknown task command %q; %s", command, taskUsage)
 	}
-	flags, positional, ok := parseRuntimeArgs(args[1:], positionalCount, command == "create")
+	flags, positional, ok := parseRuntimeArgs(args[1:], positionalCount, command == "create", command == "logs")
 	if !ok {
 		return errors.New(usage)
 	}
@@ -196,7 +196,7 @@ func runTask(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 		if deps.StreamLogs == nil {
 			return errors.New("task logs runtime is not configured")
 		}
-		return deps.StreamLogs(ctx, address, positional[0], stdout)
+		return deps.StreamLogs(ctx, address, positional[0], flags.follow, stdout)
 	default:
 		return errors.New(usage)
 	}
@@ -225,6 +225,7 @@ type runtimeFlags struct {
 	address        string
 	prTitle        string
 	idempotencyKey string
+	follow         bool
 }
 
 type runtimeFlagState struct {
@@ -233,9 +234,10 @@ type runtimeFlagState struct {
 	addressSet        bool
 	prTitleSet        bool
 	idempotencyKeySet bool
+	followSet         bool
 }
 
-func parseRuntimeArgs(args []string, positionalCount int, allowIdempotencyKey bool) (runtimeFlags, []string, bool) {
+func parseRuntimeArgs(args []string, positionalCount int, allowIdempotencyKey, allowFollow bool) (runtimeFlags, []string, bool) {
 	flags := runtimeFlags{namespace: defaultNamespace}
 	var state runtimeFlagState
 	var positional []string
@@ -249,7 +251,7 @@ func parseRuntimeArgs(args []string, positionalCount int, allowIdempotencyKey bo
 			continue
 		}
 		if strings.HasPrefix(arg, "-") {
-			next, ok := state.parse(args, i, &flags, allowIdempotencyKey)
+			next, ok := state.parse(args, i, &flags, allowIdempotencyKey, allowFollow)
 			if !ok {
 				return runtimeFlags{}, nil, false
 			}
@@ -265,7 +267,15 @@ func parseRuntimeArgs(args []string, positionalCount int, allowIdempotencyKey bo
 	return flags, positional, true
 }
 
-func (state *runtimeFlagState) parse(args []string, index int, flags *runtimeFlags, allowIdempotencyKey bool) (int, bool) {
+func (state *runtimeFlagState) parse(args []string, index int, flags *runtimeFlags, allowIdempotencyKey, allowFollow bool) (int, bool) {
+	if args[index] == "--follow" || args[index] == "-f" {
+		if !allowFollow || state.followSet {
+			return index, false
+		}
+		flags.follow = true
+		state.followSet = true
+		return index, true
+	}
 	value, next, ok := nextValue(args, index)
 	if !ok {
 		return index, false

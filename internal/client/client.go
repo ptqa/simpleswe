@@ -275,7 +275,7 @@ func (c *Client) ListAttempts(ctx context.Context, taskID string, options ListOp
 	return result, err
 }
 
-// StreamLogs delivers each SSE data line to onLine as soon as it is read.
+// StreamLogs delivers each log line to onLine as soon as it is read.
 // It deliberately does not return or retain the complete log stream.
 func (c *Client) StreamLogs(ctx context.Context, taskID string, options LogOptions, onLine func(string) error) (resultErr error) {
 	if onLine == nil {
@@ -304,16 +304,21 @@ func (c *Client) StreamLogs(ctx context.Context, taskID string, options LogOptio
 	scanner.Buffer(make([]byte, 64*1024), maxSSELine)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
+		if options.Follow {
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			line = strings.TrimPrefix(line, "data:")
+			line = strings.TrimPrefix(line, " ")
 		}
-		line = strings.TrimPrefix(line, "data:")
-		line = strings.TrimPrefix(line, " ")
 		if err := onLine(line); err != nil {
 			return err
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("scan logs: %w", err)
+	}
+	return nil
 }
 
 func (o ListOptions) values() url.Values {

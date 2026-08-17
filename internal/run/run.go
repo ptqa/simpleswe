@@ -63,8 +63,8 @@ func Dependencies() app.Dependencies {
 		RetryTask: func(ctx context.Context, address, id string) (client.Task, error) {
 			return client.New(address, nil).RetryTask(ctx, id)
 		},
-		StreamLogs: func(ctx context.Context, address, id string, output io.Writer) error {
-			return client.New(address, nil).StreamLogs(ctx, id, client.LogOptions{Follow: true, TailLines: 200}, func(line string) error {
+		StreamLogs: func(ctx context.Context, address, id string, follow bool, output io.Writer) error {
+			return client.New(address, nil).StreamLogs(ctx, id, client.LogOptions{Follow: follow, TailLines: 200}, func(line string) error {
 				_, err := fmt.Fprintln(output, line)
 				return err
 			})

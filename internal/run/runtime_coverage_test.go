@@ -37,11 +37,11 @@ func TestDependenciesCallControllerAPI(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks/task-1/retry":
 			fmt.Fprintf(w, `{"data":%s}`, dependencyTaskJSON)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks/task-1/logs":
-			if r.URL.Query().Get("follow") != "true" || r.URL.Query().Get("tail_lines") != "200" {
+			if r.URL.Query().Has("follow") || r.URL.Query().Get("tail_lines") != "200" {
 				t.Errorf("log query = %q", r.URL.RawQuery)
 			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: worker output\n\n")
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, "worker output\n")
 		default:
 			http.NotFound(w, r)
 		}
@@ -86,7 +86,7 @@ func TestDependenciesCallControllerAPI(t *testing.T) {
 		t.Fatalf("WaitTask() = %#v, %v, want ready task", waited, err)
 	}
 	var output bytes.Buffer
-	if err := deps.StreamLogs(ctx, server.URL, "task-1", &output); err != nil {
+	if err := deps.StreamLogs(ctx, server.URL, "task-1", false, &output); err != nil {
 		t.Fatalf("StreamLogs() error = %v", err)
 	}
 	if output.String() != "worker output\n" {

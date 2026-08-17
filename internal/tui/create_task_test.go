@@ -561,7 +561,7 @@ func TestControllerFixturePreservesCreatedTaskIdentityAndRoutes(t *testing.T) {
 			t.Fatalf("events %s: %v", task.ID, err)
 		}
 		var lines []string
-		if err := api.StreamLogs(context.Background(), task.ID, client.LogOptions{}, func(line string) error {
+		if err := api.StreamLogs(context.Background(), task.ID, client.LogOptions{Follow: true}, func(line string) error {
 			lines = append(lines, line)
 			return nil
 		}); err != nil || strings.Join(lines, "\n") != "created line" {

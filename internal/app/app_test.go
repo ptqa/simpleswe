@@ -29,7 +29,7 @@ const (
 	usageTaskShow   = "usage: simpleswe task show [--context NAME] [--namespace NAME] [--address URL] ID"
 	usageTaskCancel = "usage: simpleswe task cancel [--context NAME] [--namespace NAME] [--address URL] ID"
 	usageTaskRetry  = "usage: simpleswe task retry [--context NAME] [--namespace NAME] [--address URL] ID"
-	usageTaskLogs   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] ID"
+	usageTaskLogs   = "usage: simpleswe task logs [--context NAME] [--namespace NAME] [--address URL] [-f|--follow] ID"
 )
 
 // These tests define the binary seam: Run owns argument parsing, connection
@@ -84,7 +84,12 @@ func TestRunDispatchesCommandsAndRuntimeConfiguration(t *testing.T) {
 		{
 			name: "task logs with automatic port forward",
 			args: []string{"task", "logs", "--context", "production", "--namespace", "simpleswe-prod", "task-10"},
-			want: []string{"port-forward context=production namespace=simpleswe-prod", "logs address=http://127.0.0.1:18080 id=task-10", "close port-forward"},
+			want: []string{"port-forward context=production namespace=simpleswe-prod", "logs address=http://127.0.0.1:18080 id=task-10 follow=false", "close port-forward"},
+		},
+		{
+			name: "task logs follow",
+			args: []string{"task", "logs", "--address", "http://controller:8080", "--follow", "task-10"},
+			want: []string{"logs address=http://controller:8080 id=task-10 follow=true"},
 		},
 		{
 			name: "task create with hyphen-prefixed prompt",
@@ -151,6 +156,8 @@ func TestRunReportsExactUsageErrors(t *testing.T) {
 		{name: "task retry extra ID", args: []string{"task", "retry", "task-1", "task-2"}, want: usageTaskRetry},
 		{name: "task logs missing ID", args: []string{"task", "logs"}, want: usageTaskLogs},
 		{name: "task logs extra ID", args: []string{"task", "logs", "task-1", "task-2"}, want: usageTaskLogs},
+		{name: "task logs duplicate follow", args: []string{"task", "logs", "--follow", "-f", "task-1"}, want: usageTaskLogs},
+		{name: "task show rejects follow", args: []string{"task", "show", "--follow", "task-1"}, want: usageTaskShow},
 	}
 
 	for _, tt := range tests {
@@ -251,7 +258,7 @@ func TestTaskCommandsWriteJSONAndLogsWriteLines(t *testing.T) {
 		{
 			name: "logs",
 			args: []string{"task", "logs", "--address", "http://controller", "task-logs"},
-			deps: Dependencies{StreamLogs: func(_ context.Context, _, _ string, output io.Writer) error {
+			deps: Dependencies{StreamLogs: func(_ context.Context, _, _ string, _ bool, output io.Writer) error {
 				_, err := io.WriteString(output, "first line\nsecond line\n")
 				return err
 			}},
@@ -555,12 +562,12 @@ func recordingDependencies(t *testing.T, wantCtx context.Context, wantStdin io.R
 			*calls = append(*calls, "retry address="+address+" id="+id)
 			return client.Task{ID: id}, nil
 		},
-		StreamLogs: func(ctx context.Context, address, id string, stdout io.Writer) error {
+		StreamLogs: func(ctx context.Context, address, id string, follow bool, stdout io.Writer) error {
 			checkContext(ctx)
 			if stdout != wantStdout {
 				t.Errorf("log output stream differs from Run stdout")
 			}
-			*calls = append(*calls, "logs address="+address+" id="+id)
+			*calls = append(*calls, "logs address="+address+" id="+id+" follow="+strconv.FormatBool(follow))
 			return nil
 		},
 		CreateTask: func(ctx context.Context, address string, request client.CreateTaskRequest) (client.Task, error) {

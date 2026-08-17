@@ -478,6 +478,29 @@ func TestClientStreamsSSEIncrementally(t *testing.T) {
 	}
 }
 
+func TestClientReadsCurrentLogsAsPlainText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tasks/task-1/logs" || r.URL.Query().Has("follow") || r.URL.Query().Get("tail_lines") != "200" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = io.WriteString(w, "first line\nsecond line\n")
+	}))
+	t.Cleanup(server.Close)
+
+	var lines []string
+	err := New(server.URL, server.Client()).StreamLogs(context.Background(), "task-1", LogOptions{TailLines: 200}, func(line string) error {
+		lines = append(lines, line)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamLogs() error = %v", err)
+	}
+	if want := []string{"first line", "second line"}; !reflect.DeepEqual(lines, want) {
+		t.Fatalf("StreamLogs() lines = %#v, want %#v", lines, want)
+	}
+}
+
 func TestClientRejectsInvalidInputsAndUsesDefaultHTTPClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, `{"data":{"task_id":"task-1"}}`)
@@ -594,7 +617,7 @@ func TestClientStreamLogsRejectsNilCallback(t *testing.T) {
 func TestClientStreamLogsReturnsCallbackError(t *testing.T) {
 	wantErr := errors.New("callback failed")
 	server := newLogServer(t, http.StatusOK, "data: line\n\n")
-	err := New(server.URL, server.Client()).StreamLogs(context.Background(), "task-1", LogOptions{}, func(string) error {
+	err := New(server.URL, server.Client()).StreamLogs(context.Background(), "task-1", LogOptions{Follow: true}, func(string) error {
 		return wantErr
 	})
 	if !errors.Is(err, wantErr) {
@@ -604,7 +627,7 @@ func TestClientStreamLogsReturnsCallbackError(t *testing.T) {
 
 func TestClientStreamLogsSkipsNonDataLines(t *testing.T) {
 	server := newLogServer(t, http.StatusOK, "event: log\n: comment\ndata: line\n\n")
-	err := New(server.URL, server.Client()).StreamLogs(context.Background(), "task-1", LogOptions{}, func(line string) error {
+	err := New(server.URL, server.Client()).StreamLogs(context.Background(), "task-1", LogOptions{Follow: true}, func(line string) error {
 		if line != "line" {
 			return fmt.Errorf("line = %q", line)
 		}
