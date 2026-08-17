@@ -326,19 +326,18 @@ func (c *Controller) verifyAttemptProviderOwnership(ctx context.Context, record 
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
 		return err
 	}
-	if !validLiveProviderCommit(live.HeadSHA) &&
-		!webhookCommitMatchesDurable(live.HeadSHA, durableHead.CommitSHA) &&
-		(priorHead.CommitSHA == "" || !webhookCommitMatchesDurable(live.HeadSHA, priorHead.CommitSHA)) {
-		return fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID or a matching abbreviated SHA", store.ErrConflict, live.HeadSHA)))
-	}
-	if webhookCommitMatchesDurable(live.HeadSHA, durableHead.CommitSHA) {
+	matchedHead := matchedDurableCommit(live.HeadSHA, durableHead.CommitSHA, priorHead.CommitSHA)
+	if matchedHead == durableHead.CommitSHA {
 		return nil
 	}
-	if priorHead.CommitSHA != "" && webhookCommitMatchesDurable(live.HeadSHA, priorHead.CommitSHA) {
+	if priorHead.CommitSHA != "" && matchedHead == priorHead.CommitSHA {
 		return fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for candidate SHA %q", priorHead.CommitSHA, durableHead.CommitSHA)
 	}
-	if durableHead.State == "candidate" && candidateReplacementMaySettle(record, attempt) {
-		return fmt.Errorf("provider pull request head SHA %q may be a replacement for active candidate SHA %q; waiting for durable worker event", live.HeadSHA, durableHead.CommitSHA)
+	if !validProviderCommit(live.HeadSHA) {
+		return fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID or a matching abbreviated SHA", store.ErrConflict, live.HeadSHA)))
+	}
+	if providerHeadMaySettle(record, attempt) {
+		return fmt.Errorf("provider pull request head SHA %q may be from the active attempt after durable SHA %q; waiting for durable worker event", live.HeadSHA, durableHead.CommitSHA)
 	}
 	if priorHead.CommitSHA != "" {
 		return fmt.Errorf("candidate lineage drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither candidate SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, durableHead.CommitSHA, priorHead.CommitSHA)))
@@ -515,7 +514,7 @@ func (c *Controller) forgeEventMatchesTask(ctx context.Context, event store.Forg
 }
 
 func (c *Controller) qualityEventMatchesOpenPullRequest(ctx context.Context, event store.ForgeEvent, record store.Task, current store.Attempt, pullRequest store.PullRequest) (forgeMatch, error) {
-	if event.CommitSHA == "" || event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number || event.Branch != "" && event.Branch != pullRequest.HeadBranch {
+	if !validProviderCommit(event.CommitSHA) || event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number || event.Branch != "" && event.Branch != pullRequest.HeadBranch {
 		return forgeDefinitelyUnowned, nil
 	}
 	attempts, err := c.store.ListAttempts(ctx, record.ID)
@@ -546,7 +545,7 @@ func (c *Controller) qualityEventMatchesOpenPullRequest(ctx context.Context, eve
 			continue
 		}
 		currentHasPushed = candidate.ID == current.ID
-		if webhookCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
+		if providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
 			return forgeOwned, nil
 		}
 		break
@@ -575,6 +574,9 @@ func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeE
 	if event.Branch != "" && branch != "" && event.Branch != branch {
 		return forgeDefinitelyUnowned, nil
 	}
+	if event.CommitSHA != "" && !validProviderCommit(event.CommitSHA) {
+		return forgeDefinitelyUnowned, nil
+	}
 	if pullRequest.Number > 0 && event.PullRequestNumber > 0 && event.PullRequestNumber != pullRequest.Number {
 		return forgeDefinitelyUnowned, nil
 	}
@@ -586,8 +588,8 @@ func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeE
 		if git.Branch != branch || event.Branch != "" && git.Branch != event.Branch {
 			return forgeDefinitelyUnowned, nil
 		}
-		if event.CommitSHA != "" && !webhookCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
-			if git.State == "candidate" && candidateReplacementMaySettle(record, attempt) {
+		if event.CommitSHA != "" && !providerCommitMatchesDurable(event.CommitSHA, git.CommitSHA) {
+			if git.State == "candidate" && providerHeadMaySettle(record, attempt) {
 				return forgeSettling, nil
 			}
 			return forgeDefinitelyUnowned, nil
@@ -598,7 +600,7 @@ func (c *Controller) forgeEventMaySettle(ctx context.Context, event store.ForgeE
 	return forgeSettling, nil
 }
 
-func candidateReplacementMaySettle(record store.Task, attempt store.Attempt) bool {
+func providerHeadMaySettle(record store.Task, attempt store.Attempt) bool {
 	return record.CurrentAttemptID == attempt.ID && !attempt.LogsExhausted &&
 		(record.State == task.RUNNING || record.State == task.AGENT_RUNNING || record.State == task.VALIDATING)
 }
@@ -693,18 +695,17 @@ func (c *Controller) forgeCompletionEvidence(ctx context.Context, record store.T
 	if err := verifyLivePullRequestIdentity(live, pullRequest, target); err != nil {
 		return store.PullRequest{}, forge.Target{}, false, err
 	}
-	if !validLiveProviderCommit(live.HeadSHA) &&
-		!webhookCommitMatchesDurable(live.HeadSHA, git.CommitSHA) &&
-		!webhookCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
+	matchedHead := matchedDurableCommit(live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)
+	if matchedHead == git.CommitSHA {
+		return pullRequest, target, true, nil
+	}
+	if priorGit.CommitSHA != "" && matchedHead == priorGit.CommitSHA {
+		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA)
+	}
+	if !validProviderCommit(live.HeadSHA) {
 		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("validate provider pull request head: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is not a full Git object ID or a matching abbreviated SHA", store.ErrConflict, live.HeadSHA)))
 	}
-	if !webhookCommitMatchesDurable(live.HeadSHA, git.CommitSHA) {
-		if webhookCommitMatchesDurable(live.HeadSHA, priorGit.CommitSHA) {
-			return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("provider pull request head is still prior durable SHA %q; waiting for pushed SHA %q", priorGit.CommitSHA, git.CommitSHA)
-		}
-		return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("completion head drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
-	}
-	return pullRequest, target, true, nil
+	return store.PullRequest{}, forge.Target{}, false, fmt.Errorf("completion head drift: %w", forge.MarkPermanent(fmt.Errorf("%w: provider pull request head SHA %q is neither pushed SHA %q nor prior durable SHA %q", store.ErrConflict, live.HeadSHA, git.CommitSHA, priorGit.CommitSHA)))
 }
 
 func (c *Controller) persistForgeCompletionFailure(ctx context.Context, events []store.ForgeEvent, cause error) error {
@@ -734,23 +735,37 @@ func (c *Controller) handleCompletedForgeEvents(ctx context.Context, events []st
 	return errors.Join(persistenceErrors...)
 }
 
-func validLiveProviderCommit(providerSHA string) bool {
-	return protocol.FullLowerGitObjectID(strings.ToLower(providerSHA))
-}
-
-func webhookCommitMatchesDurable(providerSHA, durableSHA string) bool {
-	if strings.EqualFold(providerSHA, durableSHA) {
-		return true
-	}
-	if len(providerSHA) < 7 || len(providerSHA) >= len(durableSHA) || len(durableSHA) != 40 && len(durableSHA) != 64 {
+func validProviderCommit(providerSHA string) bool {
+	if len(providerSHA) < 7 || len(providerSHA) > 64 {
 		return false
 	}
-	for _, char := range providerSHA + durableSHA {
+	for _, char := range providerSHA {
 		if char < '0' || char > '9' && char < 'A' || char > 'F' && char < 'a' || char > 'f' {
 			return false
 		}
 	}
-	return strings.HasPrefix(strings.ToLower(durableSHA), strings.ToLower(providerSHA))
+	return true
+}
+
+func providerCommitMatchesDurable(providerSHA, durableSHA string) bool {
+	if !validProviderCommit(providerSHA) || !protocol.FullLowerGitObjectID(durableSHA) || len(providerSHA) > len(durableSHA) {
+		return false
+	}
+	return strings.EqualFold(providerSHA, durableSHA[:len(providerSHA)])
+}
+
+func matchedDurableCommit(providerSHA string, durableSHAs ...string) string {
+	matched := ""
+	for _, durableSHA := range durableSHAs {
+		if !providerCommitMatchesDurable(providerSHA, durableSHA) {
+			continue
+		}
+		if matched != "" && matched != durableSHA {
+			return ""
+		}
+		matched = durableSHA
+	}
+	return matched
 }
 
 func sameForgeCoordinates(event store.ForgeEvent, target forge.Target) bool {

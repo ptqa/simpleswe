@@ -655,7 +655,7 @@ func execFixtureSQL(t *testing.T, fixture *fixture, statement string, args ...an
 	}
 }
 
-func TestWebhookCommitMatchesDurable(t *testing.T) {
+func TestProviderCommitMatchesDurable(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		provider string
@@ -668,12 +668,22 @@ func TestWebhookCommitMatchesDurable(t *testing.T) {
 		{name: "unrelated", provider: strings.Repeat("f", 12), durable: fullCommitSHA},
 		{name: "too short", provider: fullCommitSHA[:6], durable: fullCommitSHA},
 		{name: "non hex", provider: "not-a-commit", durable: fullCommitSHA},
+		{name: "invalid durable", provider: "not-a-commit", durable: "not-a-commit"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := webhookCommitMatchesDurable(test.provider, test.durable); got != test.want {
-				t.Fatalf("webhookCommitMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
+			if got := providerCommitMatchesDurable(test.provider, test.durable); got != test.want {
+				t.Fatalf("providerCommitMatchesDurable(%q, %q) = %t, want %t", test.provider, test.durable, got, test.want)
 			}
 		})
+	}
+}
+
+func TestAbbreviatedProviderCommitMustBeUnambiguous(t *testing.T) {
+	prefix := "0123456789ab"
+	first := prefix + strings.Repeat("1", 28)
+	second := prefix + strings.Repeat("2", 28)
+	if got := matchedDurableCommit(prefix, first, second); got != "" {
+		t.Fatalf("ambiguous provider commit matched %q", got)
 	}
 }
 

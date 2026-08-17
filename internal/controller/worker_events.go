@@ -371,7 +371,7 @@ func verifyReportedPullRequest(live forge.PullRequestState, event protocol.Event
 	if err := verifyLivePullRequestIdentity(live, store.PullRequest{Number: event.PullRequestNumber, HeadBranch: manifest.TaskBranch, BaseBranch: manifest.BaseBranch}, target); err != nil {
 		return err
 	}
-	if !webhookCommitMatchesDurable(live.HeadSHA, event.CommitSHA) {
+	if !providerCommitMatchesDurable(live.HeadSHA, event.CommitSHA) {
 		return fmt.Errorf("%w: provider head SHA %q, reported SHA %q", errPullRequestHeadUnsettled, live.HeadSHA, event.CommitSHA)
 	}
 	return nil

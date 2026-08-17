@@ -103,6 +103,62 @@ func TestCandidateReplacementSHASettlesUntilDurableOrExhausted(t *testing.T) {
 	}
 }
 
+func TestActiveFollowUpProviderHeadSettlesBeforeCandidateReport(t *testing.T) {
+	for _, abbreviated := range []bool{false, true} {
+		name := "full"
+		if abbreviated {
+			name = "abbreviated"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newFixture(t)
+			record, _, branch := createOwnedOpenPullRequest(t, fixture)
+			event := controllerForgeEvent("pre-report-head-race-"+name, "review_comment", 42)
+			event.Branch = branch
+			if _, err := fixture.store.PutForgeEvent(fixture.ctx, event); err != nil {
+				t.Fatal(err)
+			}
+			control := fixture.controller.(*Controller)
+			if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+				t.Fatal(err)
+			}
+			followUp := startCurrentAttemptWorker(t, fixture, record.ID)
+			handleEvent(t, fixture, jobs.Name(record.ID, followUp.Number), "worker-pod-a2", protocol.Event{Type: protocol.EventAgentStarted, TaskID: record.ID})
+
+			newSHA := "0881a26e6cb3" + strings.Repeat("a", 28)
+			providerSHA := newSHA
+			if abbreviated {
+				providerSHA = newSHA[:12]
+			}
+			fixture.pullRequests.getResult = &forge.PullRequestState{
+				Number: 42, State: "open", HTMLURL: pullRequestURL, Title: "Provider title", SourceOwner: "acme", SourceRepository: "widget",
+				SourceBranch: branch, DestinationBranch: "main", HeadSHA: providerSHA,
+			}
+			racingWebhook := controllerForgeEvent("pre-report-webhook-race-"+name, "quality_gate_failed", 0)
+			racingWebhook.Branch, racingWebhook.CommitSHA = branch, providerSHA
+			if _, err := fixture.store.PutForgeEvent(fixture.ctx, racingWebhook); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.ProcessForgeEvents(fixture.ctx); err != nil {
+				t.Fatalf("ProcessForgeEvents during pre-report race: %v", err)
+			}
+			stored, err := fixture.store.GetForgeEvent(fixture.ctx, event.ID)
+			storedWebhook, webhookErr := fixture.store.GetForgeEvent(fixture.ctx, racingWebhook.ID)
+			current := getTask(t, fixture, record.ID)
+			if err != nil || webhookErr != nil || stored.Status != store.ForgeEventRunning || stored.NextAttemptAt == nil ||
+				storedWebhook.Status != store.ForgeEventPending || storedWebhook.NextAttemptAt == nil || current.CancellationRequested || current.State != task.AGENT_RUNNING {
+				t.Fatalf("pre-report race outcome = running event %#v, webhook %#v, task %#v, errors %v/%v", stored, storedWebhook, current, err, webhookErr)
+			}
+
+			handleEvent(t, fixture, jobs.Name(record.ID, followUp.Number), "worker-pod-a2", protocol.Event{
+				Type: protocol.EventPullRequestPublished, TaskID: record.ID, PullRequestNumber: 42, Branch: branch, CommitSHA: newSHA,
+			})
+			if err := control.verifyAttemptProviderOwnership(fixture.ctx, getTask(t, fixture, record.ID), followUp, ""); err != nil {
+				t.Fatalf("provider ownership after durable candidate: %v", err)
+			}
+		})
+	}
+}
+
 func TestReviewWebhookSettlesThroughoutOpenCodeOwnedReceiptWindow(t *testing.T) {
 	for _, target := range []task.State{task.RUNNING, task.AGENT_RUNNING, task.VALIDATING, task.COMMITTING, task.PUSHING, task.CREATING_PR} {
 		t.Run(string(target), func(t *testing.T) {
@@ -225,7 +281,7 @@ func TestReadyTaskStillOwnsNewForgeEvent(t *testing.T) {
 func TestBranchlessBitbucketCommitStatusOwnsCurrentPushedSHA(t *testing.T) {
 	fixture := newFixture(t)
 	record, original, _ := createOwnedOpenPullRequest(t, fixture)
-	payload := `{"actor":{"display_name":"External CI"},"repository":{"slug":"widget","workspace":{"slug":"acme"}},"commit_status":{"name":"unit tests","description":"failed","state":"FAILED","links":{"commit":{"href":"https://api.bitbucket.org/2.0/repositories/acme/widget/commit/` + fullCommitSHA + `"}}}}`
+	payload := `{"actor":{"display_name":"External CI"},"repository":{"slug":"widget","workspace":{"slug":"acme"}},"commit_status":{"name":"unit tests","description":"failed","state":"FAILED","links":{"commit":{"href":"https://api.bitbucket.org/2.0/repositories/acme/widget/commit/` + fullCommitSHA[:12] + `"}}}}`
 	parsed, actionable, err := bitbucket.ParseWebhook("branchless-controller", "repo:commit_status_updated", []byte(payload))
 	if err != nil || !actionable {
 		t.Fatalf("ParseWebhook() = %#v, %t, %v", parsed, actionable, err)
