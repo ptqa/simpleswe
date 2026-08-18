@@ -1,6 +1,12 @@
 package tui
 
-import "go.rockorager.dev/vaxis"
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"go.rockorager.dev/vaxis"
+)
 
 type colorPalette struct {
 	name                                 string
@@ -96,5 +102,48 @@ func (a *application) selectTheme(index int) {
 	if index >= 0 && index < len(themes) {
 		a.theme = themeName(index)
 		a.message = "theme: " + themes[index].name
+		if err := saveTheme(a.configDir, themes[index].name); err != nil {
+			a.message = fmt.Sprintf("theme not saved: %v", err)
+		}
 	}
+}
+
+func loadTheme(configDir string) themeName {
+	root, err := os.OpenRoot(configDir)
+	if err != nil {
+		return 0
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile("simpleswe/theme")
+	if err != nil {
+		return 0
+	}
+	name := strings.TrimSpace(string(data))
+	for index := range themes {
+		if themes[index].name == name {
+			return themeName(index)
+		}
+	}
+	return 0
+}
+
+func saveTheme(configDir, name string) error {
+	if configDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	root, err := os.OpenRoot(configDir)
+	if err != nil {
+		return fmt.Errorf("open config directory: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.MkdirAll("simpleswe", 0o700); err != nil {
+		return fmt.Errorf("create theme directory: %w", err)
+	}
+	if err := root.WriteFile("simpleswe/theme", []byte(name+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write theme: %w", err)
+	}
+	return nil
 }

@@ -38,6 +38,7 @@ type Options struct {
 	RequestTimeout  time.Duration
 	LogCapacity     int
 	TaskLimit       int
+	configDir       string
 }
 
 type Runner struct {
@@ -109,6 +110,9 @@ func (o Options) withDefaults() Options {
 	if o.Namespace == "" {
 		o.Namespace = "default"
 	}
+	if o.configDir == "" {
+		o.configDir, _ = os.UserConfigDir()
+	}
 	o.Stdin = readerOr(o.Stdin, os.Stdin)
 	o.Stdout = writerOr(o.Stdout, os.Stdout)
 	o.Stderr = writerOr(o.Stderr, os.Stderr)
@@ -175,6 +179,7 @@ type application struct {
 	themePicker        bool
 	themeCursor        int
 	themePrevious      themeName
+	configDir          string
 	help               bool
 	confirmAction      string
 	narrowDetail       bool
@@ -212,18 +217,20 @@ type application struct {
 func newApplication(parent context.Context, vx *vaxis.Vaxis, api *client.Client, options Options) *application {
 	ctx, cancel := context.WithCancel(parent)
 	return &application{
-		ctx:      ctx,
-		cancel:   cancel,
-		vx:       vx,
-		client:   api,
-		options:  options,
-		model:    NewModel(options.LogCapacity),
-		message:  "connecting to controller",
-		tasksCh:  make(chan taskResult, 1),
+		ctx:        ctx,
+		cancel:     cancel,
+		vx:         vx,
+		client:     api,
+		options:    options,
+		model:      NewModel(options.LogCapacity),
+		theme:      loadTheme(options.configDir),
+		configDir:  options.configDir,
+		message:    "connecting to controller",
+		tasksCh:    make(chan taskResult, 1),
 		projectsCh: make(chan projectResult, 1),
-		detailCh: make(chan detailResult, 8),
-		logsCh:   make(chan logResult, 256),
-		actionCh: make(chan actionResult, 2),
+		detailCh:   make(chan detailResult, 8),
+		logsCh:     make(chan logResult, 256),
+		actionCh:   make(chan actionResult, 2),
 	}
 }
 

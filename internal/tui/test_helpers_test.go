@@ -286,6 +286,7 @@ func newTestApplication(t *testing.T, api *client.Client) *application {
 	options := (Options{
 		Namespace: "default", RefreshInterval: time.Hour, RequestTimeout: time.Second,
 		LogCapacity: 4, TaskLimit: 10, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard,
+		configDir: t.TempDir(),
 	}).withDefaults()
 	app := newApplication(context.Background(), nil, api, options)
 	t.Cleanup(app.stop)
