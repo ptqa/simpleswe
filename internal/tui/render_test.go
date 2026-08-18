@@ -297,6 +297,14 @@ func TestRenderHelpers(t *testing.T) {
 	}
 }
 
+func TestHumanizeLabelPreservesPullRequestURL(t *testing.T) {
+	const reason = "pull request open number=24607 url=https://bitbucket.org/lightningstep/lscodebase/pull-requests/24607"
+	const want = "Pull request open number=24607 url=https://bitbucket.org/lightningstep/lscodebase/pull-requests/24607"
+	if got := humanizeLabel(reason); got != want {
+		t.Fatalf("humanizeLabel(%q) = %q, want %q", reason, got, want)
+	}
+}
+
 func assertOutputContains(t *testing.T, output string, values ...string) {
 	t.Helper()
 	for _, value := range values {

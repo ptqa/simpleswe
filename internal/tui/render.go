@@ -947,7 +947,7 @@ func textWidth(value string) int {
 }
 
 func humanizeLabel(value string) string {
-	value = strings.TrimSpace(strings.NewReplacer("_", " ", "-", " ").Replace(value))
+	value = strings.TrimSpace(strings.ReplaceAll(value, "_", " "))
 	if value == "" {
 		return ""
 	}
