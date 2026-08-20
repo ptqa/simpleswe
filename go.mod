@@ -1,6 +1,6 @@
 module github.com/simpleswe/simpleswe
 
-go 1.26.6
+go 1.27.0
 
 require (
 	go.rockorager.dev/vaxis v0.17.1
