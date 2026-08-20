@@ -65,6 +65,7 @@ func TestModelMapsActionKeys(t *testing.T) {
 		'r':    ActionRetry,
 		'\x04': ActionCancel,
 		'R':    ActionRefresh,
+		'/':    ActionSearch,
 		't':    ActionTheme,
 		'?':    ActionHelp,
 		'h':    ActionBackOrQuit,

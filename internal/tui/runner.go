@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/simpleswe/simpleswe/internal/client"
@@ -181,6 +182,8 @@ type application struct {
 	themePrevious      themeName
 	configDir          string
 	help               bool
+	searching          bool
+	searchInput        *textinput.Model
 	confirmAction      string
 	narrowDetail       bool
 	wrapLogs           bool
@@ -343,14 +346,12 @@ func (a *application) applyTasks(result taskResult) {
 	}
 	oldID := a.model.SelectedTaskID()
 	a.model.RefreshTasks(result.tasks)
+	if a.reconcileSearchSelection() {
+		return
+	}
 	selectedID := a.model.SelectedTaskID()
 	if selectedID == "" {
-		a.model.SetDetail(TaskDetail{})
-		a.model.ResetLogs()
-		if a.logStop != nil {
-			a.logStop()
-			a.logStop = nil
-		}
+		a.clearTaskSelection()
 		return
 	}
 	if selectedID != oldID || a.model.Detail().Task.ID == "" {
@@ -486,7 +487,7 @@ func (a *application) selectTask(taskID string) {
 }
 
 func (a *application) moveSelection(delta int) {
-	tasks := a.model.Tasks()
+	tasks := a.visibleTasks()
 	if len(tasks) == 0 {
 		return
 	}
@@ -501,4 +502,62 @@ func (a *application) moveSelection(delta int) {
 	if tasks[selected].ID != a.model.SelectedTaskID() {
 		a.selectTask(tasks[selected].ID)
 	}
+}
+
+func (a *application) searchQuery() string {
+	if a.searchInput == nil {
+		return ""
+	}
+	return a.searchInput.String()
+}
+
+func (a *application) visibleTasks() []Task {
+	return filterTasks(a.model.Tasks(), a.searchQuery())
+}
+
+func filterTasks(tasks []Task, query string) []Task {
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return tasks
+	}
+	filtered := make([]Task, 0, len(tasks))
+	for _, task := range tasks {
+		searchable := strings.ToLower(task.ID + "\n" + task.Repository + "\n" + task.Prompt + "\n" + task.PRTitle + "\n" + task.State + "\n" + task.GitResult.Branch + "\n" + task.PullRequest.HeadBranch)
+		if task.PullRequest.Number > 0 {
+			searchable += fmt.Sprintf("\n%d\n#%d", task.PullRequest.Number, task.PullRequest.Number)
+		}
+		if strings.Contains(searchable, query) {
+			filtered = append(filtered, task)
+		}
+	}
+	return filtered
+}
+
+func (a *application) reconcileSearchSelection() bool {
+	tasks := a.visibleTasks()
+	selectedID := a.model.SelectedTaskID()
+	if hasTask(tasks, selectedID) {
+		return false
+	}
+	if len(tasks) == 0 {
+		a.clearTaskSelection()
+		return selectedID != ""
+	}
+	a.selectTask(tasks[0].ID)
+	return true
+}
+
+func (a *application) clearTaskSelection() {
+	if a.detailStop != nil {
+		a.detailStop()
+		a.detailStop = nil
+	}
+	if a.logStop != nil {
+		a.logStop()
+		a.logStop = nil
+	}
+	a.model.SetSelectedTask("")
+	a.model.SetDetail(TaskDetail{})
+	a.model.ResetLogs()
+	a.logComplete = false
 }

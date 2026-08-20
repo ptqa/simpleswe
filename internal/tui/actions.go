@@ -24,6 +24,8 @@ func (a *application) handleVaxisEvent(event vaxis.Event) (bool, error) {
 	case vaxis.PasteEndEvent:
 		if a.createModal && !a.createPending && !a.createAccepted {
 			a.updateCreateInput(event)
+		} else if a.searching {
+			a.updateSearchInput(event)
 		}
 	case vaxis.QuitEvent:
 		return true, nil
@@ -50,6 +52,8 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	if key.EventType == vaxis.EventPaste {
 		if a.createModal && !a.createPending && !a.createAccepted {
 			a.updateCreateInput(key)
+		} else if a.searching {
+			a.updateSearchInput(key)
 		}
 		return false, nil
 	}
@@ -58,6 +62,12 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 			return true, nil
 		}
 		return a.handleCreateTaskKey(key)
+	}
+	if a.searching {
+		if key.MatchString("Ctrl+c") {
+			return true, nil
+		}
+		return a.handleSearchKey(key)
 	}
 	if a.themePicker {
 		switch {
@@ -108,6 +118,8 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 	switch {
 	case key.MatchString("n"):
 		a.openCreateTask()
+	case key.MatchString("/"):
+		a.openSearch()
 	case key.MatchString("Ctrl+c"):
 		return true, nil
 	case key.MatchString("k"), key.Matches(vaxis.KeyUp):
@@ -175,6 +187,34 @@ func (a *application) handleKey(key vaxis.Key) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (a *application) openSearch() {
+	if a.searchInput == nil {
+		a.searchInput = textinput.New().SetPrompt("/ ")
+	}
+	a.searching = true
+	a.narrowDetail = false
+	a.mode = viewDetails
+}
+
+func (a *application) handleSearchKey(key vaxis.Key) (bool, error) {
+	switch {
+	case key.Matches(vaxis.KeyEsc):
+		a.searchInput.SetContent("")
+		a.searching = false
+		a.reconcileSearchSelection()
+	case key.Matches(vaxis.KeyEnter):
+		a.searching = false
+	default:
+		a.updateSearchInput(key)
+	}
+	return false, nil
+}
+
+func (a *application) updateSearchInput(event vaxis.Event) {
+	a.searchInput.Update(event)
+	a.reconcileSearchSelection()
 }
 
 func (a *application) openCreateTask() {
@@ -337,6 +377,9 @@ func (a *application) applyAction(result actionResult) {
 		if a.createModal {
 			a.createAccepted = true
 			a.createError = ""
+		}
+		if query := a.searchQuery(); query != "" && len(filterTasks([]Task{result.task}, query)) == 0 {
+			a.searchInput.SetContent("")
 		}
 		existing := a.model.Tasks()
 		tasks := make([]Task, 0, min(a.options.TaskLimit, len(existing)+1))

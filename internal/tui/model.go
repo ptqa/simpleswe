@@ -45,6 +45,7 @@ const (
 	ActionRetry      Action = "retry"
 	ActionCancel     Action = "cancel"
 	ActionRefresh    Action = "refresh"
+	ActionSearch     Action = "search"
 	ActionTheme      Action = "theme"
 	ActionNext       Action = "next"
 	ActionPrevious   Action = "previous"
@@ -176,6 +177,8 @@ func (m *Model) ActionForKey(key rune) Action {
 		return ActionCancel
 	case 'R':
 		return ActionRefresh
+	case '/':
+		return ActionSearch
 	case 't':
 		return ActionTheme
 	case '?':

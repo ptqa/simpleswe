@@ -198,9 +198,9 @@ func (a *application) drawFooter(win vaxis.Window) {
 	}
 	rightWidth := min(width, len(right))
 	leftWidth := max(0, width-rightWidth)
-	shortcuts := []shortcut{{"n", "create"}, {"j/k", "move"}, {"↵", "details"}, {"l", "logs"}, {"e", "events"}, {"d", "job"}, {"p", "pod"}, {"s", "shell"}, {"r", "retry"}, {"^D", "cancel"}, {"t", "theme"}, {"?", "help"}}
+	shortcuts := []shortcut{{"n", "create"}, {"/", "search"}, {"j/k", "move"}, {"↵", "details"}, {"l", "logs"}, {"e", "events"}, {"d", "job"}, {"p", "pod"}, {"s", "shell"}, {"r", "retry"}, {"^D", "cancel"}, {"t", "theme"}, {"?", "help"}}
 	if width < 100 {
-		shortcuts = []shortcut{{"n", "create"}, {"j/k", "move"}, {"↵", "details"}, {"l", "logs"}, {"t", "theme"}, {"?", "help"}}
+		shortcuts = []shortcut{{"n", "create"}, {"/", "search"}, {"j/k", "move"}, {"↵", "details"}, {"l", "logs"}, {"t", "theme"}, {"?", "help"}}
 	}
 	if leftWidth > 0 {
 		drawShortcuts(win.New(0, row, leftWidth, 1), shortcuts, palette)
@@ -216,9 +216,24 @@ func (a *application) drawTasks(win vaxis.Window) {
 	if width <= 0 || height <= 0 {
 		return
 	}
-	tasks := a.model.Tasks()
+	allTasks := a.model.Tasks()
+	tasks := filterTasks(allTasks, a.searchQuery())
 	win.PrintTruncate(0, vaxis.Segment{Text: " TASKS", Style: palette.title})
 	count := fmt.Sprintf("%d total ", len(tasks))
+	if a.searching || a.searchQuery() != "" {
+		count = fmt.Sprintf("%d/%d ", len(tasks), len(allTasks))
+	}
+	searchWidth := max(0, width-len(count)-8)
+	if searchWidth > 0 {
+		switch {
+		case a.searching:
+			a.searchInput.Content, a.searchInput.Prompt = palette.info, palette.info
+			a.searchInput.HideCursor = false
+			a.searchInput.Draw(win.New(7, 0, searchWidth, 1))
+		case a.searchQuery() != "":
+			win.New(7, 0, searchWidth, 1).PrintTruncate(0, vaxis.Segment{Text: "/ " + a.searchQuery(), Style: palette.info})
+		}
+	}
 	if len(count) < width {
 		win.New(width-len(count), 0, len(count), 1).PrintTruncate(0, vaxis.Segment{Text: count, Style: palette.dim})
 	}
@@ -232,7 +247,11 @@ func (a *application) drawTasks(win vaxis.Window) {
 	win.PrintTruncate(1, vaxis.Segment{Text: header, Style: palette.dim})
 	if len(tasks) == 0 {
 		if height > 3 {
-			win.PrintTruncate(3, vaxis.Segment{Text: " No tasks returned · R refresh", Style: palette.dim})
+			message := " No tasks returned · R refresh"
+			if a.searchQuery() != "" {
+				message = " No tasks match search · / edit"
+			}
+			win.PrintTruncate(3, vaxis.Segment{Text: message, Style: palette.dim})
 		}
 		return
 	}
@@ -244,6 +263,8 @@ func (a *application) drawTasks(win vaxis.Window) {
 		win.PrintTruncate(footerRow+1,
 			vaxis.Segment{Text: " ↑/↓", Style: palette.info},
 			vaxis.Segment{Text: " navigate   ", Style: palette.dim},
+			vaxis.Segment{Text: "/", Style: palette.info},
+			vaxis.Segment{Text: " search   ", Style: palette.dim},
 			vaxis.Segment{Text: "R", Style: palette.info},
 			vaxis.Segment{Text: " refresh", Style: palette.dim},
 		)
@@ -498,6 +519,7 @@ func (a *application) drawHelp(root vaxis.Window) {
 		"KEYS",
 		"j / k   select task     g / G  first / last",
 		"n       create task",
+		"/       search tasks",
 		"enter   task and attempt details",
 		"l       logs          e  events",
 		"d       Job details   p  Pod details",
